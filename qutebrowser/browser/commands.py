@@ -1899,3 +1899,23 @@ class CommandDispatcher:
 
         log.misc.debug('state before fullscreen: {}'.format(
             debug.qflags_key(Qt, window.state_before_fullscreen)))
+
+    @cmdutils.register(instance='command-dispatcher', scope='window',
+                       name='vertical-panel-toggle')
+    def vertical_panel_toggle(self) -> None:
+        """Toggle the visibility of the vertical workspace panel.
+
+        The toggle also drives the focus protocol described in
+        ADR 0008 § "Panel focus & mode model":
+
+        - Hidden → visible: panel is shown, focus moves to the last-
+          focused descendant (or the panel itself on first show),
+          which enters ``KeyMode.workspace_panel`` via the panel's
+          focus event filter.
+        - Visible → hidden: panel is hidden, focus is left to settle
+          naturally on the webview; the next focus event the user
+          produces will leave ``KeyMode.workspace_panel``.
+        """
+        panel = objreg.get('vertical-panel', scope='window',
+                           window=self._win_id)
+        panel.toggle()

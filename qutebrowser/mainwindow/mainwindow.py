@@ -14,7 +14,7 @@ from collections.abc import MutableSequence
 from qutebrowser.qt import machinery
 from qutebrowser.qt.core import (pyqtBoundSignal, pyqtSlot, QRect, QPoint, QTimer, Qt,
                           QCoreApplication, QEventLoop, QByteArray)
-from qutebrowser.qt.widgets import QWidget, QVBoxLayout, QSizePolicy
+from qutebrowser.qt.widgets import QWidget, QVBoxLayout, QSizePolicy, QSplitter
 from qutebrowser.qt.gui import QPalette
 
 from qutebrowser.commands import runners
@@ -22,7 +22,7 @@ from qutebrowser.api import cmdutils
 from qutebrowser.config import config, configfiles, stylesheet, websettings
 from qutebrowser.utils import (message, log, usertypes, qtutils, objreg, utils,
                                jinja, debug)
-from qutebrowser.mainwindow import messageview, prompt
+from qutebrowser.mainwindow import messageview, prompt, verticalpanel
 from qutebrowser.completion import completionwidget, completer
 from qutebrowser.keyinput import modeman
 from qutebrowser.browser import downloadview, hints, downloads
@@ -229,6 +229,30 @@ class MainWindow(QWidget):
             win_id=self.win_id, private=self.is_private, parent=self)
         objreg.register('tabbed-browser', self.tabbed_browser, scope='window',
                         window=self.win_id)
+
+        # Phase 2: vertical workspace panel (left of the browser area).
+        # The empty shell owns the focus event filter and the toggle
+        # command plumbing; PINPanel / TabTree / WorkspaceIndicator
+        # are added in later sub-slices.
+        self.vertical_panel = verticalpanel.VerticalPanel(
+            win_id=self.win_id, parent=self)
+        objreg.register('vertical-panel', self.vertical_panel,
+                        scope='window', window=self.win_id,
+                        command_only=True)
+        # Horizontal splitter: panel on the left, browser on the
+        # right. ADR 0008 § "VerticalPanel composition" mandates
+        # QSplitter (not QDockWidget) so the panel is a first-class
+        # window child and the focus chain works naturally.
+        self._central_splitter = QSplitter(
+            Qt.Orientation.Horizontal, parent=self)
+        self._central_splitter.setObjectName('central-splitter')
+        self._central_splitter.setChildrenCollapsible(False)
+        self._central_splitter.addWidget(self.vertical_panel)
+        self._central_splitter.addWidget(self.tabbed_browser.widget)
+        self._central_splitter.setSizes(
+            [config.val.verticalpanel.width,
+             max(self.width() - config.val.verticalpanel.width, 1)])
+
         self._init_command_dispatcher()
 
         # We need to set an explicit parent for StatusBar because it does some
@@ -412,10 +436,14 @@ class MainWindow(QWidget):
 
     def _add_widgets(self):
         """Add or re-add all widgets to the VBox."""
-        self._vbox.removeWidget(self.tabbed_browser.widget)
+        self._vbox.removeWidget(self._central_splitter)
         self._vbox.removeWidget(self._downloadview)
         self._vbox.removeWidget(self.status)
-        widgets: list[QWidget] = [self.tabbed_browser.widget]
+        # The splitter holds VerticalPanel + tabbed_browser.widget, so
+        # the vbox only sees the splitter as a single unit. Re-adding
+        # it is enough to keep the layout consistent across statusbar
+        # / downloads position changes.
+        widgets: list[QWidget] = [self._central_splitter]
 
         downloads_position = config.val.downloads.position
         if downloads_position == 'top':

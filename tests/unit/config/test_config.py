@@ -124,7 +124,8 @@ class TestKeyConfig:
             'prompt': {},
             'caret': {},
             'register': {},
-            'yesno': {}
+            'yesno': {},
+            'workspace_panel': {}
         }
         expected_default_bindings = {
             'normal': {keyseq('a'): 'message-info foo',
@@ -136,7 +137,8 @@ class TestKeyConfig:
             'prompt': {},
             'caret': {},
             'register': {},
-            'yesno': {}
+            'yesno': {},
+            'workspace_panel': {}
         }
 
         config_stub.val.bindings.default = orig_default_bindings
