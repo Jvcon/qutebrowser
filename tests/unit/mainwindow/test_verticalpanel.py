@@ -39,6 +39,19 @@ class TestVerticalPanel:
         config_stub.val.verticalpanel.visible = True
         panel = verticalpanel.VerticalPanel(win_id=0)
         qtbot.add_widget(panel)
+        # The panel is focusable and ``qtbot.add_widget`` shows it,
+        # which queues a real focus-in event in the Qt event loop.
+        # That event fires AFTER this fixture body returns, so a
+        # naive reset here would be undone by the queued event before
+        # the test body runs (the test would see ``_in_mode = True``
+        # and the manual ``_on_focus_changed`` call would skip the
+        # enter branch). Flush the event loop first so the queued
+        # focus event fires NOW; then reset state and the mock so
+        # each test starts from a clean focus baseline.
+        QApplication.processEvents()
+        panel._in_mode = False
+        panel._last_focused = None
+        modeman_mock.clear()
         return panel
 
     def test_focus_policy_strong_focus(self, panel):

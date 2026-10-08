@@ -231,11 +231,21 @@ class MainWindow(QWidget):
                         window=self.win_id)
 
         # Phase 2: vertical workspace panel (left of the browser area).
-        # The empty shell owns the focus event filter and the toggle
-        # command plumbing; PINPanel / TabTree / WorkspaceIndicator
-        # are added in later sub-slices.
+        # The PINPanel child is wired to the app-scope WorkspaceManager
+        # (registered by qutebrowser.workspaces.init during startup);
+        # the TabTree and WorkspaceIndicator follow in later sub-slices.
+        try:
+            workspace_manager = objreg.get('workspace-manager')
+        except KeyError:
+            # Startup order quirk: the manager may not be registered
+            # yet during very early test setups. Falling back to
+            # ``None`` lets the panel render without a data source;
+            # the manager will be attached on the next signal.
+            workspace_manager = None
         self.vertical_panel = verticalpanel.VerticalPanel(
-            win_id=self.win_id, parent=self)
+            win_id=self.win_id,
+            manager=workspace_manager,
+            parent=self)
         objreg.register('vertical-panel', self.vertical_panel,
                         scope='window', window=self.win_id,
                         command_only=True)
