@@ -188,7 +188,10 @@ A `QToolBar` with `QToolButton`s in a single horizontal row.
 - Checkable buttons.
 - Active workspace: sunken state + accent border (`colors.tabs.indicator.start`).
 - Inactive workspace: raised state.
-- Right click opens a context menu: rename, archive, delete.
+- Right click opens a context menu: rename, archive, delete. Archive
+  sets the workspace's `archived: true` field and removes it from the
+  indicator while keeping its YAML on disk; a follow-up unarchive action
+  restores it.
 
 Workspace switching happens **only** via the WorkspaceIndicator. Clicking a
 button switches the active workspace; the TabTree redraws to show that
@@ -367,6 +370,10 @@ User clicks chevron on `client-A docs`. Its 4 children appear:
 # <data>/workspaces/<id>.yml
 id: <uuid>
 name: <string>
+last_active: <iso8601>          # ISO 8601 UTC; stamped on add_workspace and on set_active
+color: <hex>                    # optional; overrides the deterministic HSL monogram fill
+icon: <emoji | path>            # optional; overrides the letter monogram (emoji glyph or absolute icon path)
+archived: false                 # true hides the workspace from WorkspaceIndicator but keeps its data on disk
 groups:
   - group_id: <uuid>
     name: github
@@ -545,6 +552,53 @@ pinned tab; WorkspaceIndicator button = switch workspace.
 
 Press `w` or `t` to execute; any other key dismisses.
 
+### Panel focus & mode model
+
+The VerticalPanel and the browser area are two **physically separate
+panels** (joined by a `QSplitter`). Keyboard focus moves between them via
+the standard Qt focus chain, and qutebrowser's binding parser dispatches
+keys by `KeyMode`, not by panel. The bridge is a single dedicated mode
+that covers the entire VerticalPanel.
+
+**Mode**: `usertypes.KeyMode.workspace_panel` (new in Phase 2).
+
+- `enter(workspace_panel)` runs when Qt focus enters any direct child of
+  the `VerticalPanel` root: the `PINPanel`, the `TabTree`, the `FilterRow`
+  (when open), and any button in the `WorkspaceIndicator`.
+- `leave(workspace_panel)` runs when focus leaves the panel back to the
+  webview (or to a transient overlay such as prompt / hint).
+- Inside the mode, all panel-state Phase 2 commands bind in
+  `bindings.default.workspace_panel:`. The browser area remains in
+  `KeyMode.normal`.
+
+**Focus rules**:
+
+- `Tab` / `Shift+Tab` cycles focus within the panel:
+  `PINPanel → TabTree → WorkspaceIndicator → PINPanel`. From the last
+  WorkspaceIndicator button, `Tab` wraps to the first PINPanel slot.
+- `Esc` from `workspace_panel` returns focus to the webview and leaves
+  the mode. `Esc` from a transient `prompt` (the filter row) closes the
+  filter and returns focus to the TabTree, staying in `workspace_panel`.
+- `Ctrl+\` toggles the panel's visibility AND focus state: hidden → visible
+  moves focus to whichever child was last focused (or the TabTree if
+  first time); visible → hidden returns focus to the webview and leaves
+  the mode.
+- Mouse clicks on a panel child update the auto-`setFocus` target so
+  re-entering the panel after `Ctrl+\` lands on the clicked widget, not
+  on the TabTree by default.
+
+**Mode stack**: `workspace_panel` coexists with the existing transient
+modes (`hint`, `command`, `prompt`, `caret`, `passthrough`, `insert`).
+The `ModeManager._prev_mode` machinery already records
+`workspace_panel` as the prev mode for any of these that stack on top, so
+`Esc` from a transient restores the panel instead of falling through to
+`normal`.
+
+**Visual feedback**: the status bar's mode indicator shows
+`-- WORKSPACE --` while in `workspace_panel` (same channel the existing
+`-- INSERT --` / `-- CARET --` indicators use). The panel's focus ring
+(§ Focus ring) follows the same keyboard-only contract.
+
 ### Screen reader contract
 
 The TabTree and PIN panel expose a clean AT-SPI2 contract:
@@ -581,6 +635,22 @@ AccessibleDescription: "tab, github.com/issues/128, loading, audio playing"
 
 When expand/collapse changes, emit `model.dataChanged` for the row index so the
 screen reader re-announces the new state.
+
+## Binding classification
+
+All Phase 2 commands and key bindings split into three classes by where
+they register in `bindings.default:`.
+
+| Class | Registered in | Example commands | Target semantics |
+|---|---|---|---|
+| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tab-close`, `tab-only`, `tab-clone`, `tab-reload` | In `normal:`, the target is the webview's active tab. In `workspace_panel:`, the target is the TabTree's selected row (which may be a different tab). |
+| **Panel-state operations** | `bindings.default.workspace_panel:` only | `workspace-add`, `workspace-rename`, `workspace-delete`, `workspace-archive`, `workspace-unarchive`, `workspace-next`, `workspace-prev`, `workspace-switch`, `pintab-style-toggle`, `group-create`, `group-rename`, `group-delete`, `group-list`, `auto-group-reapply` | Operate on the active workspace / selected group / pinned-tab list. Have no meaning from `normal:` because they have no active-tab target. |
+| **Global operations** | `bindings.default.normal:` only | `vertical-panel-toggle` | Toggle panel visibility; no tab/group target. |
+
+**Registration rule for Phase 5**: every new command MUST be classified
+into exactly one of the three classes above in `configdata.yml`, and
+**active-tab operations MUST appear in both `normal:` and
+`workspace_panel:`** so the same key works from either focus.
 
 ## Reconciliation notes — qutebrowser-specific
 
@@ -634,12 +704,23 @@ screen reader re-announces the new state.
    `configdata.yml` (~line 3676-4009). Names follow `workspace-*` /
    `pintab-*` / `group-*` / `tab-*` convention. New bindings are expected for:
 
-   - `workspace-add`, `workspace-rename`, `workspace-delete`, `workspace-next`,
-     `workspace-prev`, `workspace-switch <name>`.
+   - `workspace-add`, `workspace-rename`, `workspace-delete`, `workspace-archive`,
+     `workspace-unarchive`, `workspace-next`, `workspace-prev`, `workspace-switch
+     <name>`.
    - `pintab-add`, `pintab-remove`, `pintab-move`, `pintab-style-toggle`.
    - `group-create`, `group-rename`, `group-delete`, `group-list`.
    - `tab-move-to-group`, `tab-move <from> <to> [<group_name>]`.
    - Panel visibility: `vertical-panel-toggle`.
+
+8. **VerticalPanel focus & key binding model** — the VerticalPanel and
+   the browser area are two `QSplitter`-pinned panels; physical focus is
+   Qt's job. Keyboard dispatch is `KeyMode`-based, not panel-based. The
+   VerticalPanel owns one mode, `KeyMode.workspace_panel`, entered on
+   focus-in to any panel child and left on focus-out. All Phase 2
+   commands split into three binding classes (active-tab / panel-state /
+   global); see the § "Binding classification" section above for the
+   table. The trade-off vs. parser-side focus dispatch is recorded in
+   § Decisions (Approach C accepted; Approach B rejected).
 
 ## Accessibility tier commitment
 
@@ -686,6 +767,16 @@ All spike decisions are closed. None remain open before v0.1 implementation.
 - **Empty-group deletion** — empty groups (`+0`) are deleted **without
   confirmation**; non-empty groups require a confirm prompt and null the
   members' `group_id`.
+- **VerticalPanel focus & binding model** (Approach C) — one
+  `KeyMode.workspace_panel` covers the whole panel;
+  `bindings.default.normal:` carries the webview's active-tab
+  operations, `bindings.default.workspace_panel:` carries the panel-state
+  operations plus the same-key-acts-on-selected-row variants of
+  active-tab operations. Parser is unchanged; focus dispatch stays with
+  Qt. Approach B (parser-side focus dispatch) rejected: ~5× implementation
+  cost (parser schema upgrade + index rewrite) for zero UX gain in
+  Phase 2's command set. See § "Binding classification" and § "Panel
+  focus & mode model" for the rule and the focus protocol.
 
 ## References
 
