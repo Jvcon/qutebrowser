@@ -177,6 +177,12 @@ def init(win_id: int, parent: QObject) -> 'ModeManager':
                 win_id=win_id,
                 commandrunner=commandrunner,
                 parent=modeman),
+
+        usertypes.KeyMode.workspace_panel:
+            modeparsers.WorkspacePanelKeyParser(
+                win_id=win_id,
+                commandrunner=commandrunner,
+                parent=modeman),
     }
 
     for mode, parser in keyparsers.items():

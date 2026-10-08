@@ -354,9 +354,14 @@ class StatusBar(QWidget):
                 suffix = ' ({} to leave)'.format(' or '.join(bindings))
             else:
                 suffix = ''
+            text = "-- {} MODE --{}".format(mode.upper(), suffix)
+        elif mode == 'workspace_panel':
+            # Phase 2: VerticalPanel mode shows a non-"MODE" indicator so
+            # the chrome reads naturally; see ADR 0008 § "Panel focus &
+            # mode model" for the rationale.
+            text = '-- WORKSPACE --'
         else:
-            suffix = ''
-        text = "-- {} MODE --{}".format(mode.upper(), suffix)
+            text = "-- {} MODE --".format(mode.upper())
         self.txt.setText(text)
 
     def _show_cmd_widget(self):
@@ -385,7 +390,12 @@ class StatusBar(QWidget):
             self.show()
 
         mode_manager = modeman.instance(self._win_id)
-        if mode_manager.parsers[mode].passthrough:
+        if mode == usertypes.KeyMode.workspace_panel:
+            # Non-passthrough mode that still wants the status-bar text
+            # so the user has a stable visual signal of which panel has
+            # focus. See ADR 0008 § "Panel focus & mode model".
+            self._set_mode_text('workspace_panel')
+        elif mode_manager.parsers[mode].passthrough:
             self._set_mode_text(mode.name)
         if mode in [usertypes.KeyMode.insert,
                     usertypes.KeyMode.command,
@@ -403,7 +413,11 @@ class StatusBar(QWidget):
             self.hide()
 
         mode_manager = modeman.instance(self._win_id)
-        if mode_manager.parsers[old_mode].passthrough:
+        if old_mode == usertypes.KeyMode.workspace_panel:
+            # Clear the workspace indicator; the next mode (typically
+            # KeyMode.normal) will set its own text via on_mode_entered.
+            self.txt.setText('')
+        elif mode_manager.parsers[old_mode].passthrough:
             if mode_manager.parsers[new_mode].passthrough:
                 self._set_mode_text(new_mode.name)
             else:

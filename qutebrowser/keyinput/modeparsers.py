@@ -68,6 +68,10 @@ class NormalKeyParser(CommandKeyParser):
 
     """KeyParser for normal mode with added STARTCHARS detection and more.
 
+    The ``mode`` parameter lets subclasses (e.g. ``WorkspacePanelKeyParser``)
+    reuse the partial-keychain and STARTCHARS machinery for a different
+    ``KeyMode`` while still inheriting the same command-parsing behaviour.
+
     Attributes:
         _partial_timer: Timer to clear partial keypresses.
     """
@@ -75,9 +79,10 @@ class NormalKeyParser(CommandKeyParser):
     _sequence: keyutils.KeySequence
 
     def __init__(self, *, win_id: int,
+                 mode: usertypes.KeyMode = usertypes.KeyMode.normal,
                  commandrunner: 'runners.CommandRunner',
                  parent: QObject | None = None) -> None:
-        super().__init__(mode=usertypes.KeyMode.normal, win_id=win_id,
+        super().__init__(mode=mode, win_id=win_id,
                          commandrunner=commandrunner, parent=parent)
         self._partial_timer = usertypes.Timer(self, 'partial-match')
         self._partial_timer.setSingleShot(True)
@@ -130,6 +135,30 @@ class NormalKeyParser(CommandKeyParser):
         """Reset inhibition state after a timeout."""
         self._debug_log("Releasing inhibition state of normal mode.")
         self._inhibited = False
+
+
+class WorkspacePanelKeyParser(NormalKeyParser):
+
+    """KeyParser for the VerticalPanel workspace mode (Phase 2).
+
+    Inherits partial-keychain handling and STARTCHARS detection from
+    :class:`NormalKeyParser`. The ``KeyMode`` is hard-coded to
+    :attr:`usertypes.KeyMode.workspace_panel` so the same binding
+    machinery serves both the webview and the VerticalPanel, with
+    ``bindings.default.normal:`` and ``bindings.default.workspace_panel:``
+    holding two separate binding sets.
+
+    Subclasses (or this class itself, in later Phase 2 sub-slices) will
+    add panel-specific overrides: e.g. transient filter-row handling,
+    TabTree selection navigation, and the ``Esc``-to-webview protocol.
+    """
+
+    def __init__(self, *, win_id: int,
+                 commandrunner: 'runners.CommandRunner',
+                 parent: QObject | None = None) -> None:
+        super().__init__(win_id=win_id,
+                         mode=usertypes.KeyMode.workspace_panel,
+                         commandrunner=commandrunner, parent=parent)
 
 
 class HintKeyParser(basekeyparser.BaseKeyParser):

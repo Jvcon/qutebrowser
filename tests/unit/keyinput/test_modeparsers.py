@@ -11,6 +11,7 @@ import pytest
 
 from qutebrowser.keyinput import modeparsers, keyutils
 from qutebrowser.config import configexc
+from qutebrowser.utils import usertypes
 
 
 @pytest.fixture
@@ -166,3 +167,47 @@ class TestHintKeyParser:
                 assert not commandrunner.commands
 
         assert commandrunner.commands == [('message-info abc', None)]
+
+
+class TestWorkspacePanelKeyParser:
+
+    """Tests for the VerticalPanel workspace mode keyparser (Phase 2).
+
+    The parser is a thin subclass of :class:`NormalKeyParser` that
+    hard-codes the ``KeyMode`` to :attr:`usertypes.KeyMode.workspace_panel`.
+    It reuses the partial-keychain and STARTCHARS machinery, so the
+    tests here mainly pin the mode and the inheritance, then exercise
+    a representative key sequence to confirm the command runner is
+    wired the same way as the normal mode parser.
+    """
+
+    @pytest.fixture(autouse=True)
+    def patch_stuff(self, monkeypatch, stubs, keyinput_bindings):
+        """Set up mocks and read the test config."""
+        monkeypatch.setattr(
+            'qutebrowser.keyinput.basekeyparser.usertypes.Timer',
+            stubs.FakeTimer)
+
+    @pytest.fixture
+    def keyparser(self, commandrunner):
+        return modeparsers.WorkspacePanelKeyParser(
+            win_id=0, commandrunner=commandrunner)
+
+    def test_inherits_normal_keyparser(self, keyparser):
+        """Test that WorkspacePanelKeyParser subclasses NormalKeyParser."""
+        assert isinstance(keyparser, modeparsers.NormalKeyParser)
+
+    def test_mode_is_workspace_panel(self, keyparser):
+        """Test that the parser's mode is KeyMode.workspace_panel."""
+        assert keyparser._mode == usertypes.KeyMode.workspace_panel
+
+    def test_not_passthrough(self, keyparser):
+        """Test that the parser is not a passthrough mode."""
+        assert keyparser.passthrough is False
+
+    def test_dispatches_command(self, keyparser, commandrunner):
+        """Test that a keypress dispatches a panel-mode bound command."""
+        chain = keyutils.KeySequence.parse('j')
+        for info in chain:
+            keyparser.handle(info.to_event())
+        assert commandrunner.commands == [('message-info panel-down', None)]

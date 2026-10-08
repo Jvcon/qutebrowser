@@ -20,7 +20,9 @@ BINDINGS = {'prompt': {'<Ctrl-a>': 'message-info ctrla',
                        '1': 'message-info 1'},
             'command': {'foo': 'message-info bar',
                         '<Ctrl+X>': 'message-info ctrlx'},
-            'normal': {'a': 'message-info a', 'ba': 'message-info ba'}}
+            'normal': {'a': 'message-info a', 'ba': 'message-info ba'},
+            'workspace_panel': {'j': 'message-info panel-down',
+                                'gg': 'message-info panel-top'}}
 MAPPINGS = {
     'x': 'a',
     'b': 'a',

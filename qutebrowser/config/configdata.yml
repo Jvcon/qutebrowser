@@ -3990,12 +3990,15 @@ bindings.default:
       <Escape>: mode-leave
     register:
       <Escape>: mode-leave
+    workspace_panel:
+      <Escape>: mode-leave
   type:
     name: Dict
     none_ok: true
     keytype: String  # section name
     fixed_keys: ['normal', 'insert', 'hint', 'passthrough', 'command',
-                 'prompt', 'yesno', 'caret', 'register']
+                 'prompt', 'yesno', 'caret', 'register',
+                 'workspace_panel']
     valtype:
       name: Dict
       none_ok: true
@@ -4019,7 +4022,8 @@ bindings.commands:
     none_ok: true
     keytype: String  # section name
     fixed_keys: ['normal', 'insert', 'hint', 'passthrough', 'command',
-                 'prompt', 'yesno', 'caret', 'register']
+                 'prompt', 'yesno', 'caret', 'register',
+                 'workspace_panel']
     valtype:
       name: Dict
       none_ok: true
