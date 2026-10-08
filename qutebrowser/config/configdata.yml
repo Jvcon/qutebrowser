@@ -2645,7 +2645,7 @@ url.yank_ignored_parameters:
 
 ## verticalpanel
 
-pinned-tabs.style:
+pinned_tabs.style:
   type:
     name: String
     valid_values: [icon, line]

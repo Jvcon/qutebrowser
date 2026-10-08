@@ -74,9 +74,10 @@ FaviconRole = Qt.ItemDataRole.UserRole + 3
 
 
 def _pinned_tab_data(tab: PinnedTab, role: int):
-    """Shared role -> value lookup for the model and the line-mode
-    delegate. Keeping the role table in one place avoids the "two
-    callers disagree on a role" footgun.
+    """Shared role -> value lookup for the model and the line-mode delegate.
+
+    Keeping the role table in one place avoids the "two callers
+    disagree on a role" footgun.
     """
     if role == TitleRole:
         return tab.title
@@ -131,6 +132,27 @@ class PinnedTabModel(QAbstractItemModel):
             # We are a list, not a tree.
             return 0
         return len(self._pinned)
+
+    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        return 1
+
+    def index(  # noqa: N802 - Qt naming
+            self,
+            row: int,
+            column: int,
+            parent: QModelIndex = QModelIndex(),
+    ) -> QModelIndex:
+        if not self.hasIndex(row, column, parent):
+            return QModelIndex()
+        return self.createIndex(row, column, self._pinned[row])
+
+    def parent(  # noqa: N802 - Qt naming
+            self,
+            child: QModelIndex = QModelIndex(),
+    ) -> QModelIndex:  # type: ignore[override]
+        # Flat list — every (valid) index has the implicit root as
+        # its parent.
+        return QModelIndex()
 
     def data(  # noqa: N802 - Qt naming
             self,
@@ -214,12 +236,11 @@ class PinnedTabDelegate(QStyledItemDelegate):
 
 class _PinListView(QListView):
 
-    """QListView subclass that records the originating button on
-    release.
+    """QListView subclass that records the originating button on release.
 
-    Qt's public ``clicked`` signal carries only the QModelIndex, not
-    the mouse button. The host can ask ``last_button_for(index)``
-    after ``clicked`` fires to know which button triggered the
+    Qt's public ``clicked`` signal carries only the QModelIndex, not the
+    mouse button. The host can ask ``last_button_for(index)`` after
+    ``clicked`` fires to know which button triggered the
     activation. Middle and right clicks are *also* routed through
     the event filter, so this is mostly belt-and-suspenders for the
     left-click path.
