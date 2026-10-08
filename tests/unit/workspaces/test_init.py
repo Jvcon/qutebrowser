@@ -2,15 +2,15 @@
 #
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Tests for workspace Saveable registration in configinit."""
+"""Tests for workspace Saveable registration in qutebrowser.workspaces."""
 
 import unittest.mock
 
 import pytest
 
-from qutebrowser.config import config, configfiles, configinit, configtypes
 from qutebrowser.misc import savemanager
 from qutebrowser.utils import objreg
+from qutebrowser import workspaces
 
 
 @pytest.fixture(autouse=True)
@@ -23,9 +23,8 @@ def cleanup_workspace_manager():
         pass
 
 
-def test_init_workspace_saveable_registers(fake_save_manager, data_tmpdir,
-                                           qapp):
-    configinit._init_workspace_saveable(fake_save_manager)
+def test_init_registers_saveable(fake_save_manager, data_tmpdir, qapp):
+    workspaces.init(fake_save_manager)
 
     fake_save_manager.add_saveable.assert_called_with(
         'workspace-manager', unittest.mock.ANY, unittest.mock.ANY)
@@ -34,7 +33,7 @@ def test_init_workspace_saveable_registers(fake_save_manager, data_tmpdir,
 
 def test_changed_signal_is_wired_to_saveable(fake_save_manager, data_tmpdir,
                                              qapp):
-    configinit._init_workspace_saveable(fake_save_manager)
+    workspaces.init(fake_save_manager)
     manager = objreg.get('workspace-manager')
 
     name, save, changed = fake_save_manager.add_saveable.call_args[0]
@@ -52,7 +51,7 @@ def test_changed_signal_is_wired_to_saveable(fake_save_manager, data_tmpdir,
 
 def test_changed_emission_triggers_saveable_save(fake_save_manager, data_tmpdir,
                                                  qapp):
-    configinit._init_workspace_saveable(fake_save_manager)
+    workspaces.init(fake_save_manager)
     manager = objreg.get('workspace-manager')
     _, _, changed = fake_save_manager.add_saveable.call_args[0]
 
@@ -65,15 +64,6 @@ def test_changed_emission_triggers_saveable_save(fake_save_manager, data_tmpdir,
     save_spy.assert_called_once()
 
 
-def test_late_init_calls_workspace_init(monkeypatch, mocker, fake_save_manager,
-                                        data_tmpdir, qapp):
-    monkeypatch.setattr(configinit, '_init_errors', None)
-    monkeypatch.setattr(config, 'instance', mocker.Mock())
-    monkeypatch.setattr(config, 'val', mocker.Mock())
-    monkeypatch.setattr(configfiles, 'state', mocker.Mock())
-    mocker.patch.object(configtypes.FontBase, 'set_defaults')
-    spy = mocker.patch.object(configinit, '_init_workspace_saveable')
-
-    configinit.late_init(fake_save_manager)
-
-    spy.assert_called_once_with(fake_save_manager)
+def test_configinit_no_longer_wires_workspaces():
+    from qutebrowser.config import configinit
+    assert not hasattr(configinit, '_init_workspace_saveable')

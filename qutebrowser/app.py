@@ -37,6 +37,7 @@ from qutebrowser.qt.gui import QDesktopServices, QPixmap, QIcon
 from qutebrowser.qt.core import pyqtSlot, QUrl, QObject, QEvent, pyqtSignal, Qt
 
 import qutebrowser
+from qutebrowser import workspaces
 from qutebrowser.commands import runners
 from qutebrowser.config import (config, websettings, configfiles, configinit,
                                 qtargs)
@@ -480,6 +481,9 @@ def _init_modules(*, args):
 
     log.init.debug("Initializing command history...")
     cmdhistory.init()
+
+    log.init.debug("Initializing workspaces...")
+    workspaces.init(save_manager)
 
     log.init.debug("Initializing websettings...")
     websettings.init(args)

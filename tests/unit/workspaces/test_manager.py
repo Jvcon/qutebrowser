@@ -44,6 +44,10 @@ class TestWorkspaceCrud:
         workspace = manager.add_workspace('first')
         assert manager.get_active() == workspace
 
+    def test_add_workspace_stamps_last_active(self, manager):
+        workspace = manager.add_workspace('first')
+        assert workspace.last_active is not None
+
     def test_delete_workspace(self, manager):
         workspace = manager.add_workspace('w')
         manager.delete_workspace(workspace.id)
@@ -185,3 +189,48 @@ class TestSaveLoad:
         assert manager.list_workspaces() == []
         assert manager.list_pinned() == []
         assert manager.get_active() is None
+
+    def test_active_id_restored_after_add_and_save(self, pers, qapp):
+        first = WorkspaceManager(*pers)
+        workspace = first.add_workspace('first')
+        assert workspace.last_active is not None
+        first.save()
+
+        second = WorkspaceManager(*pers)
+        second.load()
+
+        restored = second.get_active()
+        assert restored is not None
+        assert restored.id == workspace.id
+        assert [ws.id for ws in second.list_workspaces()] == [workspace.id]
+
+    def test_load_only_loads_active_workspace(self, pers, qapp):
+        first = WorkspaceManager(*pers)
+        active = first.add_workspace('active')
+        inactive = first.add_workspace('inactive')
+        first.set_active(active.id)
+        first.save()
+
+        second = WorkspaceManager(*pers)
+        second.load()
+
+        assert [ws.id for ws in second.list_workspaces()] == [active.id]
+
+        loaded = second.get_workspace(inactive.id)
+        assert loaded is not None
+        assert loaded.name == 'inactive'
+        assert [ws.id for ws in second.list_workspaces()] == [active.id,
+                                                              inactive.id]
+
+    def test_get_workspace_missing_is_none(self, manager, qapp):
+        assert manager.get_workspace(uuid.uuid4()) is None
+
+    def test_delete_active_clears_state(self, pers, qapp):
+        first = WorkspaceManager(*pers)
+        workspace = first.add_workspace('w')
+        first.delete_workspace(workspace.id)
+
+        second = WorkspaceManager(*pers)
+        second.load()
+        assert second.get_active() is None
+        assert second.list_workspaces() == []

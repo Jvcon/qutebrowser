@@ -135,18 +135,3 @@ def late_init(save_manager: savemanager.SaveManager) -> None:
 
     config.instance.init_save_manager(save_manager)
     configfiles.state.init_save_manager(save_manager)
-    _init_workspace_saveable(save_manager)
-
-
-def _init_workspace_saveable(save_manager: savemanager.SaveManager) -> None:
-    """Create the WorkspaceManager and register it as a Saveable."""
-    from qutebrowser.workspaces.manager import WorkspaceManager
-    from qutebrowser.workspaces.persistence import (PinnedPersistence,
-                                                    WorkspacePersistence)
-    persistence = WorkspacePersistence()
-    pinned_persistence = PinnedPersistence()
-    manager = WorkspaceManager(persistence, pinned_persistence)
-    manager.load()
-    save_manager.add_saveable('workspace-manager', manager.save,
-                              manager.changed)
-    objreg.register('workspace-manager', manager, update=True)

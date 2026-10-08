@@ -13,31 +13,42 @@ objects and pinned tabs, exposes CRUD operations over them, and emits
 
 import datetime
 import uuid
-from typing import Optional
+from typing import Any, Callable, Optional
+
+import yaml
 
 from qutebrowser.qt.core import QObject, pyqtSignal
 
+from qutebrowser.utils import log
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
 from qutebrowser.workspaces.persistence import (PinnedPersistence,
                                                 WorkspacePersistence)
 
 
+def _now() -> str:
+    """Return the current time as an ISO 8601 UTC timestamp."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
 class WorkspaceManager(QObject):
 
     """In-memory store of workspaces + pinned tabs; persists via Saveable.
 
-    Attributes:
+    Only the active workspace is loaded eagerly (see :meth:`load`); other
+    workspaces are loaded on demand through :meth:`get_workspace`.
+
+    Signals:
         changed: Emitted whenever managed state changes.
     """
 
     changed = pyqtSignal()
 
     def __init__(self, persistence: WorkspacePersistence,
-                 pinned: PinnedPersistence) -> None:
+                 pinned_persistence: PinnedPersistence) -> None:
         super().__init__()
         self._persistence = persistence
-        self._pinned_persistence = pinned
+        self._pinned_persistence = pinned_persistence
         self._workspaces: dict[uuid.UUID, Workspace] = {}
         self._active_id: Optional[uuid.UUID] = None
         self._pinned: list[PinnedTab] = []
@@ -45,36 +56,47 @@ class WorkspaceManager(QObject):
     # --- load/save ---
 
     def load(self) -> None:
-        """Load all workspaces and pinned tabs from disk.
+        """Load the active workspace and pinned tabs from disk.
 
-        The active workspace is restored from the most recent ``last_active``
-        timestamp found on disk, if any.
+        Only the workspace whose id is recorded in the state file is loaded
+        eagerly; all others are loaded on demand via :meth:`get_workspace`.
         """
-        self._workspaces = {
-            workspace.id: workspace
-            for workspace in self._persistence.load_all()
-        }
-        self._pinned = self._pinned_persistence.load()
+        self._workspaces = {}
         self._active_id = None
-        candidates = [ws for ws in self._workspaces.values() if ws.last_active]
-        if candidates:
-            active = max(candidates, key=lambda ws: ws.last_active or '')
-            self._active_id = active.id
+
+        active_id = self._persistence.load_state()
+        if active_id is not None:
+            try:
+                workspace = self._persistence.load(active_id)
+            except (yaml.YAMLError, KeyError, ValueError, OSError) as e:
+                log.message.warning(
+                    f"Could not load active workspace {active_id}: {e}")
+            else:
+                self._workspaces[workspace.id] = workspace
+                self._active_id = workspace.id
+
+        self._pinned = self._pinned_persistence.load()
 
     def save(self) -> None:
-        """Persist all workspaces and pinned tabs."""
+        """Persist all loaded workspaces, the active id, and pinned tabs."""
         for workspace in self._workspaces.values():
             self._persistence.save(workspace)
+        self._persistence.save_state(self._active_id)
         self._pinned_persistence.save(self._pinned)
 
     # --- workspace CRUD ---
 
     def add_workspace(self, name: str) -> Workspace:
-        """Create, store, and return a new workspace."""
-        workspace = Workspace(id=uuid.uuid4(), name=name)
+        """Create, store, and return a new workspace.
+
+        The new workspace is stamped with ``last_active`` so a first launch
+        followed by a save can restore it on the next start.
+        """
+        workspace = Workspace(id=uuid.uuid4(), name=name, last_active=_now())
         self._workspaces[workspace.id] = workspace
         if self._active_id is None:
             self._active_id = workspace.id
+            self._persistence.save_state(self._active_id)
         self.changed.emit()
         return workspace
 
@@ -84,6 +106,7 @@ class WorkspaceManager(QObject):
         self._persistence.delete(workspace_id)
         if self._active_id == workspace_id:
             self._active_id = None
+        self._persistence.save_state(self._active_id)
         self.changed.emit()
 
     def rename_workspace(self, workspace_id: uuid.UUID, new_name: str) -> None:
@@ -92,15 +115,26 @@ class WorkspaceManager(QObject):
         self.changed.emit()
 
     def list_workspaces(self) -> list[Workspace]:
-        """Return all known workspaces."""
+        """Return all loaded workspaces."""
         return list(self._workspaces.values())
 
+    def get_workspace(self, workspace_id: uuid.UUID) -> Optional[Workspace]:
+        """Return a workspace by id, loading it from disk on demand."""
+        if workspace_id in self._workspaces:
+            return self._workspaces[workspace_id]
+        try:
+            workspace = self._persistence.load(workspace_id)
+        except (yaml.YAMLError, KeyError, ValueError, OSError):
+            return None
+        self._workspaces[workspace.id] = workspace
+        return workspace
+
     def set_active(self, workspace_id: uuid.UUID) -> None:
-        """Mark a workspace as active, updating its ``last_active`` stamp."""
+        """Mark a workspace as active, stamping ``last_active`` and state."""
         workspace = self._workspaces[workspace_id]
-        workspace.last_active = datetime.datetime.now(
-            datetime.timezone.utc).isoformat()
+        workspace.last_active = _now()
         self._active_id = workspace_id
+        self._persistence.save_state(self._active_id)
         self.changed.emit()
 
     def get_active(self) -> Optional[Workspace]:
@@ -114,18 +148,38 @@ class WorkspaceManager(QObject):
     def create_group(self, workspace_id: uuid.UUID, name: str) -> Group:
         """Create and return a new group in a workspace."""
         group = Group(group_id=uuid.uuid4(), name=name)
-        self._workspaces[workspace_id].groups.append(group)
+        self._workspaces[workspace_id].add_group(group)
         self.changed.emit()
         return group
+
+    def _mutate_group_or_tab(
+            self,
+            workspace_id: uuid.UUID,
+            target_id: uuid.UUID | int,
+            mutator: Callable[[Any], None],
+    ) -> None:
+        """Apply *mutator* to the group or tab identified by *target_id*.
+
+        Groups are searched first, then tabs.  :attr:`changed` is emitted
+        once if a matching item was found.
+        """
+        workspace = self._workspaces[workspace_id]
+        for group in workspace.groups:
+            if group.group_id == target_id:
+                mutator(group)
+                self.changed.emit()
+                return
+        for tab in workspace.tabs:
+            if tab.tab_id == target_id:
+                mutator(tab)
+                self.changed.emit()
+                return
 
     def rename_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID,
                      new_name: str) -> None:
         """Rename a group within a workspace."""
-        for group in self._workspaces[workspace_id].groups:
-            if group.group_id == group_id:
-                group.name = new_name
-                self.changed.emit()
-                return
+        self._mutate_group_or_tab(
+            workspace_id, group_id, lambda group: group.rename(new_name))
 
     def delete_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID) -> None:
         """Delete a group and make its members standalone.
@@ -138,7 +192,7 @@ class WorkspaceManager(QObject):
                             if group.group_id != group_id]
         for tab in workspace.tabs:
             if tab.group_id == group_id:
-                tab.group_id = None
+                tab.clear_group()
         self.changed.emit()
 
     def list_groups(self, workspace_id: uuid.UUID) -> list[Group]:
@@ -163,18 +217,14 @@ class WorkspaceManager(QObject):
                           if tab.tab_id != tab_id]
         for tab in workspace.tabs:
             if tab.parent_id == tab_id:
-                tab.parent_id = None
+                tab.clear_parent()
         self.changed.emit()
 
     def move_tab_to_group(self, workspace_id: uuid.UUID, tab_id: int,
                           group_id: Optional[uuid.UUID]) -> None:
         """Move a tab into a group (or to standalone when group_id is None)."""
-        workspace = self._workspaces[workspace_id]
-        for tab in workspace.tabs:
-            if tab.tab_id == tab_id:
-                tab.group_id = group_id
-                self.changed.emit()
-                return
+        self._mutate_group_or_tab(
+            workspace_id, tab_id, lambda tab: tab.assign_group(group_id))
 
     # --- pinned tabs ---
 

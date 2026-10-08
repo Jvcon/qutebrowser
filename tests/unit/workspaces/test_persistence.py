@@ -4,6 +4,7 @@
 
 """Tests for qutebrowser.workspaces.persistence."""
 
+import logging
 import uuid
 
 import pytest
@@ -62,6 +63,56 @@ class TestWorkspacePersistence:
     def test_base_path_created(self, tmp_path):
         persistence = WorkspacePersistence(base_path=tmp_path / 'new')
         assert persistence.base_path.exists()
+
+    def test_base_path_creates_missing_parents(self, tmp_path):
+        persistence = WorkspacePersistence(
+            base_path=tmp_path / 'deep' / 'nested' / 'workspaces')
+        assert persistence.base_path.exists()
+
+    def test_load_all_skips_corrupt_files(self, ws_persistence, caplog):
+        first = model.Workspace(id=uuid.uuid4(), name='a')
+        second = model.Workspace(id=uuid.uuid4(), name='b')
+        ws_persistence.save(first)
+        ws_persistence.save(second)
+        (ws_persistence.base_path / 'broken.yml').write_text(
+            'id: [unclosed\n', encoding='utf-8')
+
+        with caplog.at_level(logging.WARNING, 'message'):
+            loaded = ws_persistence.load_all()
+        assert {workspace.id for workspace in loaded} == {first.id, second.id}
+
+    def test_load_all_skips_missing_id_file(self, ws_persistence, caplog):
+        workspace = model.Workspace(id=uuid.uuid4(), name='a')
+        ws_persistence.save(workspace)
+        (ws_persistence.base_path / 'nodata.yml').write_text(
+            'name: no id here\n', encoding='utf-8')
+
+        with caplog.at_level(logging.WARNING, 'message'):
+            loaded = ws_persistence.load_all()
+        assert [ws.id for ws in loaded] == [workspace.id]
+
+    def test_state_roundtrip(self, ws_persistence):
+        workspace = model.Workspace(id=uuid.uuid4(), name='a')
+        assert ws_persistence.load_state() is None
+        ws_persistence.save_state(workspace.id)
+        assert ws_persistence.load_state() == workspace.id
+        ws_persistence.save_state(None)
+        assert ws_persistence.load_state() is None
+
+    def test_load_all_ignores_state_file(self, ws_persistence):
+        workspace = model.Workspace(id=uuid.uuid4(), name='a')
+        ws_persistence.save(workspace)
+        ws_persistence.save_state(workspace.id)
+
+        loaded = ws_persistence.load_all()
+        assert [ws.id for ws in loaded] == [workspace.id]
+
+    def test_load_state_invalid_id_is_none(self, ws_persistence, caplog):
+        ws_persistence.save_state(uuid.uuid4())
+        ws_persistence.state_path.write_text(
+            'active_id: not-a-uuid\n', encoding='utf-8')
+        with caplog.at_level(logging.WARNING, 'message'):
+            assert ws_persistence.load_state() is None
 
 
 class TestPinnedPersistence:

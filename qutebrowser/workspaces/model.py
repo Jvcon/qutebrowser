@@ -32,6 +32,10 @@ class Group:
     name: str
     folded: bool = False
 
+    def rename(self, new_name: str) -> None:
+        """Rename this group."""
+        self.name = new_name
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a primitive-only dict."""
         return {
@@ -64,6 +68,18 @@ class WorkspaceTab:
     tab_id: int
     parent_id: Optional[int] = None
     group_id: Optional[uuid.UUID] = None
+
+    def assign_group(self, group_id: Optional[uuid.UUID]) -> None:
+        """Move this tab into *group_id* (or to standalone when None)."""
+        self.group_id = group_id
+
+    def clear_group(self) -> None:
+        """Make this tab standalone by clearing its group membership."""
+        self.group_id = None
+
+    def clear_parent(self) -> None:
+        """Detach this tab from its parent tab."""
+        self.parent_id = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a primitive-only dict."""
@@ -108,6 +124,10 @@ class Workspace:
     tabs: list[WorkspaceTab] = dataclasses.field(default_factory=list)
     last_active: Optional[str] = None
 
+    def add_group(self, group: Group) -> None:
+        """Append *group* to this workspace's group list."""
+        self.groups.append(group)
+
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a primitive-only dict."""
         return {
@@ -140,14 +160,15 @@ class PinnedTab:
         title: The tab's last known title.
         url: The tab's last known URL.
         favicon: Raw favicon bytes (an embedded PNG), if available.
-        last_active: ISO 8601 timestamp of when the tab was last active.
+        last_active: ISO 8601 timestamp of when the tab was last active, or
+            None if it has never been active.
     """
 
     tab_id: int
     title: str
     url: str
     favicon: Optional[bytes] = None
-    last_active: str = ""
+    last_active: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a primitive-only dict (favicon as base64 ASCII)."""
@@ -155,13 +176,15 @@ class PinnedTab:
             encoded: Optional[str] = None
         else:
             encoded = base64.b64encode(self.favicon).decode('ascii')
-        return {
+        data: dict[str, Any] = {
             'tab_id': self.tab_id,
             'title': self.title,
             'url': self.url,
             'favicon': encoded,
-            'last_active': self.last_active,
         }
+        if self.last_active is not None:
+            data['last_active'] = self.last_active
+        return data
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> 'PinnedTab':
@@ -175,5 +198,5 @@ class PinnedTab:
             title=d['title'],
             url=d['url'],
             favicon=favicon,
-            last_active=d.get('last_active', ''),
+            last_active=d.get('last_active'),
         )

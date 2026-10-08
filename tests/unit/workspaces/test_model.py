@@ -109,7 +109,20 @@ class TestPinnedTab:
         tab = model.PinnedTab(tab_id=1, title='t', url='u')
         assert tab.to_dict()['favicon'] is None
 
-    def test_last_active_defaults_to_empty_string(self):
+    def test_last_active_defaults_to_none(self):
         tab = model.PinnedTab(tab_id=1, title='t', url='u')
-        assert tab.last_active == ''
+        assert tab.last_active is None
         assert model.PinnedTab.from_dict(tab.to_dict()) == tab
+
+    def test_last_active_omitted_when_none(self):
+        tab = model.PinnedTab(tab_id=1, title='t', url='u')
+        d = tab.to_dict()
+        assert 'last_active' not in d
+        assert model.PinnedTab.from_dict(d).last_active is None
+
+    def test_last_active_roundtrips_when_set(self):
+        tab = model.PinnedTab(tab_id=1, title='t', url='u',
+                              last_active='2026-01-01T00:00:00+00:00')
+        d = tab.to_dict()
+        assert d['last_active'] == '2026-01-01T00:00:00+00:00'
+        assert model.PinnedTab.from_dict(d) == tab

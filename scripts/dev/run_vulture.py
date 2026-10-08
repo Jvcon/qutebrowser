@@ -115,6 +115,17 @@ def whitelist_generator():  # noqa: C901
     yield 'scripts.get_coredumpctl_traces.Line.gid'
     yield 'scripts.importer.import_moz_places.places.row_factory'
 
+    # Workspace manager public API.  These methods are driven through the
+    # Saveable signal flow at runtime and (from Phase 5 on) via
+    # qutebrowser.commands.cmdutils.register, so vulture can't see their
+    # call sites statically.
+    for name in ['add_workspace', 'delete_workspace', 'rename_workspace',
+                 'list_workspaces', 'get_workspace', 'set_active',
+                 'get_active', 'create_group', 'rename_group', 'delete_group',
+                 'list_groups', 'add_tab', 'remove_tab', 'move_tab_to_group',
+                 'add_pinned', 'remove_pinned', 'list_pinned']:
+        yield 'qutebrowser.workspaces.manager.WorkspaceManager.' + name
+
     # component hooks
     yield 'qutebrowser.components.hostblock.on_lists_changed'
     yield 'qutebrowser.components.braveadblock.on_lists_changed'
