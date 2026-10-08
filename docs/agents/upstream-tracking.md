@@ -26,6 +26,9 @@ to do when each one moves."
 - **State:** OPEN, `priority: 1 - middle`, `component: style / refactoring`
 - **Created / last activity:** 2020-12-04 / 2020-12-06 (issue is dormant;
   no linked PRs as of last check)
+- **Linked PRs (merged):** #5936 "Profile cleanup 1" (merged 2020-12-07;
+  +63 / -60 across 3 files; refactored `webenginesettings.py` to start
+  the cleanup that #5935 itself will finish).
 - **Why we care:** The-Compiler's draft design in the issue body
   (`ProfileFactory(QObject)` with a `created = pyqtSignal(
   QWebEngineProfile)`) is exactly the abstraction our future `Profile`

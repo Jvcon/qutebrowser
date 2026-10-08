@@ -7,14 +7,62 @@
 The dataclasses here are intentionally serialization-agnostic: each provides a
 manual ``to_dict``/``from_dict`` pair that produces and consumes only primitive
 types (``str``, ``int``, ``bool``, ``None``) so the result can be handed
-straight to :func:`qutebrowser.utils.utils.yaml_dump`.  ``uuid.UUID`` values are
+straight to :func:`qutebrowser.utils.utils.yaml_dump``.  ``uuid.UUID`` values are
 stored as strings and ``bytes`` favicons as base64 ASCII strings.
 """
 
 import base64
 import dataclasses
+import pathlib
 import uuid
 from typing import Any, Optional
+
+
+@dataclasses.dataclass
+class Profile:
+
+    """A named storage profile (Phase X, not implemented yet).
+
+    Placeholder for alignment with upstream qutebrowser's planned
+    ``#5935`` refactor (The-Compiler's ``ProfileFactory(QObject)`` with a
+    ``created = pyqtSignal(QWebEngineProfile)``). When upstream lands,
+    this dataclass becomes a thin facade over the upstream
+    ``QWebEngineProfile`` plus a ``name -> profile-id`` map; until then
+    the only thing we use is the storage-root path (see
+    :attr:`basedir`).
+
+    The default profile is named ``'default'``; switching profiles
+    means pointing the :class:`~qutebrowser.workspaces.manager.WorkspaceManager`
+    at a different ``basedir``. Multiple workspaces may share one
+    profile — the fork's design is more flexible than upstream's
+    "1 profile = 1 window" model.
+
+    Attributes:
+        name: Human-readable profile identifier (also the directory
+            component under ``<data>/profiles/``).
+        basedir: Absolute path to this profile's root directory.
+    """
+
+    name: str
+    basedir: pathlib.Path
+
+    @classmethod
+    def default(cls) -> 'Profile':
+        """Return the default profile (named 'default')."""
+        from qutebrowser.utils import standarddir
+        return cls(
+            name='default',
+            basedir=pathlib.Path(standarddir.data()) / 'profiles' / 'default',
+        )
+
+    @classmethod
+    def for_name(cls, name: str) -> 'Profile':
+        """Return the profile for *name* under the standard data dir."""
+        from qutebrowser.utils import standarddir
+        return cls(
+            name=name,
+            basedir=pathlib.Path(standarddir.data()) / 'profiles' / name,
+        )
 
 
 @dataclasses.dataclass

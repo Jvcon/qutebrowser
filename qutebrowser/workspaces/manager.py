@@ -40,15 +40,21 @@ class WorkspaceManager(QObject):
 
     Signals:
         changed: Emitted whenever managed state changes.
+        pinned_changed: Emitted whenever the pinned-tab list changes
+            (add / remove / initial load). UI consumers (e.g. the
+            VerticalPanel's PINPanel) listen to this to refresh
+            without having to poll.
     """
 
     changed = pyqtSignal()
+    pinned_changed = pyqtSignal()
 
     def __init__(self, persistence: WorkspacePersistence,
                  pinned_persistence: PinnedPersistence) -> None:
         super().__init__()
         self._persistence = persistence
         self._pinned_persistence = pinned_persistence
+        self.profile_name: str = persistence.profile_name
         self._workspaces: dict[uuid.UUID, Workspace] = {}
         self._active_id: Optional[uuid.UUID] = None
         self._pinned: list[PinnedTab] = []
@@ -76,6 +82,11 @@ class WorkspaceManager(QObject):
                 self._active_id = workspace.id
 
         self._pinned = self._pinned_persistence.load()
+        # Signal consumers that the initial pinned list is now in
+        # memory. Late-constructed consumers (e.g. a PINPanel that is
+        # built after the manager) should also call list_pinned()
+        # once to pick up the initial state.
+        self.pinned_changed.emit()
 
     def save(self) -> None:
         """Persist all loaded workspaces, the active id, and pinned tabs."""
@@ -234,12 +245,14 @@ class WorkspaceManager(QObject):
                         if pinned.tab_id != tab.tab_id]
         self._pinned.append(tab)
         self.changed.emit()
+        self.pinned_changed.emit()
 
     def remove_pinned(self, tab_id: int) -> None:
         """Remove a pinned tab by tab_id."""
         self._pinned = [pinned for pinned in self._pinned
                         if pinned.tab_id != tab_id]
         self.changed.emit()
+        self.pinned_changed.emit()
 
     def list_pinned(self) -> list[PinnedTab]:
         """Return all pinned tabs."""

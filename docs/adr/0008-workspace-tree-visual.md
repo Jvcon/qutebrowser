@@ -14,7 +14,7 @@ row, the widget for each section, and the details that bind them together.
 
 The panel is organized as:
 
-1. **PIN panel** — profile-scoped pinned tabs, rendered as `icon` or `line`
+1. **PIN panel** — app-wide (cross-workspace) pinned tabs, rendered as `icon` or `line`
    style via `pinned-tabs.style`. The two styles are alternative renderings of
    the same set, **not** co-displayed.
 2. **TabTree** — a `QTreeView` styled as a tab bar for the *active* workspace's
@@ -54,9 +54,9 @@ presses `/`, and disappears on `Esc` or when the field is cleared.
 - Groups are **opt-in**: a fresh workspace starts with no groups, only
   standalone tabs. This avoids forcing a new abstraction on users who only need
   parent-child tab chains.
-- Pinned tabs are profile-scoped and cross-workspace; giving them their own
-  compact panel keeps them accessible without duplicating them into every
-  workspace's tab list.
+- Pinned tabs are app-wide (cross-workspace, per-profile); giving them their
+  own compact panel keeps them accessible without duplicating them into
+  every workspace's tab list.
 - A transient `QLineEdit` filter, opened with `/`, searches both PIN and
   TabTree so the user can reach any pinned or workspace tab with one
   keystroke. It disappears when inactive, keeping the default panel compact.
@@ -108,9 +108,11 @@ right-click submenu for toggling it.
 - Right click opens a context menu: close, unpin, move to workspace.
 - Long-press shows a tooltip with full title + URL.
 
-**Scope**: pinned tabs are **profile-scoped**, not workspace-scoped. They are
-visible in every workspace and persist in the profile YAML, not in workspace
-YAML.
+**Scope**: pinned tabs are **app-wide within a profile** (i.e. they cross
+workspace boundaries inside the same profile, but are isolated to the
+profile). They are visible in every workspace of the active profile and
+persist at `<data>/profiles/<name>/workspaces/pinned.yml`, not in any
+per-workspace YAML. See § "Storage layout" for the full tree.
 
 ### 2. Search & Filter (transient)
 
@@ -367,7 +369,7 @@ User clicks chevron on `client-A docs`. Its 4 children appear:
 ## Persistence schema (per workspace YAML)
 
 ```yaml
-# <data>/workspaces/<id>.yml
+# <data>/profiles/default/workspaces/<id>.yml
 id: <uuid>
 name: <string>
 last_active: <iso8601>          # ISO 8601 UTC; stamped on add_workspace and on set_active
@@ -406,6 +408,54 @@ Groups are workspace-scoped. Deleting a group nulls its members' `group_id`;
 empty groups (`+0`) can be deleted without confirmation. Auto-created groups are
 persisted exactly like manually created groups once they exist.
 
+## Storage layout
+
+All workspace data lives under a per-profile directory tree, designed
+to align with the path layout that upstream qutebrowser's planned
+[`#5935` ProfileFactory refactor](https://github.com/qutebrowser/qutebrowser/issues/5935)
+is expected to settle on (and already seeded by the merged PR
+[`#5936`](https://github.com/qutebrowser/qutebrowser/pull/5936)):
+
+```text
+<data>/
+└── profiles/
+    └── <name>/
+        └── workspaces/
+            ├── pinned.yml              # app-wide pinned tabs within this profile
+            ├── <workspace-uuid>.yml    # per-workspace state (one file per workspace)
+            └── _state.yml              # active workspace id (single line: active_id: <uuid>)
+```
+
+The default profile is named `default`. Multiple workspaces share one
+profile (the fork's design is more flexible than upstream's
+"1 profile = 1 window" model). Future `QWebEngineProfile` storage
+(cookies/history/cache from `#5935`) is expected to live at a
+**sibling** of `workspaces/` under the same `profiles/<name>/` root,
+not inside it — the namespaces are independent.
+
+### Legacy migration
+
+Pre-Profile data was stored at the basedir root:
+
+```text
+<data>/workspaces/<uuid>.yml
+<data>/workspaces/_state.yml
+<data>/profile/pinned.yml
+```
+
+On the first launch after upgrading, `WorkspacePersistence.__init__`
+and `PinnedPersistence.__init__` run a one-shot migration (idempotent,
+guarded to only run for the default profile, and a no-op when the
+caller passed an explicit `base_path` / `path` override). The
+migration moves any data found at the legacy locations into
+`profiles/default/workspaces/`, deletes the now-empty legacy
+directories, and emits a single info log line on the move.
+
+**No-clobber rule**: if both a legacy file and a new file with the
+same name exist, the new file wins and the legacy file is dropped
+silently. This matches the behaviour we want for users who ran two
+builds side-by-side during the migration window.
+
 ## Commands (new, in `bindings.default:`)
 
 | Command | Behavior |
@@ -424,7 +474,7 @@ persisted exactly like manually created groups once they exist.
 
 When a pinned tab is dragged from the PIN panel into a TabTree branch:
 
-1. The tab is **unpinned** (removed from the profile-scoped `pinned.yml`).
+1. The tab is **unpinned** (removed from the per-profile `pinned.yml`).
 2. The tab **becomes a regular tab** in the active workspace (added to
    `<workspace>.yml`'s `tabs[]`).
 3. **If the drop position is inside a group**, the tab is re-parented:
@@ -671,13 +721,13 @@ into exactly one of the three classes above in `configdata.yml`, and
    injection since status comes from `AudioRole` / `LoadingRole` model roles
    consumed by the delegate.
 
-3. **Pinned tabs are profile-scoped** — persistence lives at
-   `<data>/profile/pinned.yml` (or a `pinned` section in the existing profile
-   YAML), separate from per-workspace tab lists in `<data>/workspaces/<id>.yml`.
-   Schema:
+3. **Pinned tabs are per-profile, app-wide** — persistence lives at
+   `<data>/profiles/<name>/workspaces/pinned.yml` (see § "Storage
+   layout"), separate from per-workspace tab lists in
+   `<data>/profiles/<name>/workspaces/<id>.yml`. Schema:
 
    ```yaml
-   # <data>/profile/pinned.yml
+   # <data>/profiles/default/workspaces/pinned.yml
    pinned:
      - tab_id: <int>
        title: <string>
