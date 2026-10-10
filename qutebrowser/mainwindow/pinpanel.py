@@ -6,7 +6,7 @@
 
 Renders the profile-scoped pinned-tab list as either an icon grid
 (2×3 cells of 24×24 favicons) or a line list (16×16 favicon + elided
-title per row), depending on the ``pinned-tabs.style`` config key.
+title per row), depending on the ``pinned_tabs.style`` config key.
 See ADR 0008 § "1. PIN panel" for the visual contract.
 
 The panel is composed into the :class:`qutebrowser.mainwindow.verticalpanel.VerticalPanel`
@@ -354,7 +354,7 @@ class PINPanel(QWidget):
             self._list.setMinimumHeight(0)
 
     def _on_config_changed(self, option: str) -> None:
-        if option == 'pinned-tabs.style':
+        if option == 'pinned_tabs.style':
             self._apply_style()
 
     # --- data flow ---

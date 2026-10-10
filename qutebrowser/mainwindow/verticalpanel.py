@@ -8,13 +8,13 @@ Sits to the left of the browser area, joined by a ``QSplitter``. The
 panel is composed (top to bottom) of:
 
 - :class:`qutebrowser.mainwindow.pinpanel.PINPanel`
-- TabTree             (added in a later sub-slice)
+- :class:`qutebrowser.mainwindow.tabtree.TabTree`
 - WorkspaceIndicator  (added in a later sub-slice)
 
-The PINPanel is the first child to land; the TabTree and
-WorkspaceIndicator follow in subsequent sub-slices. The empty
-shell plus the focus event filter and the visibility toggle
-landed in the prior sub-slice and remain unchanged.
+The PINPanel and TabTree are now wired in; the WorkspaceIndicator
+follows in a subsequent sub-slice. The empty shell plus the focus
+event filter and the visibility toggle landed in the prior sub-slice
+and remain unchanged.
 
 Focus protocol
 =============
@@ -34,7 +34,7 @@ from qutebrowser.qt.widgets import QApplication, QVBoxLayout, QWidget
 
 from qutebrowser.config import config
 from qutebrowser.keyinput import modeman
-from qutebrowser.mainwindow import pinpanel
+from qutebrowser.mainwindow import pinpanel, tabtree
 from qutebrowser.utils import usertypes
 
 
@@ -48,6 +48,8 @@ class VerticalPanel(QWidget):
             panel; restored on the next ``toggle()`` show.
         pin_panel: The :class:`pinpanel.PINPanel` child at the top
             of the panel's QVBoxLayout.
+        tab_tree: The :class:`tabtree.TabTree` child below the PIN
+            panel, or None when no manager is supplied.
     """
 
     def __init__(
@@ -79,28 +81,24 @@ class VerticalPanel(QWidget):
         layout.setSpacing(0)
         self._layout = layout
 
-        # PINPanel is the first child. The TabTree and
-        # WorkspaceIndicator will be appended below it in later
-        # sub-slices. The manager is optional for the first slice so
-        # tests can pass a mock or None; if None, the panel just
-        # stays empty.
+        # PINPanel is the first child and TabTree is appended below
+        # it. WorkspaceIndicator follows in a later sub-slice. The
+        # manager is optional for the first slice so tests can pass a
+        # mock or None; if None, the panel just stays empty.
         self.pin_panel: pinpanel.PINPanel | None = None
         if manager is not None:
             self.pin_panel = pinpanel.PINPanel(
                 win_id=win_id, manager=manager, parent=self)
             self._layout.addWidget(self.pin_panel)
 
-        # Spacer pushes subsequent children (TabTree, WorkspaceIndicator)
-        # to the bottom of the panel when they land. Until then the
-        # PINPanel sits flush against the top.
-        from qutebrowser.qt.widgets import QSizePolicy
-        spacer = QWidget(self)
-        spacer.setObjectName('vertical-panel-spacer')
-        spacer.setSizePolicy(
-            QSizePolicy.Policy.Preferred,
-            QSizePolicy.Policy.Expanding,
-        )
-        self._layout.addWidget(spacer)
+        # TabTree fills the space between PINPanel and the future
+        # WorkspaceIndicator. It is optional so tests can pass a mock
+        # manager or None.
+        self.tab_tree: tabtree.TabTree | None = None
+        if manager is not None:
+            self.tab_tree = tabtree.TabTree(
+                win_id=win_id, manager=manager, parent=self)
+            self._layout.addWidget(self.tab_tree, stretch=1)
 
         self._apply_width()
         if config.val.verticalpanel.visible:

@@ -15,7 +15,7 @@ row, the widget for each section, and the details that bind them together.
 The panel is organized as:
 
 1. **PIN panel** — app-wide (cross-workspace) pinned tabs, rendered as `icon` or `line`
-   style via `pinned-tabs.style`. The two styles are alternative renderings of
+   style via `pinned_tabs.style`. The two styles are alternative renderings of
    the same set, **not** co-displayed.
 2. **TabTree** — a `QTreeView` styled as a tab bar for the *active* workspace's
    tabs, with optional groups and parent-child nesting. Workspace selection
@@ -77,7 +77,7 @@ For a first version we keep the native skeleton and skin it.
 
 ### 1. PIN panel
 
-Config-driven widget. Controlled by `pinned-tabs.style = icon | line`.
+Config-driven widget. Controlled by `pinned_tabs.style = icon | line`.
 Default is `icon`. Style switching is **config-only**; there is no UI control or
 right-click submenu for toggling it.
 
@@ -813,7 +813,7 @@ All spike decisions are closed. None remain open before v0.1 implementation.
   inside a group, otherwise top-level standalone.
 - **Pin panel collapse on empty** — collapse to 0 px.
 - **WorkspaceIndicator active style** — accent border + sunken.
-- **Pin style toggle UX** — config-only via `pinned-tabs.style`.
+- **Pin style toggle UX** — config-only via `pinned_tabs.style`.
 - **Empty-group deletion** — empty groups (`+0`) are deleted **without
   confirmation**; non-empty groups require a confirm prompt and null the
   members' `group_id`.

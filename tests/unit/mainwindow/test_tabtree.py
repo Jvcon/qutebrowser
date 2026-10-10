@@ -1,0 +1,565 @@
+# SPDX-FileCopyrightText: Freya Bruhin (The Compiler) <mail@qutebrowser.org>
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Tests for the vertical panel's TabTree (Phase 2, slice 1)."""
+
+import uuid
+
+import pytest
+
+from qutebrowser.qt.core import (
+    QEvent,
+    QModelIndex,
+    QObject,
+    QPoint,
+    QPointF,
+    QRect,
+    Qt,
+    pyqtSignal,
+)
+from qutebrowser.qt.gui import (
+    QHelpEvent,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPixmap,
+)
+from qutebrowser.qt.widgets import (
+    QStyle,
+    QStyleOptionViewItem,
+    QTreeView,
+)
+
+from qutebrowser.mainwindow import tabtree
+from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
+
+
+class MockManager(QObject):
+
+    """Minimal stand-in for ``WorkspaceManager`` in TabTree tests."""
+
+    changed = pyqtSignal()
+
+    def __init__(self, workspace=None):
+        super().__init__()
+        self._workspace = workspace
+
+    def get_active(self):
+        return self._workspace
+
+
+def _make_workspace():
+    """Return a workspace with one group, two standalones and one parent tab."""
+    group = Group(group_id=uuid.uuid4(), name='client-A docs', folded=False)
+    parent_tab = WorkspaceTab(tab_id=10, parent_id=None, group_id=None)
+    child_a = WorkspaceTab(tab_id=11, parent_id=10, group_id=None)
+    child_b = WorkspaceTab(tab_id=12, parent_id=10, group_id=None)
+    standalone_a = WorkspaceTab(tab_id=20, parent_id=None, group_id=None)
+    standalone_b = WorkspaceTab(tab_id=21, parent_id=None, group_id=None)
+    group_tab_a = WorkspaceTab(
+        tab_id=30, parent_id=None, group_id=group.group_id)
+    group_tab_b = WorkspaceTab(
+        tab_id=31, parent_id=None, group_id=group.group_id)
+    group_tab_c = WorkspaceTab(
+        tab_id=32, parent_id=None, group_id=group.group_id)
+
+    workspace = Workspace(
+        id=uuid.uuid4(),
+        name='test',
+        groups=[group],
+        tabs=[
+            parent_tab, child_a, child_b,
+            standalone_a, standalone_b,
+            group_tab_a, group_tab_b, group_tab_c,
+        ],
+    )
+    return workspace
+
+
+class TestTabTreeModel:
+
+    """Tests for :class:`tabtree.TabTreeModel`."""
+
+    @pytest.fixture
+    def model(self, qtbot):
+        """Model backed by a populated workspace."""
+        manager = MockManager(_make_workspace())
+        m = tabtree.TabTreeModel(manager, parent=None)
+        # Populate display data so role tests have non-empty values.
+        m.set_tab_info(10, title='Parent', url='qute://parent',
+                       status=tabtree.Status.AUDIBLE)
+        m.set_tab_info(11, title='Child A', url='qute://child-a')
+        m.set_tab_info(12, title='Child B', url='qute://child-b')
+        m.set_tab_info(20, title='Standalone A', url='qute://standalone-a')
+        m.set_tab_info(21, title='Standalone B', url='qute://standalone-b')
+        m.set_tab_info(30, title='Group Tab A', url='qute://group-a')
+        m.set_tab_info(31, title='Group Tab B', url='qute://group-b')
+        m.set_tab_info(32, title='Group Tab C', url='qute://group-c')
+        return m
+
+    def test_topology(self, model):
+        """The model exposes groups first, then root-level tabs."""
+        root = QModelIndex()
+        assert model.rowCount(root) == 4  # 1 group + 2 standalones + 1 parent
+
+        group_index = model.index(0, 0, root)
+        assert group_index.data(tabtree.KindRole) == tabtree.Kind.Group
+        assert model.rowCount(group_index) == 3
+        for row in range(3):
+            child = model.index(row, 0, group_index)
+            assert child.data(tabtree.KindRole) in (
+                tabtree.Kind.Tab, tabtree.Kind.ParentTab)
+            assert child.parent() == group_index
+
+        # Collect the three root-level tabs by title.
+        root_tabs: dict[str, QModelIndex] = {}
+        for row in range(1, model.rowCount(root)):
+            idx = model.index(row, 0, root)
+            root_tabs[idx.data(Qt.ItemDataRole.DisplayRole)] = idx
+
+        assert sorted(root_tabs) == ['Parent', 'Standalone A', 'Standalone B']
+
+        parent_index = root_tabs['Parent']
+        assert parent_index.data(tabtree.KindRole) == tabtree.Kind.ParentTab
+        assert model.rowCount(parent_index) == 2
+        for row in range(2):
+            child = model.index(row, 0, parent_index)
+            assert child.data(tabtree.KindRole) == tabtree.Kind.Tab
+            assert child.parent() == parent_index
+
+        for title in ('Standalone A', 'Standalone B'):
+            idx = root_tabs[title]
+            assert idx.data(tabtree.KindRole) == tabtree.Kind.Tab
+            assert idx.parent() == root
+
+    def test_size_hint_group_vs_tab(self, model):
+        """Group headers are 24 px high; tab rows are 22 px high."""
+        delegate = tabtree.TabTreeItemDelegate()
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 220, 24)
+
+        group_index = model.index(0, 0, QModelIndex())
+        tab_index = model.index(1, 0, QModelIndex())
+
+        assert delegate.sizeHint(option, group_index).height() == 24
+        assert delegate.sizeHint(option, tab_index).height() == 22
+
+    def test_data_roles(self, model):
+        """Custom roles return the expected values."""
+        root = QModelIndex()
+        group_index = model.index(0, 0, root)
+        assert group_index.data(Qt.ItemDataRole.DisplayRole) == 'client-A docs'
+        assert group_index.data(tabtree.KindRole) == tabtree.Kind.Group
+        assert group_index.data(tabtree.FoldedRole) is False
+        assert group_index.data(tabtree.BadgeRole) == 3
+        assert group_index.data(tabtree.StatusRole) == tabtree.Status.NONE
+
+        root_tabs = {
+            model.index(row, 0, root).data(Qt.ItemDataRole.DisplayRole):
+                model.index(row, 0, root)
+            for row in range(1, model.rowCount(root))
+        }
+        tab_index = root_tabs['Standalone A']
+        assert tab_index.data(tabtree.KindRole) == tabtree.Kind.Tab
+        assert tab_index.data(tabtree.UrlRole) == 'qute://standalone-a'
+        assert tab_index.data(tabtree.FoldedRole) is False
+
+        parent_index = root_tabs['Parent']
+        assert parent_index.data(tabtree.KindRole) == tabtree.Kind.ParentTab
+        assert parent_index.data(tabtree.StatusRole) == tabtree.Status.AUDIBLE
+
+    def test_p_role_exposed_via_data(self, model):
+        """PinStateRole is derived from the PINNED status flag."""
+        root = QModelIndex()
+        standalone = model.index(2, 0, root)  # tab id 20
+        assert standalone.data(tabtree.PinStateRole) is False
+
+        model.set_tab_info(20, status=tabtree.Status.PINNED)
+        assert standalone.data(tabtree.PinStateRole) is True
+
+        model.set_tab_info(20, status=tabtree.Status.NONE)
+        assert standalone.data(tabtree.PinStateRole) is False
+
+    def test_set_tab_pinned_emits_data_changed(self, model):
+        """set_tab_pinned flips the bit and emits PinStateRole."""
+        root = QModelIndex()
+        standalone = model.index(2, 0, root)
+        changes = []
+        model.dataChanged.connect(lambda *args: changes.append(args))
+
+        model.set_tab_pinned(20, True)
+        assert standalone.data(tabtree.PinStateRole) is True
+        assert changes[-1][2] == [tabtree.PinStateRole]
+
+        model.set_tab_pinned(20, False)
+        assert standalone.data(tabtree.PinStateRole) is False
+
+    def test_empty_group_badge_zero(self):
+        """Empty groups report a +0 badge."""
+        group = Group(group_id=uuid.uuid4(), name='empty', folded=False)
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test', groups=[group], tabs=[])
+        model = tabtree.TabTreeModel(MockManager(workspace))
+        group_index = model.index(0, 0, QModelIndex())
+        assert group_index.data(tabtree.BadgeRole) == 0
+
+    def test_active_tab_id_is_exposed_via_data(self, model):
+        """ActiveRole is True only on the row for the active tab id."""
+        model.set_active_tab_id(20)
+        root = QModelIndex()
+        group_index = model.index(0, 0, root)     # group
+        parent_index = model.index(1, 0, root)    # parent tab, id 10
+        active_index = model.index(2, 0, root)    # standalone tab, id 20
+
+        assert active_index.data(tabtree.ActiveRole) is True
+        assert parent_index.data(tabtree.ActiveRole) is False
+        assert group_index.data(tabtree.ActiveRole) is False
+
+        model.set_active_tab_id(None)
+        assert active_index.data(tabtree.ActiveRole) is False
+
+    def test_set_active_tab_id_emits_data_changed(self, model):
+        """Changing the active tab emits dataChanged carrying ActiveRole."""
+        changes = []
+        model.dataChanged.connect(lambda *args: changes.append(args))
+        model.set_active_tab_id(20)
+        assert len(changes) == 1
+        top_left = changes[0][0]
+        assert top_left.isValid()
+        assert top_left.data(tabtree.KindRole) == tabtree.Kind.Tab
+        assert changes[0][2] == [tabtree.ActiveRole]
+
+    def test_set_active_tab_id_is_idempotent(self, model):
+        """Setting the same active id again emits nothing."""
+        model.set_active_tab_id(20)
+        changes = []
+        model.dataChanged.connect(lambda *args: changes.append(args))
+        model.set_active_tab_id(20)
+        assert changes == []
+
+    def test_tab_id_for_index(self, model):
+        """tab_id_for_index resolves tab rows and rejects group rows."""
+        root = QModelIndex()
+        assert model.tab_id_for_index(QModelIndex()) is None
+        assert model.tab_id_for_index(model.index(0, 0, root)) is None
+        assert model.tab_id_for_index(model.index(1, 0, root)) == 10
+        assert model.tab_id_for_index(model.index(2, 0, root)) == 20
+
+
+class TestTabTreeItemDelegate:
+
+    """Tests for :class:`tabtree.TabTreeItemDelegate`."""
+
+    @pytest.fixture
+    def delegate(self):
+        """Fresh delegate with captured signals."""
+        d = tabtree.TabTreeItemDelegate()
+        d._captured = []
+        d.fold_toggled.connect(lambda idx: d._captured.append(('fold', idx)))
+        d.audio_toggled.connect(lambda idx: d._captured.append(('audio', idx)))
+        d.activated.connect(lambda idx: d._captured.append(('activated', idx)))
+        return d
+
+    @pytest.fixture
+    def model(self, qtbot):
+        """Populated model with one audible tab."""
+        workspace = _make_workspace()
+        manager = MockManager(workspace)
+        m = tabtree.TabTreeModel(manager)
+        m.set_tab_info(10, title='Parent', status=tabtree.Status.AUDIBLE)
+        return m
+
+    @pytest.fixture
+    def option(self):
+        """Style option covering the full 220 px row."""
+        opt = QStyleOptionViewItem()
+        opt.rect = QRect(0, 0, 220, 22)
+        opt.fontMetrics = opt.fontMetrics
+        return opt
+
+    def _press(self, delegate, model, option, index, pos):
+        """Send a left-button press event to the delegate at *pos*."""
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(pos),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        return delegate.editorEvent(event, model, option, index)
+
+    def test_chevron_click_toggles_fold(self, delegate, model, option):
+        """Clicking the chevron emits fold_toggled."""
+        group_index = model.index(0, 0, QModelIndex())
+        # The chevron occupies the leftmost CHEVRON_WIDTH pixels.
+        pos = QPoint(3, option.rect.height() // 2)
+        assert self._press(delegate, model, option, group_index, pos) is True
+        assert delegate._captured == [('fold', group_index)]
+
+    def test_audio_click_toggles_audio(self, delegate, model, option):
+        """Clicking the audio icon emits audio_toggled."""
+        root = QModelIndex()
+        parent_index = None
+        for row in range(model.rowCount(root)):
+            idx = model.index(row, 0, root)
+            if idx.data(tabtree.KindRole) == tabtree.Kind.ParentTab:
+                parent_index = idx
+                break
+        assert parent_index is not None
+
+        # Status strip is right-aligned; audio is its leftmost glyph.
+        fm = option.fontMetrics
+        status_text = '♪'  # audible only
+        text_width = fm.horizontalAdvance(status_text)
+        pos = QPoint(option.rect.right() - 6 - text_width + 2,
+                     option.rect.height() // 2)
+        assert self._press(delegate, model, option, parent_index, pos) is True
+        assert delegate._captured == [('audio', parent_index)]
+
+    def test_body_click_activates(self, delegate, model, option):
+        """Clicking the row body emits activated."""
+        root = QModelIndex()
+        tab_index = None
+        for row in range(model.rowCount(root)):
+            idx = model.index(row, 0, root)
+            if idx.data(tabtree.KindRole) == tabtree.Kind.Tab:
+                tab_index = idx
+                break
+        assert tab_index is not None
+
+        # Click in the middle of the row, well right of any icon.
+        pos = QPoint(60, option.rect.height() // 2)
+        assert self._press(delegate, model, option, tab_index, pos) is True
+        assert delegate._captured == [('activated', tab_index)]
+
+    def test_help_event_tooltip(self, delegate, model, option, qtbot):
+        """helpEvent returns a tooltip for group and tab rows."""
+        view = QTreeView()
+        qtbot.add_widget(view)
+
+        group_index = model.index(0, 0, QModelIndex())
+        event = QHelpEvent(
+            QEvent.Type.ToolTip,
+            QPoint(10, 10),
+            QPoint(10, 10),
+        )
+        assert delegate.helpEvent(event, view, option, group_index) is True
+
+        tab_index = model.index(1, 0, QModelIndex())
+        assert delegate.helpEvent(event, view, option, tab_index) is True
+
+    @staticmethod
+    def _paint_row(delegate, model, option, index):
+        """Paint *index* through *delegate* with a real QPainter."""
+        pixmap = QPixmap(option.rect.width(), option.rect.height())
+        painter = QPainter(pixmap)
+        try:
+            delegate.paint(painter, option, index)
+        finally:
+            painter.end()
+        return pixmap
+
+    def test_paint_includes_close_x_when_hovered(self, model, option):
+        """Hovered tab rows record a close-glyph hit rect while painting."""
+        delegate = tabtree.TabTreeItemDelegate()
+        tab_index = model.index(1, 0, QModelIndex())
+        option.state = QStyle.StateFlag.State_MouseOver
+        self._paint_row(delegate, model, option, tab_index)
+
+        close_rect = delegate._last_close_rect.get(tab_index)
+        assert close_rect is not None
+        assert close_rect.width() > 0
+        assert close_rect.height() > 0
+        assert option.rect.contains(close_rect)
+
+    def test_paint_omits_close_x_when_not_hovered(self, model, option):
+        """Non-hovered tab rows record no close-glyph hit rect."""
+        delegate = tabtree.TabTreeItemDelegate()
+        tab_index = model.index(1, 0, QModelIndex())
+        self._paint_row(delegate, model, option, tab_index)
+
+        assert delegate._last_close_rect.get(tab_index) is None
+
+    def test_editor_event_close_x_emits_signal(self, model, option):
+        """Pressing inside the close glyph emits close_requested."""
+        delegate = tabtree.TabTreeItemDelegate()
+        tab_index = model.index(1, 0, QModelIndex())
+        option.state = QStyle.StateFlag.State_MouseOver
+        self._paint_row(delegate, model, option, tab_index)
+
+        close_rect = delegate._last_close_rect[tab_index]
+        emitted = []
+        delegate.close_requested.connect(
+            lambda idx: emitted.append(idx))
+
+        pos = close_rect.center()
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(pos),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        assert delegate.editorEvent(event, model, option, tab_index) is True
+        assert emitted == [tab_index]
+
+    def test_pin_glyph_drawn_for_pinned_tab(self, model, option):
+        """A pinned tab records a pin-glyph hit rect while painting."""
+        delegate = tabtree.TabTreeItemDelegate()
+        model.set_tab_info(10, status=tabtree.Status.PINNED)
+        tab_index = model.index(1, 0, QModelIndex())
+        self._paint_row(delegate, model, option, tab_index)
+
+        pin_rect = delegate._last_pin_rect.get(tab_index)
+        assert pin_rect is not None
+        assert pin_rect.width() > 0
+        assert pin_rect.height() > 0
+        assert option.rect.contains(pin_rect)
+
+    def test_pin_glyph_drawn_on_hover_when_unpinned(self, model, option):
+        """An unpinned tab shows the pin glyph only while hovered."""
+        delegate = tabtree.TabTreeItemDelegate()
+        tab_index = model.index(1, 0, QModelIndex())
+        option.state = QStyle.StateFlag.State_MouseOver
+        self._paint_row(delegate, model, option, tab_index)
+
+        pin_rect = delegate._last_pin_rect.get(tab_index)
+        assert pin_rect is not None
+        assert option.rect.contains(pin_rect)
+
+    def test_pin_glyph_omitted_when_unpinned_not_hovered(self, model, option):
+        """An unpinned, non-hovered tab records no pin-glyph hit rect."""
+        delegate = tabtree.TabTreeItemDelegate()
+        tab_index = model.index(1, 0, QModelIndex())
+        self._paint_row(delegate, model, option, tab_index)
+
+        assert delegate._last_pin_rect.get(tab_index) is None
+
+    def test_pin_toggle_emits_on_p_click(self, model, option):
+        """Pressing inside the pin glyph emits pin_toggled."""
+        delegate = tabtree.TabTreeItemDelegate()
+        model.set_tab_info(10, status=tabtree.Status.PINNED)
+        tab_index = model.index(1, 0, QModelIndex())
+        self._paint_row(delegate, model, option, tab_index)
+
+        pin_rect = delegate._last_pin_rect[tab_index]
+        emitted = []
+        delegate.pin_toggled.connect(lambda idx: emitted.append(idx))
+
+        pos = pin_rect.center()
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(pos),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        assert delegate.editorEvent(event, model, option, tab_index) is True
+        assert emitted == [tab_index]
+
+    def test_active_tab_highlight_drawn_when_set(self, model, option):
+        """The active-tab left accent is drawn once the model marks it."""
+        model.set_active_tab_id(10)
+        delegate = tabtree.TabTreeItemDelegate()
+        active_index = model.index(1, 0, QModelIndex())
+        other_index = model.index(2, 0, QModelIndex())
+
+        self._paint_row(delegate, model, option, active_index)
+        assert delegate._last_active_accent is not None
+        assert delegate._last_active_accent.width() == 2
+
+        self._paint_row(delegate, model, option, other_index)
+        assert delegate._last_active_accent is None
+
+
+class TestTabTree:
+
+    """Tests for the host :class:`tabtree.TabTree` widget."""
+
+    def test_instantiates_and_shows(self, qtbot):
+        """The host widget can be shown without raising."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        tree.show()
+        assert tree.view() is not None
+        assert tree.view().model() is not None
+
+    def test_empty_workspace_shows_placeholder(self, qtbot):
+        """An empty workspace displays the placeholder instead of the tree."""
+        workspace = Workspace(id=uuid.uuid4(), name='empty')
+        manager = MockManager(workspace)
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        tree.show()
+        # Stack page 0 is the tree, page 1 is the placeholder.
+        assert tree._stack.currentIndex() == 1
+        assert tree.view().model().rowCount(QModelIndex()) == 0
+
+    def test_manager_changed_rebuilds(self, qtbot):
+        """Emitting manager.changed refreshes the model."""
+        workspace = Workspace(id=uuid.uuid4(), name='initial')
+        manager = MockManager(workspace)
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        assert tree.view().model().rowCount(QModelIndex()) == 0
+
+        manager._workspace = _make_workspace()
+        manager.changed.emit()
+        assert tree.view().model().rowCount(QModelIndex()) == 4
+
+    def test_jk_shortcut_moves_selection(self, qtbot):
+        """The J shortcut moves the selection and emits keyboard_activated."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        tree.show()
+
+        tree.view().setCurrentIndex(tree._model.index(0, 0))
+        before = tree.view().currentIndex()
+        assert before.row() == 0
+
+        activated = []
+        keyboard_activated = []
+        tree.activated.connect(lambda idx: activated.append(idx))
+        tree.keyboard_activated.connect(
+            lambda idx: keyboard_activated.append(idx))
+
+        j_shortcut = next(
+            shortcut for shortcut in tree._shortcuts
+            if shortcut.key() == QKeySequence('j'))
+        j_shortcut.activated.emit()
+
+        after = tree.view().currentIndex()
+        assert after.isValid()
+        assert after.row() == 1
+        # J/K uses the dedicated signal so the bridge can keep focus in
+        # the tree for iterative navigation; mouse clicks still hit
+        # ``activated``.
+        assert activated == []
+        assert keyboard_activated == [after]
+
+    def test_tree_emits_close_requested(self, qtbot):
+        """The host forwards the delegate's close_requested signal."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+
+        emitted = []
+        tree.close_requested.connect(lambda idx: emitted.append(idx))
+        idx = tree._model.index(1, 0)
+        tree._delegate.close_requested.emit(idx)
+        assert emitted == [idx]
+
+    def test_tree_emits_pin_toggled(self, qtbot):
+        """The host forwards the delegate's pin_toggled signal."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+
+        emitted = []
+        tree.pin_toggled.connect(lambda idx: emitted.append(idx))
+        idx = tree._model.index(1, 0)
+        tree._delegate.pin_toggled.emit(idx)
+        assert emitted == [idx]

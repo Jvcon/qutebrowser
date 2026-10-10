@@ -22,7 +22,8 @@ from qutebrowser.api import cmdutils
 from qutebrowser.config import config, configfiles, stylesheet, websettings
 from qutebrowser.utils import (message, log, usertypes, qtutils, objreg, utils,
                                jinja, debug)
-from qutebrowser.mainwindow import messageview, prompt, verticalpanel
+from qutebrowser.mainwindow import (messageview, prompt, verticalpanel,
+                                    workspacebridge)
 from qutebrowser.completion import completionwidget, completer
 from qutebrowser.keyinput import modeman
 from qutebrowser.browser import downloadview, hints, downloads
@@ -249,6 +250,22 @@ class MainWindow(QWidget):
         objreg.register('vertical-panel', self.vertical_panel,
                         scope='window', window=self.win_id,
                         command_only=True)
+        # Bridge TabbedBrowser signals into the WorkspaceManager + TabTree
+        # so the vertical panel reflects real tabs instead of showing the
+        # "No tabs in this workspace" placeholder (see workspacebridge).
+        # The bridge tolerates manager=None / model=None and no tab_tree.
+        self.workspace_bridge = workspacebridge.WorkspaceBridge(
+            win_id=self.win_id,
+            tabbed_browser=self.tabbed_browser,
+            manager=workspace_manager,
+            model=(
+                self.vertical_panel.tab_tree._model
+                if self.vertical_panel.tab_tree is not None
+                else None
+            ),
+            tab_tree=self.vertical_panel.tab_tree,
+            parent=self,
+        )
         # Horizontal splitter: panel on the left, browser on the
         # right. ADR 0008 § "VerticalPanel composition" mandates
         # QSplitter (not QDockWidget) so the panel is a first-class
