@@ -154,6 +154,44 @@ class WorkspaceManager(QObject):
             return None
         return self._workspaces.get(self._active_id)
 
+    def get_workspace_by_name(self, name: str) -> Optional[Workspace]:
+        """Return the workspace with the given name (case-insensitive), if any.
+
+        Loaded workspaces are checked first. If none matches, the on-disk
+        workspaces are consulted so that workspaces which are not currently
+        loaded (e.g. after a cold start, when only the active workspace is
+        loaded eagerly) are still found. A match loaded from disk is cached
+        in memory so the mutation APIs (rename/archive/delete) work on it.
+        """
+        name_lower = name.lower()
+        for workspace in self._workspaces.values():
+            if workspace.name.lower() == name_lower:
+                return workspace
+        for workspace in self._persistence.load_all():
+            if workspace.name.lower() == name_lower:
+                self._workspaces[workspace.id] = workspace
+                return workspace
+        return None
+
+    def list_all_workspaces(self) -> list[Workspace]:
+        """Return every workspace (loaded ones plus on-disk ones).
+
+        Used by the ``:workspace-list`` command so that a cold-started
+        qutebrowser (which loads only the active workspace eagerly) still
+        lists all workspaces.
+        """
+        workspaces = self.list_workspaces()
+        loaded_ids = {workspace.id for workspace in workspaces}
+        for workspace in self._persistence.load_all():
+            if workspace.id not in loaded_ids:
+                workspaces.append(workspace)
+        return workspaces
+
+    def archive_workspace(self, workspace_id: uuid.UUID) -> None:
+        """Mark a workspace as archived without deleting it."""
+        self._workspaces[workspace_id].archived = True
+        self.changed.emit()
+
     # --- groups ---
 
     def create_group(self, workspace_id: uuid.UUID, name: str) -> Group:

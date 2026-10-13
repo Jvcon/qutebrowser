@@ -4,6 +4,12 @@
 
 """Workspace, tab-group, and pinned-tab management."""
 
+# Import the :workspace-* command handlers for their side effects — the
+# @cmdutils.register decorators run at import time (mirroring how e.g.
+# qutebrowser.browser.commands is imported by qutebrowser.app).
+from qutebrowser.workspaces import commands as workspace_commands  # noqa: F401
+del workspace_commands
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:

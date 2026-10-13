@@ -164,6 +164,8 @@ class Workspace:
         groups: Groups defined in this workspace (opt-in, may be empty).
         tabs: Tab entries belonging to this workspace.
         last_active: ISO 8601 timestamp of when this workspace was last active.
+        archived: Whether this workspace is archived (hidden from normal
+            use, but not deleted).
     """
 
     id: uuid.UUID
@@ -171,6 +173,7 @@ class Workspace:
     groups: list[Group] = dataclasses.field(default_factory=list)
     tabs: list[WorkspaceTab] = dataclasses.field(default_factory=list)
     last_active: Optional[str] = None
+    archived: bool = False
 
     def add_group(self, group: Group) -> None:
         """Append *group* to this workspace's group list."""
@@ -184,6 +187,7 @@ class Workspace:
             'groups': [group.to_dict() for group in self.groups],
             'tabs': [tab.to_dict() for tab in self.tabs],
             'last_active': self.last_active,
+            'archived': self.archived,
         }
 
     @classmethod
@@ -195,6 +199,7 @@ class Workspace:
             groups=[Group.from_dict(g) for g in d.get('groups', [])],
             tabs=[WorkspaceTab.from_dict(t) for t in d.get('tabs', [])],
             last_active=d.get('last_active'),
+            archived=bool(d.get('archived', False)),
         )
 
 
