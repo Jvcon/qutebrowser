@@ -1,0 +1,66 @@
+// For format details, see https://aka.ms/devcontainer.json
+//
+// Based on the official microsoft/devcontainers base image (default user
+// "vscode") and iterated via Features, keeping the container image small.
+// The GUI stack comes from the official desktop-lite feature, which provides
+// Xvfb + x11vnc + noVNC out of the box (web access on forwarded port 6080).
+{
+    "name": "qutebrowser",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+    "features": {
+        // Provides Xvfb + x11vnc + noVNC desktop session. Web access on
+        // forwarded port 6080, direct VNC on 5901.
+        "ghcr.io/devcontainers/features/desktop-lite:1": {
+            "password": "vscode",
+            "webPort": "6080",
+            "vncPort": "5901"
+        },
+        // node 22 for the eslint tox env, matching CI. Includes npx.
+        "ghcr.io/devcontainers/features/node:1": {
+            "version": "22"
+        }
+    },
+    "forwardPorts": [
+        6080,
+        5901
+    ],
+    "portsAttributes": {
+        "6080": {
+            "label": "noVNC web client",
+            "onAutoForward": "openBrowser"
+        },
+        "5901": {
+            "label": "VNC (direct)",
+            "onAutoForward": "ignore"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "njpwerner.autodocstring"
+            ],
+            "settings": {
+                "python.testing.pytestEnabled": true,
+                "python.testing.pytestArgs": [
+                    "tests"
+                ],
+                "editor.rulers": [
+                    79
+                ],
+                "files.insertFinalNewline": true,
+                "files.trimTrailingWhitespace": true
+            }
+        }
+    },
+    // post-create script:
+    // - apt deps: system PyQt6/QtWebEngine (needed by tox envs without the
+    //   pyqt factor, which link system PyQt in via scripts/link_pyqt.py),
+    //   QtWebEngine runtime libs, asciidoc (tox docs env), dbus-run-session
+    // - .venv bootstrap with pip-installed PyQt6 (never link_pyqt into the
+    //   same venv: the system PyQt6 symlink makes the pip install of
+    //   PyQt6-Qt6 fail with EACCES)
+    // - opencode + oh-my-opencode-slim + mattpock skills (non-fatal)
+    "postCreateCommand": "bash .devcontainer/post-create.sh",
+    "remoteUser": "vscode"
+}

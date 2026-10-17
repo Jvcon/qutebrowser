@@ -260,6 +260,7 @@ class KeyMode(enum.Enum):
     # but it's used in the config for common bindings for
     # set_mark/jump_mark/record_macro/run_macro.
     register = enum.auto()
+    workspace_panel = enum.auto()  #: VerticalPanel mode (Phase 2)
 
 
 class Exit(enum.IntEnum):

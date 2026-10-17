@@ -2643,6 +2643,45 @@ url.yank_ignored_parameters:
     - utm_name
   desc: URL parameters to strip when yanking a URL.
 
+## verticalpanel
+
+pinned_tabs.style:
+  type:
+    name: String
+    valid_values: [icon, line]
+  default: icon
+  desc: >-
+    Display style for the vertical panel's pinned-tab list (Phase 2).
+    `icon` renders 24×24 favicons in a 2×3 grid (ADR 0008 § "1. PIN
+    panel" — Icon mode). `line` renders a vertical list with a 16×16
+    favicon and the elided title per row (Line mode). Style switching
+    is config-only; there is no UI toggle.
+
+verticalpanel.width:
+  default: 220
+  type:
+    name: PercOrInt
+    minperc: 0
+    maxperc: 100
+    minint: 1
+  desc: >-
+    Width (in pixels or as a percentage of the window) of the
+    vertical workspace panel (Phase 2). See ADR 0008 §
+    "VerticalPanel composition" for the layout contract; the
+    panel is the leftmost pane of a `QSplitter` joined to the
+    browser area. Drag-resizing the splitter handle overrides
+    this value at runtime; the new value is committed on next
+    startup.
+
+verticalpanel.visible:
+  type: Bool
+  default: true
+  desc: >-
+    Whether the vertical workspace panel is visible. Use
+    `:vertical-panel-toggle` or `<Ctrl-\>` to toggle at runtime
+    (the toggle also drives focus per ADR 0008 § "Panel focus &
+    mode model").
+
 ## window
 
 window.hide_wayland_decoration:
@@ -3720,6 +3759,7 @@ bindings.default:
       tl: forward -t
       wl: forward -w
       <F11>: fullscreen
+      "<Ctrl-\\>": vertical-panel-toggle
       f: hint
       F: hint all tab
       wf: hint all window
@@ -3990,12 +4030,15 @@ bindings.default:
       <Escape>: mode-leave
     register:
       <Escape>: mode-leave
+    workspace_panel:
+      <Escape>: mode-leave
   type:
     name: Dict
     none_ok: true
     keytype: String  # section name
     fixed_keys: ['normal', 'insert', 'hint', 'passthrough', 'command',
-                 'prompt', 'yesno', 'caret', 'register']
+                 'prompt', 'yesno', 'caret', 'register',
+                 'workspace_panel']
     valtype:
       name: Dict
       none_ok: true
@@ -4019,7 +4062,8 @@ bindings.commands:
     none_ok: true
     keytype: String  # section name
     fixed_keys: ['normal', 'insert', 'hint', 'passthrough', 'command',
-                 'prompt', 'yesno', 'caret', 'register']
+                 'prompt', 'yesno', 'caret', 'register',
+                 'workspace_panel']
     valtype:
       name: Dict
       none_ok: true

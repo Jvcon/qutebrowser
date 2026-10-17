@@ -14,7 +14,7 @@ from collections.abc import MutableSequence
 from qutebrowser.qt import machinery
 from qutebrowser.qt.core import (pyqtBoundSignal, pyqtSlot, QRect, QPoint, QTimer, Qt,
                           QCoreApplication, QEventLoop, QByteArray)
-from qutebrowser.qt.widgets import QWidget, QVBoxLayout, QSizePolicy
+from qutebrowser.qt.widgets import QWidget, QVBoxLayout, QSizePolicy, QSplitter
 from qutebrowser.qt.gui import QPalette
 
 from qutebrowser.commands import runners
@@ -22,7 +22,8 @@ from qutebrowser.api import cmdutils
 from qutebrowser.config import config, configfiles, stylesheet, websettings
 from qutebrowser.utils import (message, log, usertypes, qtutils, objreg, utils,
                                jinja, debug)
-from qutebrowser.mainwindow import messageview, prompt
+from qutebrowser.mainwindow import (messageview, prompt, verticalpanel,
+                                    workspacebridge)
 from qutebrowser.completion import completionwidget, completer
 from qutebrowser.keyinput import modeman
 from qutebrowser.browser import downloadview, hints, downloads
@@ -229,6 +230,56 @@ class MainWindow(QWidget):
             win_id=self.win_id, private=self.is_private, parent=self)
         objreg.register('tabbed-browser', self.tabbed_browser, scope='window',
                         window=self.win_id)
+
+        # Phase 2: vertical workspace panel (left of the browser area).
+        # The PINPanel child is wired to the app-scope WorkspaceManager
+        # (registered by qutebrowser.workspaces.init during startup);
+        # the TabTree and WorkspaceIndicator follow in later sub-slices.
+        try:
+            workspace_manager = objreg.get('workspace-manager')
+        except KeyError:
+            # Startup order quirk: the manager may not be registered
+            # yet during very early test setups. Falling back to
+            # ``None`` lets the panel render without a data source;
+            # the manager will be attached on the next signal.
+            workspace_manager = None
+        self.vertical_panel = verticalpanel.VerticalPanel(
+            win_id=self.win_id,
+            manager=workspace_manager,
+            parent=self)
+        objreg.register('vertical-panel', self.vertical_panel,
+                        scope='window', window=self.win_id,
+                        command_only=True)
+        # Bridge TabbedBrowser signals into the WorkspaceManager + TabTree
+        # so the vertical panel reflects real tabs instead of showing the
+        # "No tabs in this workspace" placeholder (see workspacebridge).
+        # The bridge tolerates manager=None / model=None and no tab_tree.
+        self.workspace_bridge = workspacebridge.WorkspaceBridge(
+            win_id=self.win_id,
+            tabbed_browser=self.tabbed_browser,
+            manager=workspace_manager,
+            model=(
+                self.vertical_panel.tab_tree._model
+                if self.vertical_panel.tab_tree is not None
+                else None
+            ),
+            tab_tree=self.vertical_panel.tab_tree,
+            parent=self,
+        )
+        # Horizontal splitter: panel on the left, browser on the
+        # right. ADR 0008 § "VerticalPanel composition" mandates
+        # QSplitter (not QDockWidget) so the panel is a first-class
+        # window child and the focus chain works naturally.
+        self._central_splitter = QSplitter(
+            Qt.Orientation.Horizontal, parent=self)
+        self._central_splitter.setObjectName('central-splitter')
+        self._central_splitter.setChildrenCollapsible(False)
+        self._central_splitter.addWidget(self.vertical_panel)
+        self._central_splitter.addWidget(self.tabbed_browser.widget)
+        self._central_splitter.setSizes(
+            [config.val.verticalpanel.width,
+             max(self.width() - config.val.verticalpanel.width, 1)])
+
         self._init_command_dispatcher()
 
         # We need to set an explicit parent for StatusBar because it does some
@@ -412,10 +463,14 @@ class MainWindow(QWidget):
 
     def _add_widgets(self):
         """Add or re-add all widgets to the VBox."""
-        self._vbox.removeWidget(self.tabbed_browser.widget)
+        self._vbox.removeWidget(self._central_splitter)
         self._vbox.removeWidget(self._downloadview)
         self._vbox.removeWidget(self.status)
-        widgets: list[QWidget] = [self.tabbed_browser.widget]
+        # The splitter holds VerticalPanel + tabbed_browser.widget, so
+        # the vbox only sees the splitter as a single unit. Re-adding
+        # it is enough to keep the layout consistent across statusbar
+        # / downloads position changes.
+        widgets: list[QWidget] = [self._central_splitter]
 
         downloads_position = config.val.downloads.position
         if downloads_position == 'top':
