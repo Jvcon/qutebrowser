@@ -35,6 +35,7 @@ class FakeManager:
         self.renamed: list[tuple[uuid.UUID, str]] = []
         self.archived: list[uuid.UUID] = []
         self.deleted: list[uuid.UUID] = []
+        self.purged: list[uuid.UUID] = []
 
     def add_workspace(self, name: str) -> Workspace:
         workspace = Workspace(id=uuid.uuid4(), name=name,
@@ -75,6 +76,59 @@ class FakeManager:
     def delete_workspace(self, workspace_id: uuid.UUID) -> None:
         del self._workspaces[workspace_id]
         self.deleted.append(workspace_id)
+
+    def get_workspace(self, workspace_id: uuid.UUID) -> Optional[Workspace]:
+        return self._workspaces.get(workspace_id)
+
+    # --- groups ---
+
+    def create_group(self, workspace_id: uuid.UUID, name: str) -> Group:
+        group = Group(group_id=uuid.uuid4(), name=name)
+        self._workspaces[workspace_id].add_group(group)
+        return group
+
+    def _find_group(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> Group:
+        for group in self._workspaces[workspace_id].groups:
+            if group.group_id == group_id:
+                return group
+        raise KeyError(group_id)
+
+    def rename_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID,
+                     new_name: str) -> None:
+        self._find_group(workspace_id, group_id).rename(new_name)
+
+    def pin_group(self, workspace_id: uuid.UUID,
+                  group_id: uuid.UUID) -> None:
+        self._find_group(workspace_id, group_id).pinned = True
+
+    def unpin_group(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> None:
+        self._find_group(workspace_id, group_id).pinned = False
+
+    def archive_group(self, workspace_id: uuid.UUID,
+                      group_id: uuid.UUID) -> None:
+        self._find_group(workspace_id, group_id).archived = True
+
+    def restore_group(self, workspace_id: uuid.UUID,
+                      group_id: uuid.UUID) -> None:
+        self._find_group(workspace_id, group_id).archived = False
+
+    def list_archived_groups(self, workspace_id: uuid.UUID) -> list[Group]:
+        return [group for group in self._workspaces[workspace_id].groups
+                if group.archived]
+
+    def purge_group(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> int:
+        workspace = self._workspaces[workspace_id]
+        removed = [tab for tab in workspace.tabs
+                   if tab.group_id == group_id]
+        workspace.tabs = [tab for tab in workspace.tabs
+                          if tab.group_id != group_id]
+        workspace.groups = [group for group in workspace.groups
+                            if group.group_id != group_id]
+        self.purged.append(group_id)
+        return len(removed)
 
 
 @pytest.fixture
@@ -260,6 +314,140 @@ class TestWorkspaceDelete:
     def test_delete_missing_raises(self, fake_manager: FakeManager) -> None:
         with pytest.raises(cmdutils.CommandError, match='No workspace'):
             commands.workspace_delete('nope')
+
+
+class TestGroupCommands:
+
+    def test_new_creates_group(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+
+        commands.vp_group_new('github')
+
+        assert [group.name for group in workspace.groups] == ['github']
+        assert messages[0].startswith("Created group 'github'")
+
+    def test_new_refuses_duplicate_case_insensitive(
+            self, fake_manager: FakeManager) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.create_group(workspace.id, 'Dev')
+
+        with pytest.raises(cmdutils.CommandError):
+            commands.vp_group_new('dev')
+        assert [group.name for group in workspace.groups] == ['Dev']
+
+    def test_new_requires_active_workspace(
+            self, fake_manager: FakeManager) -> None:
+        with pytest.raises(cmdutils.CommandError, match='No active workspace'):
+            commands.vp_group_new('g')
+
+    def test_rename_by_name(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'old')
+
+        commands.vp_group_rename('old', 'new')
+
+        assert group.name == 'new'
+        assert messages == ["Renamed group 'old' to 'new'."]
+
+    def test_rename_by_uuid(
+            self, fake_manager: FakeManager) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'old')
+
+        commands.vp_group_rename(str(group.group_id), 'new')
+
+        assert group.name == 'new'
+
+    def test_rename_refuses_collision(
+            self, fake_manager: FakeManager) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.create_group(workspace.id, 'taken')
+        group = fake_manager.create_group(workspace.id, 'mine')
+
+        with pytest.raises(cmdutils.CommandError):
+            commands.vp_group_rename('mine', 'TAKEN')
+        assert group.name == 'mine'
+
+    def test_rename_missing_raises(self, fake_manager: FakeManager) -> None:
+        fake_manager.add_workspace('w')
+        with pytest.raises(cmdutils.CommandError, match='No group'):
+            commands.vp_group_rename('nope', 'new')
+
+    def test_pin_and_unpin(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+
+        commands.vp_group_pin('g')
+        assert group.pinned is True
+        assert messages == ["Pinned group 'g'."]
+
+        commands.vp_group_unpin('g')
+        assert group.pinned is False
+        assert messages[-1] == "Unpinned group 'g'."
+
+    def test_archive_then_restore(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+
+        commands.vp_group_archive('g')
+        assert group.archived is True
+        assert fake_manager.list_archived_groups(workspace.id) == [group]
+        assert messages[-1] == "Archived group 'g'."
+
+        commands.vp_group_restore('g')
+        assert group.archived is False
+        assert fake_manager.list_archived_groups(workspace.id) == []
+        assert messages[-1] == "Restored group 'g'."
+
+    def test_archive_already_archived_is_noop(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        group.archived = True
+
+        commands.vp_group_archive('g')
+
+        assert messages == ["Group 'g' is already archived."]
+
+    def test_restore_not_archived_is_noop(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.create_group(workspace.id, 'g')
+
+        commands.vp_group_restore('g')
+
+        assert messages == ["Group 'g' is not archived."]
+
+    def test_delete_confirms_then_purges(
+            self,
+            fake_manager: FakeManager,
+            confirmations: list[Callable[[], None]],
+            messages: list[str],
+    ) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        workspace.tabs.append(
+            WorkspaceTab(tab_id=1, group_id=group.group_id))
+        workspace.tabs.append(WorkspaceTab(tab_id=2))
+
+        commands.vp_group_delete('g')
+
+        assert len(confirmations) == 1
+        confirmations[0]()
+
+        assert fake_manager.purged == [group.group_id]
+        assert workspace.groups == []
+        assert [tab.tab_id for tab in workspace.tabs] == [2]
+        assert messages == ["Deleted group 'g' (1 tabs)."]
+
+    def test_delete_missing_raises(self, fake_manager: FakeManager) -> None:
+        fake_manager.add_workspace('w')
+        with pytest.raises(cmdutils.CommandError, match='No group'):
+            commands.vp_group_delete('nope')
 
 
 @pytest.fixture

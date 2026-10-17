@@ -18,17 +18,59 @@ class TestGroup:
         group = model.Group(group_id=uuid.uuid4(), name='github')
         assert group.folded is False
 
+    def test_lifecycle_flags_default_to_false(self):
+        group = model.Group(group_id=uuid.uuid4(), name='github')
+        assert group.pinned is False
+        assert group.archived is False
+
+    def test_post_init_stamps_created_at(self):
+        group = model.Group(group_id=uuid.uuid4(), name='github')
+        assert group.created_at is not None
+        # ISO 8601 UTC timestamps end in +00:00.
+        assert group.created_at.endswith('+00:00')
+
+    def test_post_init_keeps_explicit_created_at(self):
+        group = model.Group(group_id=uuid.uuid4(), name='github',
+                            created_at='2026-01-01T00:00:00+00:00')
+        assert group.created_at == '2026-01-01T00:00:00+00:00'
+
     @pytest.mark.parametrize('folded', [False, True])
     def test_roundtrip(self, folded):
         group = model.Group(group_id=uuid.uuid4(), name='github',
                             folded=folded)
         assert model.Group.from_dict(group.to_dict()) == group
 
+    def test_roundtrip_with_all_fields(self):
+        group = model.Group(
+            group_id=uuid.uuid4(), name='github', folded=True, pinned=True,
+            archived=True, created_at='2026-01-01T00:00:00+00:00')
+        restored = model.Group.from_dict(group.to_dict())
+        assert restored == group
+        assert restored.pinned is True
+        assert restored.archived is True
+
+    def test_from_dict_tolerates_old_format(self):
+        group_id = uuid.uuid4()
+        restored = model.Group.from_dict({
+            'group_id': str(group_id),
+            'name': 'legacy',
+            'folded': True,
+        })
+        assert restored.group_id == group_id
+        assert restored.name == 'legacy'
+        assert restored.folded is True
+        assert restored.pinned is False
+        assert restored.archived is False
+        assert restored.created_at is not None
+
     def test_to_dict_is_primitive(self):
         group = model.Group(group_id=uuid.uuid4(), name='github')
         d = group.to_dict()
         assert isinstance(d['group_id'], str)
-        assert set(d) == {'group_id', 'name', 'folded'}
+        assert set(d) == {
+            'group_id', 'name', 'folded', 'pinned', 'archived',
+            'created_at',
+        }
 
 
 class TestWorkspaceTab:
