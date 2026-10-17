@@ -20,7 +20,7 @@ from qutebrowser.api import cmdutils
 from qutebrowser.utils import message, objreg
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import TabMetadata, WorkspaceManager
-from qutebrowser.workspaces.model import Workspace
+from qutebrowser.workspaces.model import Group, Workspace
 
 
 def _manager() -> WorkspaceManager:
@@ -235,6 +235,9 @@ def _make_delete_action(
     return delete
 
 
+# VP-F1 (vp/13): tab collection commands. Helper `_resolve_group` is defined
+# earlier in this module and resolves within the *given* workspace, returning
+# a group UUID or None for "standalone".
 # TODO(vp14): add completion listing group names + UUIDs once the group
 # picker/completion model lands.
 @cmdutils.register(name='tab-collect')
@@ -304,3 +307,209 @@ def vp_collect_all(group_id: str, win_id: int = 0) -> None:
     message.info(
         f"Collected {len(collected)} tab(s) into '{group_id}'; "
         f"skipped {len(skipped)}.")
+
+
+# VP-F2 (vp/14): group management commands. The resolver is renamed to
+# `_resolve_group_target` so it can coexist with the in-workspace
+# `_resolve_group` defined above (different signatures, different scopes).
+def _resolve_group_target(
+    manager: WorkspaceManager,
+    target: str,
+) -> tuple[Workspace, Group]:
+    """Resolve *target* (a group name or UUID) to ``(workspace, group)``.
+
+    Group names are matched case-insensitively across every workspace.
+    Archived groups are included so they can be restored or permanently
+    deleted.
+
+    Raises:
+        cmdutils.CommandError: If no group matches, or if a name matches
+            groups in more than one workspace.
+    """
+    target_lower = target.lower()
+    try:
+        target_uuid: uuid.UUID | None = uuid.UUID(target)
+    except ValueError:
+        target_uuid = None
+
+    name_matches: list[tuple[Workspace, Group]] = []
+    id_matches: list[tuple[Workspace, Group]] = []
+    for candidate in manager.list_all_workspaces():
+        # ``list_all_workspaces`` may return workspaces that are still only
+        # on disk; make sure the manager caches the instance before we hand
+        # it back for mutation.
+        workspace = manager.get_workspace(candidate.id)
+        if workspace is None:
+            continue
+        for group in workspace.groups:
+            if target_uuid is not None and group.group_id == target_uuid:
+                id_matches.append((workspace, group))
+            if group.name.lower() == target_lower:
+                name_matches.append((workspace, group))
+
+    matches = id_matches or name_matches
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise cmdutils.CommandError(
+            f"Group name '{target}' is ambiguous; use its UUID instead.")
+    raise cmdutils.CommandError(f"No group '{target}' in any workspace.")
+
+
+# TODO(vp-followup): add completion for group names + UUIDs once the group
+# picker/completion model lands (mirrors the TODO in the #13 worktree).
+
+
+@cmdutils.register(name='vp-group-new')
+@cmdutils.argument('name', metavar='name')
+def vp_group_new(name: str) -> None:
+    """Create a new Group with the given name.
+
+    The group is added to the active workspace. Group names must be unique
+    across all workspaces (compared case-insensitively) so that they can be
+    resolved unambiguously by the other ``:vp-group-*`` commands.
+
+    Args:
+        name: The name for the new group.
+    """
+    manager = _manager()
+    workspace = manager.get_active()
+    if workspace is None:
+        raise cmdutils.CommandError(
+            "No active workspace; create or switch to one first.")
+
+    name_lower = name.lower()
+    for candidate in manager.list_all_workspaces():
+        for group in candidate.groups:
+            if group.name.lower() == name_lower:
+                raise cmdutils.CommandError(
+                    f"A group with the name '{name}' already exists!")
+
+    group = manager.create_group(workspace.id, name)
+    message.info(f"Created group '{group.name}' (id {group.group_id}).")
+
+
+@cmdutils.register(name='vp-group-rename')
+@cmdutils.argument('target', metavar='target')
+@cmdutils.argument('new_name', metavar='new-name')
+def vp_group_rename(target: str, new_name: str) -> None:
+    """Rename a Group. ``target`` may be a name or UUID.
+
+    Args:
+        target: The current name or UUID of the group.
+        new_name: The new name for the group.
+    """
+    manager = _manager()
+    workspace, group = _resolve_group_target(manager, target)
+
+    name_lower = new_name.lower()
+    for candidate in manager.list_all_workspaces():
+        for other in candidate.groups:
+            if other.group_id == group.group_id:
+                continue
+            if other.name.lower() == name_lower:
+                raise cmdutils.CommandError(
+                    f"A group with the name '{new_name}' already exists!")
+
+    old_name = group.name
+    manager.rename_group(workspace.id, group.group_id, new_name)
+    message.info(f"Renamed group '{old_name}' to '{new_name}'.")
+
+
+@cmdutils.register(name='vp-group-pin')
+@cmdutils.argument('target', metavar='target')
+def vp_group_pin(target: str) -> None:
+    """Pin a Group so it appears first in the list.
+
+    Args:
+        target: The name or UUID of the group.
+    """
+    manager = _manager()
+    workspace, group = _resolve_group_target(manager, target)
+    manager.pin_group(workspace.id, group.group_id)
+    message.info(f"Pinned group '{group.name}'.")
+
+
+@cmdutils.register(name='vp-group-unpin')
+@cmdutils.argument('target', metavar='target')
+def vp_group_unpin(target: str) -> None:
+    """Unpin a Group.
+
+    Args:
+        target: The name or UUID of the group.
+    """
+    manager = _manager()
+    workspace, group = _resolve_group_target(manager, target)
+    manager.unpin_group(workspace.id, group.group_id)
+    message.info(f"Unpinned group '{group.name}'.")
+
+
+@cmdutils.register(name='vp-group-archive')
+@cmdutils.argument('target', metavar='target')
+def vp_group_archive(target: str) -> None:
+    """Archive a Group, hiding it without deleting its data.
+
+    Args:
+        target: The name or UUID of the group.
+    """
+    manager = _manager()
+    workspace, group = _resolve_group_target(manager, target)
+    if group.archived:
+        message.info(f"Group '{group.name}' is already archived.")
+        return
+    manager.archive_group(workspace.id, group.group_id)
+    message.info(f"Archived group '{group.name}'.")
+
+
+@cmdutils.register(name='vp-group-restore')
+@cmdutils.argument('target', metavar='target')
+def vp_group_restore(target: str) -> None:
+    """Restore an archived Group.
+
+    Args:
+        target: The name or UUID of the group.
+    """
+    manager = _manager()
+    workspace, group = _resolve_group_target(manager, target)
+    if not group.archived:
+        message.info(f"Group '{group.name}' is not archived.")
+        return
+    manager.restore_group(workspace.id, group.group_id)
+    message.info(f"Restored group '{group.name}'.")
+
+
+@cmdutils.register(name='vp-group-delete')
+@cmdutils.argument('target', metavar='target')
+def vp_group_delete(target: str) -> None:
+    """Permanently delete a Group and all its TabEntries.
+
+    Requires confirmation. Unlike ``:vp-group-archive``, this cannot be
+    undone.
+
+    Args:
+        target: The name or UUID of the group.
+    """
+    manager = _manager()
+    workspace, group = _resolve_group_target(manager, target)
+    message.confirm_async(
+        title=(f"Delete group '{group.name}' and all its tabs? "
+               "This cannot be undone."),
+        default=False,
+        yes_action=_make_group_delete_action(manager, workspace, group),
+    )
+
+
+def _make_group_delete_action(
+    manager: WorkspaceManager,
+    workspace: Workspace,
+    group: Group,
+) -> Callable[[], None]:
+    """Return the callback which cascade-deletes *group* after confirmation."""
+    name = group.name
+    group_id = group.group_id
+
+    def delete() -> None:
+        removed = manager.purge_group(workspace.id, group_id)
+        message.info(f"Deleted group '{name}' ({removed} tabs).")
+
+    return delete

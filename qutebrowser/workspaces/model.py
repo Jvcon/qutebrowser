@@ -13,6 +13,7 @@ stored as strings and ``bytes`` favicons as base64 ASCII strings.
 
 import base64
 import dataclasses
+import datetime
 import pathlib
 import uuid
 from typing import Any, Optional
@@ -74,11 +75,24 @@ class Group:
         group_id: Unique identifier of this group.
         name: User-visible group name.
         folded: Whether the group is collapsed in the TabTree.
+        pinned: Whether the group is pinned (pinned groups sort first).
+        archived: Whether the group is archived (hidden from the normal
+            list, but retained and restorable).
+        created_at: ISO 8601 UTC timestamp of when the group was created.
+            Populated automatically when left as ``None``.
     """
 
     group_id: uuid.UUID
     name: str
     folded: bool = False
+    pinned: bool = False
+    archived: bool = False
+    created_at: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.created_at is None:
+            self.created_at = datetime.datetime.now(
+                datetime.timezone.utc).isoformat()
 
     def rename(self, new_name: str) -> None:
         """Rename this group."""
@@ -90,15 +104,25 @@ class Group:
             'group_id': str(self.group_id),
             'name': self.name,
             'folded': self.folded,
+            'pinned': self.pinned,
+            'archived': self.archived,
+            'created_at': self.created_at,
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> 'Group':
-        """Deserialize from a primitive-only dict."""
+        """Deserialize from a primitive-only dict.
+
+        Fields added after the original format (``pinned``, ``archived``,
+        ``created_at``) default gracefully so older YAML files still load.
+        """
         return cls(
             group_id=uuid.UUID(d['group_id']),
             name=d['name'],
             folded=bool(d.get('folded', False)),
+            pinned=bool(d.get('pinned', False)),
+            archived=bool(d.get('archived', False)),
+            created_at=d.get('created_at'),
         )
 
 

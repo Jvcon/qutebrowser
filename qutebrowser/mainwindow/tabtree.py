@@ -188,6 +188,7 @@ class TabTreeModel(QAbstractItemModel):
         self._tab_info: dict[int, _TabInfo] = {}
         self._folded_state: dict[int, bool] = {}
         self._active_tab_id: Optional[int] = None
+        self._show_archived = False
         self._placeholder_pixmap = self._create_placeholder_pixmap()
         self.set_workspace(manager.get_active())
 
@@ -200,6 +201,17 @@ class TabTreeModel(QAbstractItemModel):
         if workspace is not None:
             self._build_tree(workspace)
         self.endResetModel()
+
+    def set_show_archived(self, show: bool) -> None:
+        """Show or hide archived groups in the tree.
+
+        Archived groups are hidden by default. The archive view flips this
+        on via :meth:`set_show_archived` when the user opens it.
+        """
+        if show == self._show_archived:
+            return
+        self._show_archived = show
+        self.set_workspace(self._workspace)
 
     def set_tab_info(
             self,
@@ -379,8 +391,16 @@ class TabTreeModel(QAbstractItemModel):
         tabs = list(workspace.tabs)
         parent_ids = {t.parent_id for t in tabs if t.parent_id is not None}
 
+        groups = [
+            group for group in workspace.groups
+            if self._show_archived or not group.archived
+        ]
+        # Pinned groups sort first, preserving insertion order within each
+        # band (``sorted`` is stable). Pinning does not change list order.
+        groups = sorted(groups, key=lambda group: not group.pinned)
+
         group_nodes: dict[uuid.UUID, _Node] = {}
-        for group in workspace.groups:
+        for group in groups:
             node = _Node(Kind.Group, group, self._root)
             group_nodes[group.group_id] = node
             node.row = len(self._root.children)

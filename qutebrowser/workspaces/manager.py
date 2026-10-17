@@ -283,6 +283,95 @@ class WorkspaceManager(QObject):
         """Return all groups in a workspace."""
         return list(self._workspaces[workspace_id].groups)
 
+    # --- group lifecycle (pin / archive / reorder / purge) ---
+
+    def _find_group(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> Group:
+        """Return the group identified by *group_id*.
+
+        Raises ``KeyError`` when no such group exists.
+        """
+        for group in self._workspaces[workspace_id].groups:
+            if group.group_id == group_id:
+                return group
+        raise KeyError(f"No group with id {group_id}")
+
+    def pin_group(self, workspace_id: uuid.UUID,
+                  group_id: uuid.UUID) -> None:
+        """Mark a group as pinned (pinned groups sort first)."""
+        group = self._find_group(workspace_id, group_id)
+        group.pinned = True
+        self.changed.emit()
+
+    def unpin_group(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> None:
+        """Clear a group's pinned flag."""
+        group = self._find_group(workspace_id, group_id)
+        group.pinned = False
+        self.changed.emit()
+
+    def archive_group(self, workspace_id: uuid.UUID,
+                      group_id: uuid.UUID) -> None:
+        """Mark a group as archived without deleting its data."""
+        group = self._find_group(workspace_id, group_id)
+        group.archived = True
+        self.changed.emit()
+
+    def restore_group(self, workspace_id: uuid.UUID,
+                      group_id: uuid.UUID) -> None:
+        """Clear a group's archived flag."""
+        group = self._find_group(workspace_id, group_id)
+        group.archived = False
+        self.changed.emit()
+
+    def list_archived_groups(self, workspace_id: uuid.UUID) -> list[Group]:
+        """Return only the archived groups in a workspace."""
+        return [group for group in self._workspaces[workspace_id].groups
+                if group.archived]
+
+    def move_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID,
+                   new_index: int) -> None:
+        """Move *group_id* to *new_index* in ``workspace.groups``.
+
+        Reordering is independent of the pin flag: pinning only changes the
+        display sort order, not the underlying list order.
+
+        Raises:
+            ValueError: If *new_index* is outside
+                ``[0, len(workspace.groups))``.
+        """
+        workspace = self._workspaces[workspace_id]
+        group = self._find_group(workspace_id, group_id)
+        if not 0 <= new_index < len(workspace.groups):
+            raise ValueError(
+                f"Group index {new_index} out of range "
+                f"(0..{len(workspace.groups) - 1}).")
+        current_index = workspace.groups.index(group)
+        workspace.groups.pop(current_index)
+        workspace.groups.insert(new_index, group)
+        self.changed.emit()
+
+    def purge_group(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> int:
+        """Permanently delete a group and every tab belonging to it.
+
+        Unlike :meth:`delete_group` (which makes members standalone), this
+        cascades: every :class:`~qutebrowser.workspaces.model.WorkspaceTab`
+        whose ``group_id`` matches is removed as well.
+
+        Returns:
+            The number of tabs that were removed.
+        """
+        workspace = self._workspaces[workspace_id]
+        removed_tabs = [tab for tab in workspace.tabs
+                        if tab.group_id == group_id]
+        workspace.tabs = [tab for tab in workspace.tabs
+                          if tab.group_id != group_id]
+        workspace.groups = [group for group in workspace.groups
+                            if group.group_id != group_id]
+        self.changed.emit()
+        return len(removed_tabs)
+
     # --- tab membership ---
 
     def add_tab(self, workspace_id: uuid.UUID, tab: WorkspaceTab) -> None:

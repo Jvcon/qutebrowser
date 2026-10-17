@@ -246,6 +246,52 @@ class TestTabTreeModel:
         assert model.tab_id_for_index(model.index(1, 0, root)) == 10
         assert model.tab_id_for_index(model.index(2, 0, root)) == 20
 
+    def test_pinned_groups_sort_first_and_stable(self):
+        """Pinned groups come first; insertion order is stable per band."""
+        groups = [
+            Group(group_id=uuid.uuid4(), name='unpinned-1'),
+            Group(group_id=uuid.uuid4(), name='pinned-1', pinned=True),
+            Group(group_id=uuid.uuid4(), name='unpinned-2'),
+            Group(group_id=uuid.uuid4(), name='pinned-2', pinned=True),
+        ]
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test', groups=groups, tabs=[])
+        model = tabtree.TabTreeModel(MockManager(workspace))
+
+        root = QModelIndex()
+        names = [
+            model.index(row, 0, root).data(Qt.ItemDataRole.DisplayRole)
+            for row in range(model.rowCount(root))
+        ]
+        assert names == [
+            'pinned-1', 'pinned-2', 'unpinned-1', 'unpinned-2']
+
+    def test_archived_groups_hidden_by_default(self):
+        """Archived groups are filtered out until set_show_archived(True)."""
+        visible = Group(group_id=uuid.uuid4(), name='visible')
+        archived = Group(
+            group_id=uuid.uuid4(), name='archived', archived=True)
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test',
+            groups=[visible, archived], tabs=[])
+        model = tabtree.TabTreeModel(MockManager(workspace))
+        root = QModelIndex()
+
+        def names():
+            return [
+                model.index(row, 0, root).data(
+                    Qt.ItemDataRole.DisplayRole)
+                for row in range(model.rowCount(root))
+            ]
+
+        assert names() == ['visible']
+
+        model.set_show_archived(True)
+        assert names() == ['visible', 'archived']
+
+        model.set_show_archived(False)
+        assert names() == ['visible']
+
 
 class TestTabTreeItemDelegate:
 

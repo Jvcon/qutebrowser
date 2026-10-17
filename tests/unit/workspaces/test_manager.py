@@ -104,6 +104,110 @@ class TestGroups:
         assert workspace.tabs[1].group_id is None
 
 
+class TestGroupLifecycle:
+
+    def test_pin_and_unpin_flip_flag_and_emit_changed(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.pin_group(workspace.id, group.group_id)
+        assert group.pinned is True
+        assert changes
+
+        changes.clear()
+        manager.unpin_group(workspace.id, group.group_id)
+        assert group.pinned is False
+        assert changes
+
+    def test_pinning_does_not_reorder_groups(self, manager):
+        workspace = manager.add_workspace('w')
+        first = manager.create_group(workspace.id, 'first')
+        second = manager.create_group(workspace.id, 'second')
+
+        manager.pin_group(workspace.id, second.group_id)
+
+        assert manager.list_groups(workspace.id) == [first, second]
+
+    def test_archive_and_restore(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.archive_group(workspace.id, group.group_id)
+        assert group.archived is True
+        assert manager.list_archived_groups(workspace.id) == [group]
+        assert changes
+
+        changes.clear()
+        manager.restore_group(workspace.id, group.group_id)
+        assert group.archived is False
+        assert manager.list_archived_groups(workspace.id) == []
+        assert changes
+
+    def test_move_group_reorders(self, manager):
+        workspace = manager.add_workspace('w')
+        a = manager.create_group(workspace.id, 'a')
+        b = manager.create_group(workspace.id, 'b')
+        c = manager.create_group(workspace.id, 'c')
+
+        manager.move_group(workspace.id, c.group_id, 0)
+        assert manager.list_groups(workspace.id) == [c, a, b]
+
+        manager.move_group(workspace.id, a.group_id, 2)
+        assert manager.list_groups(workspace.id) == [c, b, a]
+
+    def test_move_group_out_of_range_raises(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+
+        with pytest.raises((ValueError, IndexError)):
+            manager.move_group(workspace.id, group.group_id, 5)
+        with pytest.raises((ValueError, IndexError)):
+            manager.move_group(workspace.id, group.group_id, -1)
+
+    def test_move_group_unknown_id_raises(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.create_group(workspace.id, 'g')
+        with pytest.raises(KeyError):
+            manager.move_group(workspace.id, uuid.uuid4(), 0)
+
+    def test_purge_group_removes_group_and_members(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        other = manager.create_group(workspace.id, 'other')
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=1, group_id=group.group_id))
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=2, group_id=group.group_id))
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=3, group_id=other.group_id))
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=4))
+
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+        removed = manager.purge_group(workspace.id, group.group_id)
+
+        assert removed == 2
+        assert manager.list_groups(workspace.id) == [other]
+        assert [tab.tab_id for tab in workspace.tabs] == [3, 4]
+        assert changes
+
+    def test_delete_group_nulls_members_still_works(self, manager):
+        """The legacy delete_group semantics are unchanged by purge_group."""
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=1, group_id=group.group_id))
+
+        manager.delete_group(workspace.id, group.group_id)
+
+        assert manager.list_groups(workspace.id) == []
+        assert workspace.tabs[0].group_id is None
+
+
 class TestTabMembership:
 
     def test_add_and_remove_tab(self, manager):
