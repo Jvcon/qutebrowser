@@ -55,6 +55,82 @@ class TestWorkspaceTab:
         tab = model.WorkspaceTab(tab_id=1, group_id=uuid.uuid4())
         assert isinstance(tab.to_dict()['group_id'], str)
 
+    def test_metadata_fields_default_empty(self):
+        tab = model.WorkspaceTab(tab_id=1)
+        assert tab.title == ''
+        assert tab.url == ''
+        assert tab.description == ''
+        assert tab.source == ''
+        assert tab.favicon is None
+        assert tab.last_fetched is None
+        assert tab.fetch_attempts == 0
+        assert tab.last_error is None
+
+    def test_user_edited_always_has_three_keys(self):
+        tab = model.WorkspaceTab(tab_id=1)
+        assert tab.user_edited == {
+            'title': False,
+            'description': False,
+            'source': False,
+        }
+        partial = model.WorkspaceTab(
+            tab_id=1, user_edited={'title': True})
+        assert partial.user_edited == {
+            'title': True,
+            'description': False,
+            'source': False,
+        }
+
+    def test_roundtrip_with_all_metadata(self):
+        tab = model.WorkspaceTab(
+            tab_id=1,
+            parent_id=2,
+            group_id=uuid.uuid4(),
+            title='GitHub',
+            url='https://github.com/qutebrowser',
+            description='A browser',
+            source='github.com',
+            favicon='iVBORw0KGgo=',
+            user_edited={'title': True, 'description': False,
+                         'source': True},
+            last_fetched='2026-01-01T00:00:00+00:00',
+            fetch_attempts=3,
+            last_error='timeout',
+        )
+        restored = model.WorkspaceTab.from_dict(tab.to_dict())
+        assert restored == tab
+        assert restored.user_edited['title'] is True
+        assert restored.user_edited['description'] is False
+
+    def test_from_old_dict_uses_empty_defaults(self):
+        tab = model.WorkspaceTab.from_dict(
+            {'tab_id': 7, 'parent_id': None, 'group_id': None})
+        assert tab.tab_id == 7
+        assert tab.title == ''
+        assert tab.url == ''
+        assert tab.description == ''
+        assert tab.source == ''
+        assert tab.favicon is None
+        assert tab.last_fetched is None
+        assert tab.fetch_attempts == 0
+        assert tab.last_error is None
+        assert tab.user_edited == {
+            'title': False,
+            'description': False,
+            'source': False,
+        }
+
+    def test_to_dict_is_primitive(self):
+        tab = model.WorkspaceTab(tab_id=1, group_id=uuid.uuid4())
+        d = tab.to_dict()
+        assert {
+            'tab_id', 'parent_id', 'group_id', 'title', 'url',
+            'description', 'source', 'favicon', 'user_edited',
+            'last_fetched', 'fetch_attempts', 'last_error',
+        } <= set(d)
+        assert all(not isinstance(value, uuid.UUID)
+                   for value in d.values())
+
 
 class TestWorkspace:
 

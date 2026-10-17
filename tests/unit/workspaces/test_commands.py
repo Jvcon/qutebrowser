@@ -341,3 +341,38 @@ class TestPersistence:
         third.load()
         assert {ws.name for ws in third.list_all_workspaces()} == {
             'work', 'play'}
+
+
+class TestCollectAllCommand:
+
+    def test_no_collectable_tabs_emits_message(
+            self,
+            pers: tuple[WorkspacePersistence, PinnedPersistence],
+            messages: list[str],
+            monkeypatch: pytest.MonkeyPatch,
+            qapp,
+    ) -> None:
+        manager = WorkspaceManager(*pers)
+        workspace = manager.add_workspace('w')
+        manager.create_group(workspace.id, 'g')
+        manager.set_active(workspace.id)
+        monkeypatch.setattr(commands, '_manager', lambda: manager)
+        monkeypatch.setattr(commands.objreg, 'get', lambda *_a, **_k: {})
+
+        commands.vp_collect_all('g', win_id=0)
+
+        assert messages == ['No collectable tabs in this window.']
+
+    def test_unknown_group_raises(
+            self,
+            pers: tuple[WorkspacePersistence, PinnedPersistence],
+            monkeypatch: pytest.MonkeyPatch,
+            qapp,
+    ) -> None:
+        manager = WorkspaceManager(*pers)
+        workspace = manager.add_workspace('w')
+        manager.set_active(workspace.id)
+        monkeypatch.setattr(commands, '_manager', lambda: manager)
+
+        with pytest.raises(cmdutils.CommandError, match='No group named'):
+            commands.vp_collect_all('missing', win_id=0)

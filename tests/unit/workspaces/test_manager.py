@@ -8,7 +8,7 @@ import uuid
 
 import pytest
 
-from qutebrowser.workspaces.manager import WorkspaceManager
+from qutebrowser.workspaces.manager import TabMetadata, WorkspaceManager
 from qutebrowser.workspaces.model import PinnedTab, WorkspaceTab
 from qutebrowser.workspaces.persistence import (PinnedPersistence,
                                                 WorkspacePersistence)
@@ -139,6 +139,96 @@ class TestTabMembership:
                         WorkspaceTab(tab_id=1, group_id=group.group_id))
         manager.move_tab_to_group(workspace.id, 1, None)
         assert workspace.tabs[0].group_id is None
+
+
+class TestCollect:
+
+    def test_collect_fresh_url_captures_metadata(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'github')
+
+        tab = manager.collect_tab(
+            workspace.id, 1, group.group_id,
+            metadata=TabMetadata(
+                url='https://github.com/qutebrowser',
+                title='qutebrowser',
+                description='A keyboard-driven browser',
+            ))
+
+        assert [t.tab_id for t in workspace.tabs] == [1]
+        assert tab.title == 'qutebrowser'
+        assert tab.url == 'https://github.com/qutebrowser'
+        assert tab.source == 'github.com'
+        assert tab.description == 'A keyboard-driven browser'
+        assert tab.group_id == group.group_id
+        assert tab.fetch_attempts == 1
+        assert tab.last_fetched is not None
+        assert tab.last_error is None
+
+    def test_collect_same_url_reuses_entry_and_backfills(self, manager):
+        workspace = manager.add_workspace('w')
+
+        first = manager.collect_tab(
+            workspace.id, 1,
+            metadata=TabMetadata(url='https://example.com/page'))
+        assert first.title == ''
+
+        second = manager.collect_tab(
+            workspace.id, 2,
+            metadata=TabMetadata(
+                url='https://example.com/page', title='Example'))
+
+        assert second is first
+        assert [t.tab_id for t in workspace.tabs] == [1]
+        assert first.title == 'Example'
+        assert first.fetch_attempts == 2
+
+    def test_collect_never_overwrites_user_edited_field(self, manager):
+        workspace = manager.add_workspace('w')
+        tab = manager.collect_tab(
+            workspace.id, 1,
+            metadata=TabMetadata(
+                url='https://example.com/', title='Auto title'))
+        manager.set_user_edited(workspace.id, tab.tab_id, 'title')
+
+        manager.collect_tab(
+            workspace.id, 1,
+            metadata=TabMetadata(
+                url='https://example.com/', title='New auto title'))
+
+        assert tab.title == 'Auto title'
+
+    def test_collect_all_skips_internal_pages(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        metadata = {
+            1: TabMetadata(url='https://example.com/'),
+            2: TabMetadata(url='qute://version'),
+            3: TabMetadata(url='about:blank'),
+        }
+
+        collected, skipped = manager.collect_all_in_window(
+            workspace.id, group.group_id, [1, 2, 3],
+            tab_metadata=metadata)
+
+        assert collected == [1]
+        assert skipped == [2, 3]
+        assert [t.tab_id for t in workspace.tabs] == [1]
+        assert workspace.tabs[0].group_id == group.group_id
+
+    def test_collect_all_all_internal_returns_zero_and_count(self, manager):
+        workspace = manager.add_workspace('w')
+        metadata = {
+            1: TabMetadata(url='qute://version'),
+            2: TabMetadata(url='chrome://settings'),
+        }
+
+        collected, skipped = manager.collect_all_in_window(
+            workspace.id, None, [1, 2], tab_metadata=metadata)
+
+        assert collected == []
+        assert skipped == [1, 2]
+        assert workspace.tabs == []
 
 
 class TestPinned:

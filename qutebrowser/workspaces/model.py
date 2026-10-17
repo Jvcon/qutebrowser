@@ -105,17 +105,48 @@ class Group:
 @dataclasses.dataclass
 class WorkspaceTab:
 
-    """A single tab entry inside a workspace.
+    """A single tab entry (a.k.a. ``TabEntry``) inside a workspace.
 
     Attributes:
         tab_id: The tab's integer id (matches the runtime tab registry).
         parent_id: The ``tab_id`` of the parent tab, if any.
         group_id: The ``group_id`` of the group this tab belongs to, if any.
+        title: Last captured page title.
+        url: Last captured page URL.
+        description: Best-effort page description (``meta[name=description]``).
+        source: Site host derived from :attr:`url` (e.g. ``github.com``).
+        favicon: Base64-encoded PNG bytes of the tab's favicon, if captured.
+        user_edited: Per-field flags marking metadata the user edited
+            manually. Keys are ``title``, ``description`` and ``source``;
+            all three are always present (defaulting to ``False``).
+        last_fetched: ISO 8601 UTC timestamp of the last successful metadata
+            fetch, if any.
+        fetch_attempts: Number of metadata fetch attempts made so far.
+        last_error: Short error string from the last failed fetch, if any.
     """
 
     tab_id: int
     parent_id: Optional[int] = None
     group_id: Optional[uuid.UUID] = None
+    title: str = ''
+    url: str = ''
+    description: str = ''
+    source: str = ''
+    favicon: Optional[str] = None
+    user_edited: dict[str, bool] = dataclasses.field(default_factory=dict)
+    last_fetched: Optional[str] = None
+    fetch_attempts: int = 0
+    last_error: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """Ensure every user-editable field has an explicit flag."""
+        edited = {
+            key: bool(value)
+            for key, value in (self.user_edited or {}).items()
+        }
+        for key in ('title', 'description', 'source'):
+            edited.setdefault(key, False)
+        self.user_edited = edited
 
     def assign_group(self, group_id: Optional[uuid.UUID]) -> None:
         """Move this tab into *group_id* (or to standalone when None)."""
@@ -137,19 +168,46 @@ class WorkspaceTab:
             'group_id': (
                 str(self.group_id) if self.group_id is not None else None
             ),
+            'title': self.title,
+            'url': self.url,
+            'description': self.description,
+            'source': self.source,
+            'favicon': self.favicon,
+            'user_edited': dict(self.user_edited),
+            'last_fetched': self.last_fetched,
+            'fetch_attempts': self.fetch_attempts,
+            'last_error': self.last_error,
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> 'WorkspaceTab':
-        """Deserialize from a primitive-only dict."""
+        """Deserialize from a primitive-only dict.
+
+        Older YAML files lack the metadata fields added for issue #13; all
+        of them are read with ``.get()`` defaults so those files load
+        without migration.
+        """
         raw_group_id = d.get('group_id')
         group_id = (
             uuid.UUID(raw_group_id) if raw_group_id is not None else None
         )
+        raw_user_edited = d.get('user_edited') or {}
         return cls(
             tab_id=int(d['tab_id']),
             parent_id=d.get('parent_id'),
             group_id=group_id,
+            title=d.get('title', '') or '',
+            url=d.get('url', '') or '',
+            description=d.get('description', '') or '',
+            source=d.get('source', '') or '',
+            favicon=d.get('favicon'),
+            user_edited={
+                key: bool(value)
+                for key, value in raw_user_edited.items()
+            },
+            last_fetched=d.get('last_fetched'),
+            fetch_attempts=int(d.get('fetch_attempts', 0) or 0),
+            last_error=d.get('last_error'),
         )
 
 

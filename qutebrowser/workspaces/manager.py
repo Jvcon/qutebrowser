@@ -11,13 +11,15 @@ objects and pinned tabs, exposes CRUD operations over them, and emits
 ``Saveable``.
 """
 
+import dataclasses
 import datetime
 import uuid
+from collections.abc import Iterable, Mapping
 from typing import Any, Callable, Optional
 
 import yaml
 
-from qutebrowser.qt.core import QObject, pyqtSignal
+from qutebrowser.qt.core import QObject, QUrl, pyqtSignal
 
 from qutebrowser.utils import log
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
@@ -29,6 +31,39 @@ from qutebrowser.workspaces.persistence import (PinnedPersistence,
 def _now() -> str:
     """Return the current time as an ISO 8601 UTC timestamp."""
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _now_seconds() -> str:
+    """Return the current UTC timestamp truncated to whole seconds."""
+    return datetime.datetime.now(
+        datetime.timezone.utc).isoformat(timespec='seconds')
+
+
+def _host(url: str) -> str:
+    """Return the lowercase host component of *url* ('' when unavailable)."""
+    if not url:
+        return ''
+    return QUrl(url).host().lower()
+
+
+@dataclasses.dataclass
+class TabMetadata:
+
+    """Metadata captured from a live tab for collection/backfill.
+
+    This intentionally does not depend on the browser layer so the manager
+    can be unit-tested with plain strings.
+    """
+
+    url: str = ''
+    title: str = ''
+    description: str = ''
+    source: str = ''
+    favicon: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.source:
+            self.source = _host(self.url)
 
 
 class WorkspaceManager(QObject):
@@ -274,6 +309,215 @@ class WorkspaceManager(QObject):
         """Move a tab into a group (or to standalone when group_id is None)."""
         self._mutate_group_or_tab(
             workspace_id, tab_id, lambda tab: tab.assign_group(group_id))
+
+    # --- metadata capture / collection (VP-F1) ---
+
+    def find_tab_by_id(
+            self,
+            workspace_id: uuid.UUID,
+            tab_id: int,
+    ) -> Optional[WorkspaceTab]:
+        """Return the workspace tab with *tab_id*, if present."""
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return None
+        for tab in workspace.tabs:
+            if tab.tab_id == tab_id:
+                return tab
+        return None
+
+    def find_or_create_tab_by_url(
+            self,
+            workspace_id: uuid.UUID,
+            url: str,
+            *,
+            tab_id: Optional[int] = None,
+    ) -> WorkspaceTab:
+        """Return the tab entry matching *url*, creating one when missing.
+
+        A non-empty URL identifies the entry: re-collecting the same URL
+        must not create a duplicate. Empty URLs always create a fresh entry
+        because they cannot be matched meaningfully.
+
+        Args:
+            workspace_id: Workspace to search / add to.
+            url: The URL to match.
+            tab_id: Tab id to use for a newly created entry. Defaults to
+                ``-1`` (a placeholder for callers which only need the entry).
+        """
+        workspace = self._workspaces[workspace_id]
+        if url:
+            for tab in workspace.tabs:
+                if tab.url == url:
+                    return tab
+
+        tab = WorkspaceTab(
+            tab_id=tab_id if tab_id is not None else -1,
+            url=url,
+            source=_host(url),
+        )
+        self.add_tab(workspace_id, tab)
+        return tab
+
+    def update_tab_metadata(
+            self,
+            workspace_id: uuid.UUID,
+            tab_id: int,
+            *,
+            url: Optional[str] = None,
+            title: Optional[str] = None,
+            description: Optional[str] = None,
+            source: Optional[str] = None,
+            favicon: Optional[str] = None,
+            fetched: bool = False,
+            error: Optional[str] = None,
+    ) -> Optional[WorkspaceTab]:
+        """Update a tab entry's metadata, respecting the user-edited guard.
+
+        ``None`` means "leave unchanged". Fields with a truthy
+        :attr:`WorkspaceTab.user_edited` flag are never overwritten (except
+        ``url``, which is the entry's identity rather than editable content).
+
+        Args:
+            workspace_id: Workspace owning the tab.
+            tab_id: Runtime id of the tab entry to update.
+            url: New page URL; when given, ``source`` is re-derived unless
+                explicitly supplied.
+            title: New page title.
+            description: New page description.
+            source: New site host.
+            favicon: New base64-encoded PNG favicon.
+            fetched: Whether this call represents a successful fetch; when
+                True, ``fetch_attempts`` is incremented, ``last_fetched`` is
+                stamped and ``last_error`` is cleared.
+            error: Error string to record on failure.
+
+        Returns:
+            The updated tab, or None when the workspace/tab is unknown.
+        """
+        tab = self.find_tab_by_id(workspace_id, tab_id)
+        if tab is None:
+            return None
+
+        changed = False
+        if url is not None and url != tab.url:
+            tab.url = url
+            changed = True
+            if source is None:
+                source = _host(url)
+
+        updates = (
+            ('title', title),
+            ('description', description),
+            ('source', source),
+            ('favicon', favicon),
+        )
+        for field, value in updates:
+            if value is None:
+                continue
+            if tab.user_edited.get(field, False):
+                continue
+            if getattr(tab, field) != value:
+                setattr(tab, field, value)
+                changed = True
+
+        if fetched:
+            tab.fetch_attempts += 1
+            tab.last_fetched = _now_seconds()
+            tab.last_error = None
+            changed = True
+        if error is not None:
+            tab.last_error = error
+            changed = True
+
+        if changed:
+            self.changed.emit()
+        return tab
+
+    def set_user_edited(
+            self,
+            workspace_id: uuid.UUID,
+            tab_id: int,
+            field: str,
+            value: bool = True,
+    ) -> None:
+        """Mark *field* as user-edited so auto-fetch won't overwrite it."""
+        tab = self.find_tab_by_id(workspace_id, tab_id)
+        if tab is None:
+            return
+        tab.user_edited[field] = value
+        self.changed.emit()
+
+    def collect_tab(
+            self,
+            workspace_id: uuid.UUID,
+            tab_id: int,
+            group_id: Optional[uuid.UUID] = None,
+            *,
+            metadata: Optional[TabMetadata] = None,
+    ) -> WorkspaceTab:
+        """Collect a tab, upserting by URL and backfilling metadata.
+
+        Re-collecting an already-known URL reuses the existing entry instead
+        of appending a duplicate. Fields the user edited manually are never
+        overwritten.
+        """
+        meta = metadata or TabMetadata()
+        tab = self.find_or_create_tab_by_url(
+            workspace_id, meta.url, tab_id=tab_id)
+
+        if meta.url:
+            tab.url = meta.url
+        if meta.title and not tab.user_edited.get('title', False):
+            tab.title = meta.title
+        if meta.description and not tab.user_edited.get(
+                'description', False):
+            tab.description = meta.description
+        if meta.source and not tab.user_edited.get('source', False):
+            tab.source = meta.source
+        if meta.favicon and not tab.user_edited.get('favicon', False):
+            tab.favicon = meta.favicon
+
+        if group_id is not None:
+            tab.assign_group(group_id)
+
+        tab.fetch_attempts += 1
+        tab.last_fetched = _now_seconds()
+        tab.last_error = None
+        self.changed.emit()
+        return tab
+
+    def collect_all_in_window(
+            self,
+            workspace_id: uuid.UUID,
+            group_id: Optional[uuid.UUID],
+            tab_ids: Iterable[int],
+            *,
+            tab_metadata: Optional[Mapping[int, TabMetadata]] = None,
+    ) -> tuple[list[int], list[int]]:
+        """Collect every collectable tab in *tab_ids* into *group_id*.
+
+        A tab is collectable when its URL uses ``http``/``https`` and has a
+        non-empty host. Internal pages (``qute://*``, ``about:blank``,
+        ``chrome://*``, ``view-source:*``, ...) are skipped silently.
+
+        Returns:
+            ``(collected, skipped)`` lists of tab ids.
+        """
+        metadata_by_id = tab_metadata or {}
+        collected: list[int] = []
+        skipped: list[int] = []
+        for tab_id in tab_ids:
+            meta = metadata_by_id.get(tab_id, TabMetadata())
+            parsed = QUrl(meta.url)
+            scheme = parsed.scheme().lower()
+            if scheme not in ('http', 'https') or not parsed.host():
+                skipped.append(tab_id)
+                continue
+            self.collect_tab(
+                workspace_id, tab_id, group_id, metadata=meta)
+            collected.append(tab_id)
+        return collected, skipped
 
     # --- pinned tabs ---
 

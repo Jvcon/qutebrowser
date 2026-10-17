@@ -48,15 +48,17 @@ Known limitations (tracked for the next sub-slice)
 * Tabs inserted directly through the ``QTabWidget`` API (bypassing
   ``TabbedBrowser.tabopen``) are only picked up by the construction-time
   ``_sync_existing_tabs`` pass, not while running.
-* Favicons are not forwarded yet (the placeholder pixmap is used).
 * Drag-and-drop reparenting, the search overlay and the real audio toggle API
   are out of scope for this slice.
+* Favicons / titles / URLs are captured into the :class:`WorkspaceTab`
+  metadata (VP-F1); the tree's placeholder pixmap is still used for display.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import uuid
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional, cast
 
 from qutebrowser.qt import sip
@@ -65,6 +67,7 @@ from qutebrowser.qt.widgets import QWidget
 
 from qutebrowser.mainwindow.tabtree import Status, TabTreeModel
 from qutebrowser.utils import objreg
+from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import WorkspaceManager
 from qutebrowser.workspaces.model import WorkspaceTab
 
@@ -72,6 +75,7 @@ if TYPE_CHECKING:
     from qutebrowser.browser.browsertab import AbstractTab
     from qutebrowser.mainwindow.tabbedbrowser import TabbedBrowser
     from qutebrowser.mainwindow.tabtree import TabTree
+    from qutebrowser.qt.gui import QIcon
 
 
 @dataclasses.dataclass
@@ -121,6 +125,7 @@ class WorkspaceBridge(QObject):
             tab_tree: Optional[TabTree] = None,
             win_id: int = 0,
             parent: Optional[QWidget] = None,
+            description_fetcher: Callable[..., None] | None = None,
     ) -> None:
         super().__init__(parent)
         self._win_id = win_id
@@ -130,6 +135,8 @@ class WorkspaceBridge(QObject):
         self._tab_index: dict[int, int] = {}
         self._tab_state: dict[int, _TabState] = {}
         self._attached: set[int] = set()
+        self._description_fetcher = (
+            description_fetcher or tabentry_fetch.fetch_description)
 
         if manager is None or model is None:
             # Tolerate headless / no-workspace startup: stay inert so the
@@ -203,7 +210,7 @@ class WorkspaceBridge(QObject):
         try:
             return objreg.get(
                 'tab-registry', scope='window', window=self._win_id)
-        except KeyError:
+        except (KeyError, objreg.RegistryUnavailableError):
             return {}
 
     # --- TabTree -> TabbedBrowser direction ---
@@ -326,6 +333,22 @@ class WorkspaceBridge(QObject):
         except (AttributeError, NotImplementedError):
             pass
 
+        # Persist the live title/url/source (and any already-available
+        # favicon) onto the WorkspaceTab, not just the ephemeral state.
+        favicon = ''
+        try:
+            favicon = iconbytes.icon_to_png_base64(tab.icon())
+        except (AttributeError, NotImplementedError):
+            pass
+        self._manager.update_tab_metadata(  # type: ignore[union-attr]
+            workspace_id,
+            tab_id,
+            url=state.url or None,
+            title=state.title or None,
+            favicon=favicon or None,
+            fetched=bool(favicon),
+        )
+
         self._attach_tab(tab)
         self._push(tab_id)
 
@@ -340,6 +363,8 @@ class WorkspaceBridge(QObject):
             lambda title, tid=tab_id: self._on_title_changed(tid, title))
         tab.url_changed.connect(
             lambda url, tid=tab_id: self._on_url_changed(tid, url))
+        tab.icon_changed.connect(
+            lambda icon, tid=tab_id: self._on_icon_changed(tid, icon))
         tab.load_started.connect(
             lambda tid=tab_id: self._on_load_started(tid))
         tab.load_finished.connect(
@@ -374,13 +399,41 @@ class WorkspaceBridge(QObject):
             status=state.status(),
         )
 
+    def _active_workspace_id(self) -> Optional[uuid.UUID]:
+        """Return the active workspace id, or None when unavailable."""
+        if self._manager is None:
+            return None
+        workspace = self._manager.get_active()
+        return None if workspace is None else workspace.id
+
     def _on_title_changed(self, tab_id: int, title: str) -> None:
         self._state_for(tab_id).title = title
+        workspace_id = self._active_workspace_id()
+        if workspace_id is not None:
+            # The manager applies the user-edited guard for us.
+            self._manager.update_tab_metadata(  # type: ignore[union-attr]
+                workspace_id, tab_id, title=title)
         self._push(tab_id)
 
     def _on_url_changed(self, tab_id: int, url: QUrl) -> None:
-        self._state_for(tab_id).url = url.toString()
+        url_str = url.toString()
+        self._state_for(tab_id).url = url_str
+        workspace_id = self._active_workspace_id()
+        if workspace_id is not None:
+            source = url.host().lower()
+            self._manager.update_tab_metadata(  # type: ignore[union-attr]
+                workspace_id, tab_id, url=url_str or None,
+                source=source or None)
         self._push(tab_id)
+
+    def _on_icon_changed(self, tab_id: int, icon: QIcon) -> None:
+        """Persist a live favicon as base64 PNG onto the workspace tab."""
+        encoded = iconbytes.icon_to_png_base64(icon)
+        workspace_id = self._active_workspace_id()
+        if workspace_id is None or not encoded:
+            return
+        self._manager.update_tab_metadata(  # type: ignore[union-attr]
+            workspace_id, tab_id, favicon=encoded, fetched=True)
 
     def _on_load_started(self, tab_id: int) -> None:
         self._state_for(tab_id).loading = True
@@ -389,6 +442,33 @@ class WorkspaceBridge(QObject):
     def _on_load_finished(self, tab_id: int, ok: bool) -> None:
         self._state_for(tab_id).loading = False
         self._push(tab_id)
+        if ok:
+            tab = self._tab_registry().get(tab_id)
+            if tab is not None:
+                self._fetch_description(tab_id, tab)
+
+    def _fetch_description(self, tab_id: int, tab: AbstractTab) -> None:
+        """Best-effort description capture, persisted when it resolves."""
+        workspace_id = self._active_workspace_id()
+        manager = self._manager
+        if workspace_id is None or manager is None:
+            return
+
+        def update(description: str) -> None:
+            manager.update_tab_metadata(
+                workspace_id, tab_id, description=description)
+
+        def on_error(error: str) -> None:
+            manager.update_tab_metadata(
+                workspace_id, tab_id, description='', error=error)
+
+        try:
+            self._description_fetcher(tab, update, on_error=on_error)
+        except TypeError:
+            # Injected test doubles may only accept (tab, callback).
+            self._description_fetcher(tab, update)
+        except Exception as e:  # noqa: BLE001 - metadata is best-effort
+            on_error(str(e)[:200])
 
     def _on_pinned_changed(self, tab_id: int, pinned: bool) -> None:
         self._state_for(tab_id).pinned = pinned

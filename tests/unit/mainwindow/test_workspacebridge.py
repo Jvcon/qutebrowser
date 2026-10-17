@@ -8,8 +8,8 @@ from unittest import mock
 
 import pytest
 
-from qutebrowser.qt.core import QModelIndex, QObject, QUrl, pyqtSignal
-from qutebrowser.qt.gui import QIcon
+from qutebrowser.qt.core import QModelIndex, QObject, Qt, QUrl, pyqtSignal
+from qutebrowser.qt.gui import QIcon, QPixmap
 
 from qutebrowser.mainwindow import tabtree, workspacebridge
 from qutebrowser.workspaces.manager import WorkspaceManager
@@ -77,6 +77,9 @@ class MockTab(QObject):
 
     def url(self) -> QUrl:
         return self._url
+
+    def icon(self) -> QIcon:
+        return QIcon()
 
     def set_pinned(self, pinned: bool) -> None:
         self.data.pinned = pinned
@@ -405,3 +408,40 @@ class TestWorkspaceBridge:
         tab = _open_tab(browser, MockTab(1))
         tab.pinned_changed.emit(True)
         assert model._tab_info[1].status & tabtree.Status.PINNED
+
+    def test_icon_changed_writes_favicon_to_workspace_tab(
+            self, browser, manager, bridge):
+        tab = _open_tab(browser, MockTab(1))
+        pixmap = QPixmap(16, 16)
+        pixmap.fill(Qt.GlobalColor.red)
+
+        tab.icon_changed.emit(QIcon(pixmap))
+
+        workspace_tab = manager.get_active().tabs[0]
+        assert workspace_tab.favicon
+        assert workspace_tab.fetch_attempts == 1
+        assert workspace_tab.last_fetched is not None
+
+    def test_title_changed_persists_into_workspace_tab(
+            self, browser, manager, bridge):
+        tab = _open_tab(browser, MockTab(1))
+        tab.title_changed.emit('Persisted title')
+        assert manager.get_active().tabs[0].title == 'Persisted title'
+
+    def test_url_changed_persists_source_into_workspace_tab(
+            self, browser, manager, bridge):
+        tab = _open_tab(browser, MockTab(1))
+        tab.url_changed.emit(QUrl('https://Example.COM/path'))
+        workspace_tab = manager.get_active().tabs[0]
+        assert workspace_tab.url == 'https://example.com/path'
+        assert workspace_tab.source == 'example.com'
+
+    def test_user_edited_title_blocks_overwrite(
+            self, browser, manager, bridge):
+        tab = _open_tab(browser, MockTab(1, title='Original'))
+        workspace_tab = manager.get_active().tabs[0]
+        workspace_tab.user_edited['title'] = True
+
+        tab.title_changed.emit('Auto title')
+
+        assert workspace_tab.title == 'Original'
