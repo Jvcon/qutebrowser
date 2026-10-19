@@ -914,6 +914,10 @@ class WorkspaceManager(QObject):
         Raises:
             ValueError: If *status* is not a valid reading status.
         """
+        # Normalise lowercase callers (e.g. ``'done'``) before validation so
+        # both the :vp-status-set / :vp-batch-status commands and direct
+        # callers can use the same case-insensitive API surface.
+        status = status.upper()
         if status not in READING_STATUSES:
             raise ValueError(
                 f"Invalid reading status {status!r}; expected one of "

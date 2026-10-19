@@ -742,6 +742,9 @@ class _FakeBrowser:
     def __init__(self) -> None:
         self.widget = _FakeWidget()
         self.opened: list[tuple[str, bool]] = []
+        # VP-F4's new-window flow constructs a fresh ``MainWindow`` and
+        # reads the source browser's ``is_private`` flag to mirror it.
+        self.is_private = False
 
     def tabopen(self, url: QUrl, newwindow: bool = False) -> None:
         self.opened.append((url.toString(), newwindow))
@@ -860,12 +863,31 @@ class TestBatchOperations:
 
         monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
 
+        # The new-window path constructs a fresh ``MainWindow`` (we cannot
+        # build a real one without a fully initialised Qt/config env) and
+        # uses *its* tabbed browser to open the URL.
+        new_browser = _FakeBrowser()
+        new_browser.is_private = False
+
+        class _FakeMainWindow:
+
+            def __init__(self, *, private: bool) -> None:
+                self.private = private
+                self.tabbed_browser = new_browser
+                self.shown = False
+
+            def show(self) -> None:
+                self.shown = True
+
+        from qutebrowser.mainwindow import mainwindow as _mw
+        monkeypatch.setattr(_mw, 'MainWindow', _FakeMainWindow)
+
         opened, reused = manager.open_tabs_in_new_window(
             workspace.id, [1, 2])
 
         assert (opened, reused) == (1, 1)
         assert browser.widget.set_calls == [live]
-        assert browser.opened == [('https://b.example/', True)]
+        assert new_browser.opened == [('https://b.example/', False)]
 
     def test_open_tabs_as_new_tabs_reuses_and_opens(
             self, manager, monkeypatch):
