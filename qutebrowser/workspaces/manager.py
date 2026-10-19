@@ -903,6 +903,25 @@ class WorkspaceManager(QObject):
                 return tab
         return None
 
+    def find_tab_by_url(
+            self,
+            workspace_id: uuid.UUID,
+            url: str,
+    ) -> Optional[WorkspaceTab]:
+        """Return the first tab in *workspace_id* with matching *url*.
+
+        Pure query: unlike :meth:`find_or_create_tab_by_url` it never
+        creates an entry, so it is safe to call on tab switches.  An empty
+        *url* never matches (it cannot identify an entry).
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None or not url:
+            return None
+        for tab in workspace.tabs:
+            if tab.url == url:
+                return tab
+        return None
+
     def set_open_status(
             self,
             workspace_id: uuid.UUID,

@@ -78,6 +78,11 @@ if TYPE_CHECKING:
     from qutebrowser.qt.gui import QIcon
 
 
+#: URL schemes which never map to a workspace entry; a switch to one of
+#: these must not trigger the VP-D5 auto-locate (internal pages).
+_INTERNAL_SCHEMES = frozenset({'qute', 'about', 'chrome', 'view-source'})
+
+
 @dataclasses.dataclass
 class _TabState:
 
@@ -114,6 +119,8 @@ class WorkspaceBridge(QObject):
         _browser: The tabbed browser whose tabs are mirrored.
         _manager: The workspace manager to keep in sync, or None.
         _model: The tab tree model to feed display data, or None.
+        _tab_tree: The TabTree host used for auto-locate on tab switch, or
+            None when the bridge was built without one.
         _tab_index: ``QTabWidget`` index -> ``tab.tab_id`` cache.
         _tab_state: ``tab.tab_id`` -> :class:`_TabState`.
         _attached: ``tab_id`` set of tabs whose signals are already wired.
@@ -135,6 +142,7 @@ class WorkspaceBridge(QObject):
         self._browser = tabbed_browser
         self._manager = manager
         self._model = model
+        self._tab_tree = tab_tree
         self._tab_index: dict[int, int] = {}
         self._tab_state: dict[int, _TabState] = {}
         self._attached: set[int] = set()
@@ -267,7 +275,12 @@ class WorkspaceBridge(QObject):
     # --- TabTree -> TabbedBrowser direction ---
 
     def _on_current_tab_changed(self, tab: AbstractTab) -> None:
-        """Reflect the browser's ``current_tab_changed`` into the model."""
+        """Reflect the browser's ``current_tab_changed`` into the model.
+
+        Besides updating the active row it also asks the tree to auto-locate
+        the newly focused tab (VP-D5): expand and scroll its group, then
+        briefly highlight the tab.
+        """
         if self._model is None or sip.isdeleted(self._model):
             return
         new_id = tab.tab_id
@@ -275,6 +288,37 @@ class WorkspaceBridge(QObject):
             # Guard against the feedback loop from a tree-driven switch.
             return
         self._model.set_active_tab_id(new_id)
+        self._auto_locate(tab)
+
+    def _auto_locate(self, tab: AbstractTab) -> None:
+        """Emit ``group_focus_requested`` for the newly focused *tab*.
+
+        Skips internal pages (``qute://`` / ``about:`` / ``chrome://`` /
+        ``view-source:``), empty URLs and tabs which are not tracked live
+        (i.e. shutting down).  When the tab has no workspace entry the
+        browser switch is simply ignored -- auto-locate never creates state.
+        """
+        if self._manager is None or self._tab_tree is None:
+            return
+        # A tab which is shutting down has already been detached; never
+        # auto-locate a dying tab.
+        if tab.tab_id not in self._attached:
+            return
+        url_str = self._live_url(tab)
+        if not url_str:
+            return
+        if QUrl(url_str).scheme().lower() in _INTERNAL_SCHEMES:
+            return
+        workspace_id = self._active_workspace_id()
+        if workspace_id is None:
+            return
+        entry = self._manager.find_tab_by_id(workspace_id, tab.tab_id)
+        if entry is None:
+            entry = self._manager.find_tab_by_url(workspace_id, url_str)
+        if entry is None:
+            return
+        self._tab_tree.group_focus_requested.emit(
+            entry.group_id, entry.tab_id)
 
     def _on_tree_activated(self, idx: QModelIndex) -> None:
         """Switch to the tab behind a clicked/selected tree row."""

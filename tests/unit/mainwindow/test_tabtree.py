@@ -472,6 +472,113 @@ class TestTabTreeModel:
         assert names == ['opened', 'archived', 'suspended']
 
 
+class TestAutoLocate:
+
+    """VP-D5: active-group accent, transient tab highlight and focus."""
+
+    @pytest.fixture
+    def model(self, qtbot):
+        manager = MockManager(_make_workspace())
+        return tabtree.TabTreeModel(manager)
+
+    @pytest.fixture
+    def group_id(self, model):
+        return model._workspace.groups[0].group_id
+
+    def test_active_group_role_and_data_changed(self, model, group_id):
+        """set_active_group_id flips ActiveGroupRole and emits dataChanged."""
+        changes = []
+        model.dataChanged.connect(lambda *args: changes.append(args))
+
+        model.set_active_group_id(group_id)
+
+        assert model.active_group_id() == group_id
+        group_index = model.index(0, 0, QModelIndex())
+        assert group_index.data(tabtree.ActiveGroupRole) is True
+        assert changes[0][2] == [tabtree.ActiveGroupRole]
+        # Tab rows never claim the active-group role.
+        assert model.index(2, 0, QModelIndex()).data(
+            tabtree.ActiveGroupRole) is False
+
+    def test_set_active_group_id_is_idempotent(self, model, group_id):
+        """Setting the same active group again emits nothing."""
+        model.set_active_group_id(group_id)
+        changes = []
+        model.dataChanged.connect(lambda *args: changes.append(args))
+        model.set_active_group_id(group_id)
+        assert changes == []
+
+    def test_clear_active_group_id(self, model, group_id):
+        """Passing None clears the marker."""
+        model.set_active_group_id(group_id)
+        model.set_active_group_id(None)
+        assert model.active_group_id() is None
+        assert model.index(0, 0, QModelIndex()).data(
+            tabtree.ActiveGroupRole) is False
+
+    def test_highlight_role_reflects(self, model, monkeypatch):
+        """set_highlighted_tab_id flips HighlightRole for the tab row."""
+        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer())
+        model.set_highlighted_tab_id(20)
+        index = model.index(2, 0, QModelIndex())  # standalone tab id 20
+        assert index.data(tabtree.HighlightRole) is True
+        assert model.index(3, 0, QModelIndex()).data(
+            tabtree.HighlightRole) is False
+
+    def test_highlight_resets_after_timeout(self, model, monkeypatch):
+        """The scheduled callback clears the highlight."""
+        calls = []
+
+        class FakeQTimer:
+            @staticmethod
+            def singleShot(ms, callback):  # noqa: N802 - Qt naming
+                calls.append((ms, callback))
+
+        monkeypatch.setattr(tabtree, 'QTimer', FakeQTimer)
+        model.set_highlighted_tab_id(20, timeout_ms=1234)
+
+        assert len(calls) == 1
+        assert calls[0][0] == 1234
+        assert model.index(2, 0, QModelIndex()).data(
+            tabtree.HighlightRole) is True
+
+        calls[0][1]()  # fire the scheduled reset
+
+        assert model.index(2, 0, QModelIndex()).data(
+            tabtree.HighlightRole) is False
+
+    def test_focus_group_and_tab_expands_and_returns_index(self, model, group_id):
+        """focus_group_and_tab expands the group and returns the tab index."""
+        model._workspace.groups[0].folded = True
+
+        index = model.focus_group_and_tab(group_id, 30)
+
+        assert model._workspace.groups[0].folded is False
+        assert model.active_group_id() == group_id
+        assert index.isValid()
+        assert index.data(tabtree.KindRole) == tabtree.Kind.Tab
+
+    def test_focus_group_and_tab_standalone(self, model):
+        """A None group id focuses a standalone tab without an accent."""
+        index = model.focus_group_and_tab(None, 20)
+        assert index.isValid()
+        assert model.active_group_id() is None
+
+    def test_focus_group_and_tab_unknown_tab(self, model, group_id):
+        """An unknown tab returns an invalid index."""
+        index = model.focus_group_and_tab(group_id, 999)
+        assert not index.isValid()
+
+
+class _FakeQTimer:
+
+    """No-op QTimer stand-in so scheduled resets never fire in tests."""
+
+    @staticmethod
+    def singleShot(ms, callback):  # noqa: N802 - Qt naming
+        return None
+
+
 class TestTabTreeItemDelegate:
 
     """Tests for :class:`tabtree.TabTreeItemDelegate`."""
@@ -696,6 +803,19 @@ class TestTabTreeItemDelegate:
 
         self._paint_row(delegate, model, option, other_index)
         assert delegate._last_active_accent is None
+
+    def test_paint_highlight_and_active_group(self, model, option, monkeypatch):
+        """HighlightRole and ActiveGroupRole paint without raising."""
+        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer())
+        group_id = model._workspace.groups[0].group_id
+        model.set_active_group_id(group_id)
+        model.set_highlighted_tab_id(20)
+        delegate = tabtree.TabTreeItemDelegate()
+
+        group_index = model.index(0, 0, QModelIndex())
+        tab_index = model.index(2, 0, QModelIndex())
+        self._paint_row(delegate, model, option, group_index)
+        self._paint_row(delegate, model, option, tab_index)
 
 
 class TestSelectionMode:
@@ -956,3 +1076,29 @@ class TestTabTree:
 
         tree._delegate.selection_toggled.emit(idx)
         assert tree.model().selected_tab_ids() == set()
+
+    def test_focus_group_and_tab_scrolls_and_highlights(self, qtbot):
+        """The host scrolls to group + tab and highlights once."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        group_id = tree.model()._workspace.groups[0].group_id
+
+        scrolled = []
+
+        class FakeView:
+
+            def scrollTo(self, index, hint=None):  # noqa: N802 - Qt naming
+                scrolled.append((index, hint))
+
+        tree._view = FakeView()  # type: ignore[assignment]
+
+        highlighted = []
+        tree.model().highlight_tab = (
+            lambda tab_id, **kwargs: highlighted.append(tab_id))
+
+        tree.focus_group_and_tab(group_id, 30)
+
+        assert len(scrolled) == 2
+        assert highlighted == [30]
+        assert tree.model().active_group_id() == group_id

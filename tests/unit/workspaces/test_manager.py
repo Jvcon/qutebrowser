@@ -433,6 +433,49 @@ class TestGroupState:
         assert changes == []
 
 
+class TestFindTabByUrl:
+
+    """Pure URL lookup used by the VP-D5 auto-locate (no create, no emit)."""
+
+    def _workspace_with_tabs(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(
+            tab_id=1, url='https://a.example/'))
+        manager.add_tab(workspace.id, WorkspaceTab(
+            tab_id=2, url='https://b.example/'))
+        return workspace
+
+    def test_hit_returns_matching_entry(self, manager):
+        workspace = self._workspace_with_tabs(manager)
+        found = manager.find_tab_by_url(workspace.id, 'https://b.example/')
+        assert found is not None
+        assert found.tab_id == 2
+
+    def test_miss_returns_none(self, manager):
+        workspace = self._workspace_with_tabs(manager)
+        assert manager.find_tab_by_url(
+            workspace.id, 'https://missing.example/') is None
+
+    def test_empty_url_returns_none(self, manager):
+        workspace = self._workspace_with_tabs(manager)
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=3, url=''))
+        assert manager.find_tab_by_url(workspace.id, '') is None
+
+    def test_unknown_workspace_returns_none(self, manager):
+        self._workspace_with_tabs(manager)
+        assert manager.find_tab_by_url(uuid.uuid4(), 'https://a.example/') is None
+
+    def test_lookup_does_not_create_or_emit(self, manager):
+        workspace = self._workspace_with_tabs(manager)
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        assert manager.find_tab_by_url(
+            workspace.id, 'https://missing.example/') is None
+        assert len(workspace.tabs) == 2
+        assert changes == []
+
+
 class TestCollect:
 
     def test_collect_fresh_url_captures_metadata(self, manager):

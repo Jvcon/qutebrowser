@@ -521,3 +521,124 @@ class TestWorkspaceBridge:
         tab.title_changed.emit('Auto title')
 
         assert workspace_tab.title == 'Original'
+
+
+class TestAutoLocate:
+
+    """VP-D5: tab switches emit ``group_focus_requested``."""
+
+    def _tree_and_bridge(self, browser, manager, qtbot):
+        """Build a tree and a bridge wired to the same model."""
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        bridge = workspacebridge.WorkspaceBridge(
+            win_id=0,
+            tabbed_browser=browser,
+            manager=manager,
+            model=tree._model,
+            tab_tree=tree,
+        )
+        return tree, bridge
+
+    @staticmethod
+    def _collect(tree):
+        emitted = []
+        tree.group_focus_requested.connect(
+            lambda gid, tid: emitted.append((gid, tid)))
+        return emitted
+
+    def test_known_tab_emits_group_focus(self, browser, manager, qtbot):
+        """A switch to a grouped tab emits its group + tab id."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2, url=QUrl('https://b.example/')))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        workspace = manager.get_active()
+        group = manager.create_group(workspace.id, 'g')
+        manager.move_tab_to_group(workspace.id, 2, group.group_id)
+        emitted = self._collect(tree)
+
+        browser.current_tab_changed.emit(tab_b)
+
+        assert emitted == [(group.group_id, 2)]
+        assert tree.model().active_group_id() == group.group_id
+
+    def test_standalone_tab_emits_none_group(self, browser, manager, qtbot):
+        """A standalone tab emits ``None`` as the group id."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2, url=QUrl('https://b.example/')))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        emitted = self._collect(tree)
+
+        browser.current_tab_changed.emit(tab_b)
+
+        assert emitted == [(None, 2)]
+
+    def test_url_fallback_emits(
+            self, browser, manager, qtbot, monkeypatch):
+        """When the id lookup misses, the URL match is used instead."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2, url=QUrl('https://b.example/')))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        workspace = manager.get_active()
+        entry = manager.find_tab_by_id(workspace.id, 2)
+        assert entry is not None
+        monkeypatch.setattr(manager, 'find_tab_by_id', lambda *a, **k: None)
+        monkeypatch.setattr(
+            manager, 'find_tab_by_url', lambda wid, url: entry)
+        emitted = self._collect(tree)
+
+        browser.current_tab_changed.emit(tab_b)
+
+        assert emitted == [(entry.group_id, entry.tab_id)]
+
+    def test_internal_page_skipped(self, browser, manager, qtbot):
+        """A switch to a ``qute://`` page does not emit."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2, url=QUrl('qute://settings')))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        emitted = self._collect(tree)
+
+        browser.current_tab_changed.emit(tab_b)
+
+        assert emitted == []
+
+    def test_empty_url_skipped(self, browser, manager, qtbot):
+        """A switch to a tab without a URL does not emit."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        emitted = self._collect(tree)
+
+        browser.current_tab_changed.emit(tab_b)
+
+        assert emitted == []
+
+    def test_shutting_down_tab_skipped(self, browser, manager, qtbot):
+        """A tab which is shutting down does not trigger auto-locate."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2, url=QUrl('https://b.example/')))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        emitted = self._collect(tree)
+
+        tab_b.shutting_down.emit()
+        browser.current_tab_changed.emit(tab_b)
+
+        assert emitted == []
+
+    def test_unknown_tab_does_not_emit(self, browser, manager, qtbot):
+        """A switch to a tab with no workspace entry does not emit."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        emitted = self._collect(tree)
+
+        # A brand-new tab id never registered with the bridge.
+        browser.current_tab_changed.emit(MockTab(99, url=QUrl('https://z/')))
+
+        assert emitted == []
+
+    def test_no_tab_tree_is_inert(self, browser, manager, model, bridge):
+        """A bridge built without a TabTree tolerates tab switches."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2, url=QUrl('https://b.example/')))
+        browser.current_tab_changed.emit(tab_b)
+        assert model.active_tab_id() == 2
