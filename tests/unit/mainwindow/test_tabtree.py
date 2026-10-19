@@ -654,6 +654,30 @@ class TestSelectionMode:
         assert captured == [index]
         assert activated == []
 
+    def test_delegate_shift_click_requests_range(self, model):
+        """Shift+click in selection mode requests a range extension."""
+        model.set_selection_mode(True)
+        delegate = tabtree.TabTreeItemDelegate()
+        ranges = []
+        toggled = []
+        delegate.selection_range_requested.connect(
+            lambda idx: ranges.append(idx))
+        delegate.selection_toggled.connect(lambda idx: toggled.append(idx))
+
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 220, 22)
+        index = model.index(2, 0, QModelIndex())
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(QPoint(60, 11)),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.ShiftModifier,
+        )
+        assert delegate.editorEvent(event, model, option, index) is True
+        assert ranges == [index]
+        assert toggled == []
+
 
 class TestTabTree:
 

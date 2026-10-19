@@ -852,18 +852,25 @@ class TestBatchOperations:
 
         changes = []
         manager.changed.connect(lambda: changes.append(True))
-        removed = manager.delete_tabs(workspace.id, [1, 2])
+        removed = manager.delete_tabs(workspace.id, [1, 2], confirm=False)
 
         assert removed == 2
         assert [tab.tab_id for tab in workspace.tabs] == [3]
         assert changes
+
+    def test_delete_tabs_default_confirm_is_noop(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        assert manager.delete_tabs(workspace.id, [1]) == 0
+        assert [tab.tab_id for tab in workspace.tabs] == [1]
 
     def test_delete_tabs_unknown_is_idempotent(self, manager):
         workspace = manager.add_workspace('w')
         changes = []
         manager.changed.connect(lambda: changes.append(True))
 
-        assert manager.delete_tabs(workspace.id, [99]) == 0
+        assert manager.delete_tabs(workspace.id, [99], confirm=False) == 0
         assert changes == []
 
     def test_open_tabs_in_new_window_reuses_and_opens(
