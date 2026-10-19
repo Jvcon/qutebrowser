@@ -46,10 +46,10 @@ class FakeManager:
         self.deleted_tabs: list[int] = []
         self.opened_windows: list[tuple[uuid.UUID, set[int]]] = []
         self.opened_tabs: list[tuple[uuid.UUID, set[int]]] = []
-        self.closed_groups: list[tuple[uuid.UUID, uuid.UUID]] = []
-        self.close_group_result = (0, 0)
-        self.reopened_groups: list[tuple[uuid.UUID, uuid.UUID]] = []
-        self.reopen_group_result = (0, 0, 0)
+        self.closed_groups: list[tuple[uuid.UUID, uuid.UUID, int]] = []
+        self.close_group_result: tuple[int, int] = (0, 0)
+        self.reopened_groups: list[tuple[uuid.UUID, uuid.UUID, int]] = []
+        self.reopen_group_result: tuple[int, int, int] = (0, 0, 0)
 
     def add_workspace(self, name: str) -> Workspace:
         workspace = Workspace(id=uuid.uuid4(), name=name,
@@ -160,13 +160,14 @@ class FakeManager:
         return 'SUSPENDED'
 
     def close_group(self, workspace_id: uuid.UUID,
-                    group_id: uuid.UUID) -> tuple[int, int]:
-        self.closed_groups.append((workspace_id, group_id))
+                    group_id: uuid.UUID, *,
+                    win_id: int = 0) -> tuple[int, int]:
+        self.closed_groups.append((workspace_id, group_id, win_id))
         return self.close_group_result
 
     def reopen_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID,
                      *, win_id: int = 0) -> tuple[int, int, int]:
-        self.reopened_groups.append((workspace_id, group_id))
+        self.reopened_groups.append((workspace_id, group_id, win_id))
         return self.reopen_group_result
 
     def get_or_create_inbox(self, workspace_id: uuid.UUID) -> Group:
@@ -666,8 +667,19 @@ class TestGroupClose:
         commands.vp_group_close('g')
 
         assert fake_manager.closed_groups == [
-            (workspace.id, group.group_id)]
+            (workspace.id, group.group_id, 0)]
         assert messages == ["Closed 2 tab(s) in 'g'; skipped 1."]
+
+    def test_passes_win_id_through(
+            self, fake_manager: FakeManager) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        fake_manager.close_group_result = (1, 0)
+
+        commands.vp_group_close('g', win_id=3)
+
+        assert fake_manager.closed_groups == [
+            (workspace.id, group.group_id, 3)]
 
     def test_already_suspended(
             self, fake_manager: FakeManager, messages: list[str]) -> None:

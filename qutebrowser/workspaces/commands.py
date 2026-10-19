@@ -552,7 +552,8 @@ def _make_group_delete_action(
 
 @cmdutils.register(name='vp-group-close')
 @cmdutils.argument('target', metavar='target')
-def vp_group_close(target: str) -> None:
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_group_close(target: str, win_id: int = 0) -> None:
     """Close every open tab in the group, leaving entries as SUSPENDED.
 
     Args:
@@ -560,7 +561,8 @@ def vp_group_close(target: str) -> None:
     """
     manager = _manager()
     workspace, group = _resolve_group_target(manager, target)
-    closed, skipped = manager.close_group(workspace.id, group.group_id)
+    closed, skipped = manager.close_group(
+        workspace.id, group.group_id, win_id=win_id)
     if closed == 0 and skipped == 0:
         # Could be an empty group, or all members already SUSPENDED.
         state = manager.group_state(workspace.id, group.group_id)
