@@ -289,6 +289,11 @@ def tab_collect(tab: Any, group_id: str = '') -> None:
         )
         if existing is not None:
             manager.set_open_status(workspace.id, existing.tab_id, 'OPEN')
+            if existing.tab_id != tab.tab_id:
+                # VP-D1: bind the live tab's id to the retained entry so the
+                # bridge tracks *this* tab for the same-URL workspace row.
+                manager.update_tab_metadata(
+                    workspace.id, existing.tab_id, new_tab_id=tab.tab_id)
             message.info("Collected tab.")
             return
 

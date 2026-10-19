@@ -69,7 +69,7 @@ from qutebrowser.mainwindow.tabtree import Status, TabTreeModel
 from qutebrowser.utils import objreg
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import WorkspaceManager
-from qutebrowser.workspaces.model import WorkspaceTab
+from qutebrowser.workspaces.model import Workspace, WorkspaceTab
 
 if TYPE_CHECKING:
     from qutebrowser.browser.browsertab import AbstractTab
@@ -216,6 +216,54 @@ class WorkspaceBridge(QObject):
         except (KeyError, objreg.RegistryUnavailableError):
             return {}
 
+    @staticmethod
+    def _live_url(tab: AbstractTab) -> str:
+        """Return *tab*'s current URL as a string ('' when unavailable)."""
+        try:
+            return tab.url().toString()
+        except (AttributeError, NotImplementedError):
+            return ''
+
+    def _ensure_entry(
+            self,
+            workspace_id: uuid.UUID,
+            workspace: Workspace,
+            tab: AbstractTab,
+            tab_id: int,
+    ) -> None:
+        """Ensure *tab_id* has exactly one entry, reusing by id or URL.
+
+        VP-D1: a *new* tab id may still belong to an entry retained for the
+        same URL (e.g. a suspended tab re-opened from history). Match by URL
+        instead of creating a duplicate entry, and rebind the entry's
+        ``tab_id`` so it tracks the live tab from here on.
+        """
+        tabs = workspace.tabs
+        existing = next(
+            (entry for entry in tabs if entry.tab_id == tab_id), None)
+        if existing is not None:
+            # Re-using a retained entry (e.g. after a suspend): mark it OPEN
+            # again and clear the SUSPENDED status bit before pushing.
+            self._manager.set_open_status(  # type: ignore[union-attr]
+                workspace_id, tab_id, 'OPEN')
+            return
+        live_url = self._live_url(tab)
+        if live_url:
+            existing = next(
+                (entry for entry in tabs if entry.url == live_url), None)
+        if existing is None:
+            self._manager.add_tab(  # type: ignore[union-attr]
+                workspace_id,
+                WorkspaceTab(tab_id=tab_id, open_status='OPEN'),
+            )
+            return
+        old_id = existing.tab_id
+        self._manager.set_open_status(  # type: ignore[union-attr]
+            workspace_id, old_id, 'OPEN')
+        if old_id != tab_id:
+            self._manager.update_tab_metadata(  # type: ignore[union-attr]
+                workspace_id, old_id, new_tab_id=tab_id)
+
     # --- TabTree -> TabbedBrowser direction ---
 
     def _on_current_tab_changed(self, tab: AbstractTab) -> None:
@@ -318,20 +366,7 @@ class WorkspaceBridge(QObject):
             return
         workspace = self._manager.get_active()  # type: ignore[union-attr]
         assert workspace is not None
-        existing = next(
-            (entry for entry in workspace.tabs if entry.tab_id == tab_id),
-            None,
-        )
-        if existing is None:
-            self._manager.add_tab(  # type: ignore[union-attr]
-                workspace_id,
-                WorkspaceTab(tab_id=tab_id, open_status='OPEN'),
-            )
-        else:
-            # Re-using a retained entry (e.g. after a suspend): mark it OPEN
-            # again and clear the SUSPENDED status bit before pushing.
-            self._manager.set_open_status(  # type: ignore[union-attr]
-                workspace_id, tab_id, 'OPEN')
+        self._ensure_entry(workspace_id, workspace, tab, tab_id)
 
         # A tab inserted at *idx* shifts every later index up by one.
         self._tab_index = {
@@ -533,11 +568,15 @@ class WorkspaceBridge(QObject):
         self._push(tab_id)
 
     def _remove_tab_id(self, tab_id: int) -> None:
-        """Suspend *tab_id* and clear its live display data from the model."""
-        self._tab_state.pop(tab_id, None)
+        """Suspend *tab_id*, keeping its last known display data visible.
+
+        VP-D1 requires the retained entry to stay on screen: the workspace
+        entry is only flipped to ``SUSPENDED`` (never removed), so the tree
+        row must keep rendering its last known title/URL with the SUSPENDED
+        badge instead of going blank.
+        """
         self._attached.discard(tab_id)
         if self._model is not None and not sip.isdeleted(self._model):
-            self._model.clear_tab_info(tab_id)
             # Clear the active highlight if the removed tab was the
             # currently focused one. The browser will emit a fresh
             # ``current_tab_changed`` for the replacement tab if any;

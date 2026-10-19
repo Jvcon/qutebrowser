@@ -682,6 +682,34 @@ class WorkspaceManager(QObject):
         self.add_tab(workspace_id, tab)
         return tab
 
+    def _rebind_tab_id(
+            self,
+            workspace_id: uuid.UUID,
+            tab: WorkspaceTab,
+            new_tab_id: int,
+    ) -> bool:
+        """Rebind *tab* to *new_tab_id*, clearing colliding children links.
+
+        Returns True when the id actually changed.  A collision with another
+        entry's id is ignored (the entry keeps its current id) so the caller
+        never ends up with two entries sharing one runtime id.
+        """
+        if new_tab_id == tab.tab_id:
+            return False
+        workspace = self._workspaces[workspace_id]
+        collision = any(
+            other.tab_id == new_tab_id
+            for other in workspace.tabs if other is not tab
+        )
+        if collision:
+            return False
+        old_id = tab.tab_id
+        tab.tab_id = new_tab_id
+        for child in workspace.tabs:
+            if child.parent_id == old_id:
+                child.parent_id = new_tab_id
+        return True
+
     def update_tab_metadata(
             self,
             workspace_id: uuid.UUID,
@@ -694,6 +722,7 @@ class WorkspaceManager(QObject):
             favicon: Optional[str] = None,
             fetched: bool = False,
             error: Optional[str] = None,
+            new_tab_id: Optional[int] = None,
     ) -> Optional[WorkspaceTab]:
         """Update a tab entry's metadata, respecting the user-edited guard.
 
@@ -714,6 +743,9 @@ class WorkspaceManager(QObject):
                 True, ``fetch_attempts`` is incremented, ``last_fetched`` is
                 stamped and ``last_error`` is cleared.
             error: Error string to record on failure.
+            new_tab_id: When given, rebind the entry to this runtime tab id
+                (used by VP-D1's URL-match reuse so the entry tracks the live
+                tab). A colliding id is ignored.
 
         Returns:
             The updated tab, or None when the workspace/tab is unknown.
@@ -723,6 +755,9 @@ class WorkspaceManager(QObject):
             return None
 
         changed = False
+        if new_tab_id is not None:
+            changed = self._rebind_tab_id(
+                workspace_id, tab, new_tab_id) or changed
         if url is not None and url != tab.url:
             tab.url = url
             changed = True
