@@ -45,6 +45,15 @@ def _active_workspace(manager: WorkspaceManager) -> Workspace:
     return workspace
 
 
+def _tab_tree(win_id: int) -> Any:
+    """Return the window's TabTree, raising a CommandError if unavailable."""
+    try:
+        return objreg.get('tab-tree', scope='window', window=win_id)
+    except (KeyError, objreg.RegistryUnavailableError) as e:
+        raise cmdutils.CommandError(
+            "The tab tree is not available in this window.") from e
+
+
 def _resolve_group(
     manager: WorkspaceManager,
     workspace: Workspace,
@@ -513,3 +522,189 @@ def _make_group_delete_action(
         message.info(f"Deleted group '{name}' ({removed} tabs).")
 
     return delete
+
+
+# VP-F4 (vp/16): multi-select + batch operations. The selection itself lives
+# in the window's TabTree model; these commands drive it and hand the selected
+# tab ids to the batched WorkspaceManager APIs.
+
+
+@cmdutils.register(name='vp-select-mode')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_select_mode(win_id: int = 0) -> None:
+    """Toggle multi-select mode in the vertical panel's tab tree."""
+    tree = _tab_tree(win_id)
+    enabled = not tree.selection_mode()
+    tree.set_selection_mode(enabled)
+    if enabled:
+        message.info("Selection mode enabled.")
+    else:
+        message.info("Selection mode disabled.")
+
+
+@cmdutils.register(name='vp-select-toggle')
+@cmdutils.argument('target', metavar='tab-id')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_select_toggle(target: int, win_id: int = 0) -> None:
+    """Toggle the selection of the tab with the given id.
+
+    Args:
+        target: The integer id of the tab to (de)select.
+    """
+    tree = _tab_tree(win_id)
+    model = tree.model()
+    if not tree.selection_mode():
+        tree.set_selection_mode(True)
+    selected = model.selected_tab_ids()
+    newly_selected = target not in selected
+    model.set_selected(target, newly_selected)
+    if newly_selected:
+        message.info(f"Selected tab {target}.")
+    else:
+        message.info(f"Deselected tab {target}.")
+
+
+@cmdutils.register(name='vp-select-all')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_select_all(win_id: int = 0) -> None:
+    """Select every tab in the active workspace."""
+    tree = _tab_tree(win_id)
+    model = tree.model()
+    if not tree.selection_mode():
+        tree.set_selection_mode(True)
+    model.select_all(True)
+    message.info(f"Selected {len(model.selected_tab_ids())} tab(s).")
+
+
+@cmdutils.register(name='vp-select-none')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_select_none(win_id: int = 0) -> None:
+    """Clear the tab selection."""
+    tree = _tab_tree(win_id)
+    tree.model().select_all(False)
+    message.info("Cleared tab selection.")
+
+
+@cmdutils.register(name='vp-batch-move')
+@cmdutils.argument('group_ref', metavar='group')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_batch_move(group_ref: str, win_id: int = 0) -> None:
+    """Move the selected tabs into a group.
+
+    Args:
+        group_ref: Group name or UUID to move the tabs into. Required.
+    """
+    manager = _manager()
+    tree = _tab_tree(win_id)
+    selected = tree.model().selected_tab_ids()
+    if not selected:
+        raise cmdutils.CommandError("No tabs selected.")
+    if not group_ref:
+        raise cmdutils.CommandError(
+            "A group name or UUID is required for :vp-batch-move.")
+    workspace, group = _resolve_group_target(manager, group_ref)
+    moved = manager.move_tabs(workspace.id, selected, group.group_id)
+    message.info(f"Moved {moved} tab(s) into '{group.name}'.")
+
+
+@cmdutils.register(name='vp-batch-status')
+@cmdutils.argument('status', metavar='status')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_batch_status(status: str, win_id: int = 0) -> None:
+    """Set the reading status of the selected tabs.
+
+    Args:
+        status: One of ``FRESH``, ``ACTIVE`` or ``DONE``
+            (case-insensitive).
+    """
+    manager = _manager()
+    tree = _tab_tree(win_id)
+    selected = tree.model().selected_tab_ids()
+    if not selected:
+        raise cmdutils.CommandError("No tabs selected.")
+    workspace = _active_workspace(manager)
+    normalized = status.upper()
+    try:
+        count = manager.set_reading_status(workspace.id, selected, normalized)
+    except ValueError as e:
+        raise cmdutils.CommandError(str(e)) from e
+    message.info(f"Marked {count} tab(s) as {normalized}.")
+
+
+@cmdutils.register(name='vp-batch-delete')
+@cmdutils.argument('force', flag='!')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_batch_delete(force: bool = False, win_id: int = 0) -> None:
+    """Delete the selected tabs, after confirmation.
+
+    Pass ``-!`` to skip the confirmation prompt.
+    """
+    manager = _manager()
+    tree = _tab_tree(win_id)
+    model = tree.model()
+    selected = model.selected_tab_ids()
+    if not selected:
+        message.info("No tabs selected.")
+        return
+    workspace = _active_workspace(manager)
+    if force:
+        count = manager.delete_tabs(workspace.id, selected)
+        model.select_all(False)
+        message.info(f"Deleted {count} tab(s).")
+        return
+    message.confirm_async(
+        title=f"Delete {len(selected)} selected tab(s)?",
+        default=False,
+        yes_action=_make_batch_delete_action(
+            manager, workspace, selected, model),
+    )
+
+
+def _make_batch_delete_action(
+    manager: WorkspaceManager,
+    workspace: Workspace,
+    tab_ids: set[int],
+    model: Any,
+) -> Callable[[], None]:
+    """Return the callback which deletes *tab_ids* after confirmation."""
+    ids = set(tab_ids)
+
+    def delete() -> None:
+        count = manager.delete_tabs(workspace.id, ids)
+        model.select_all(False)
+        message.info(f"Deleted {count} tab(s).")
+
+    return delete
+
+
+@cmdutils.register(name='vp-batch-open-window')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_batch_open_window(win_id: int = 0) -> None:
+    """Open the selected tabs in a new window, reusing live tabs."""
+    manager = _manager()
+    tree = _tab_tree(win_id)
+    selected = tree.model().selected_tab_ids()
+    if not selected:
+        message.info("No tabs selected.")
+        return
+    workspace = _active_workspace(manager)
+    opened, reused = manager.open_tabs_in_new_window(
+        workspace.id, selected, win_id=win_id)
+    message.info(
+        f"Opened {opened} tab(s) in a new window; reused {reused}.")
+
+
+@cmdutils.register(name='vp-batch-open-tabs')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_batch_open_tabs(win_id: int = 0) -> None:
+    """Open the selected tabs as new tabs, reusing live tabs."""
+    manager = _manager()
+    tree = _tab_tree(win_id)
+    selected = tree.model().selected_tab_ids()
+    if not selected:
+        message.info("No tabs selected.")
+        return
+    workspace = _active_workspace(manager)
+    opened, reused = manager.open_tabs_as_new_tabs(
+        workspace.id, selected, win_id=win_id)
+    message.info(f"Opened {opened} tab(s); reused {reused}.")

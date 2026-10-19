@@ -21,7 +21,7 @@ import yaml
 
 from qutebrowser.qt.core import QObject, QUrl, pyqtSignal
 
-from qutebrowser.utils import log
+from qutebrowser.utils import log, objreg
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
 from qutebrowser.workspaces.persistence import (PinnedPersistence,
@@ -398,6 +398,191 @@ class WorkspaceManager(QObject):
         """Move a tab into a group (or to standalone when group_id is None)."""
         self._mutate_group_or_tab(
             workspace_id, tab_id, lambda tab: tab.assign_group(group_id))
+
+    # --- batched operations (VP-F4) ---
+
+    _READING_STATUSES = frozenset({'FRESH', 'ACTIVE', 'DONE'})
+
+    def move_tabs(
+            self,
+            workspace_id: uuid.UUID,
+            tab_ids: Iterable[int],
+            group_id: Optional[uuid.UUID],
+    ) -> int:
+        """Move every known tab in *tab_ids* into *group_id*.
+
+        ``group_id`` of ``None`` detaches the tabs (makes them standalone).
+        Unknown tab ids are skipped silently.  :attr:`changed` is emitted
+        once if anything moved.
+
+        Returns:
+            The number of tabs that were moved.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return 0
+        id_set = set(tab_ids)
+        moved = 0
+        for tab in workspace.tabs:
+            if tab.tab_id in id_set:
+                tab.assign_group(group_id)
+                moved += 1
+        if moved:
+            self.changed.emit()
+        return moved
+
+    def set_reading_status(
+            self,
+            workspace_id: uuid.UUID,
+            tab_ids: Iterable[int],
+            status: str,
+    ) -> int:
+        """Set the reading status of every known tab in *tab_ids*.
+
+        Args:
+            workspace_id: Workspace owning the tabs.
+            tab_ids: Tab ids to update; unknown ids are skipped silently.
+            status: One of ``FRESH``, ``ACTIVE`` or ``DONE``
+                (case-insensitive).
+
+        Raises:
+            ValueError: If *status* is not one of the allowed values.
+
+        Returns:
+            The number of tabs updated.
+        """
+        normalized = str(status).upper()
+        if normalized not in self._READING_STATUSES:
+            raise ValueError(f"Invalid reading status: {status!r}")
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return 0
+        id_set = set(tab_ids)
+        updated = 0
+        for tab in workspace.tabs:
+            if tab.tab_id in id_set:
+                # ``reading_status`` is owned by the reading-status slice
+                # (VP-F3); ``setattr`` keeps this batch helper usable even
+                # before that field lands on ``WorkspaceTab``.
+                setattr(tab, 'reading_status', normalized)  # noqa: B010
+                updated += 1
+        if updated:
+            self.changed.emit()
+        return updated
+
+    def delete_tabs(
+            self,
+            workspace_id: uuid.UUID,
+            tab_ids: Iterable[int],
+    ) -> int:
+        """Remove every known tab in *tab_ids* from *workspace_id*.
+
+        Children of a removed tab are detached (their ``parent_id`` is
+        cleared).  Unknown tab ids are skipped silently.  :attr:`changed`
+        is emitted once if anything was removed; the command layer is
+        responsible for confirming the deletion.
+
+        Returns:
+            The number of tabs that were removed.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return 0
+        id_set = set(tab_ids)
+        removed = [tab for tab in workspace.tabs if tab.tab_id in id_set]
+        if not removed:
+            return 0
+        workspace.tabs = [tab for tab in workspace.tabs
+                          if tab.tab_id not in id_set]
+        for tab in workspace.tabs:
+            if tab.parent_id in id_set:
+                tab.clear_parent()
+        self.changed.emit()
+        return len(removed)
+
+    @staticmethod
+    def _window_resources(win_id: int) -> tuple[Any, Mapping[int, Any]]:
+        """Return ``(tabbed_browser, tab_registry)`` for *win_id*."""
+        browser = objreg.get('tabbed-browser', scope='window', window=win_id)
+        registry = objreg.get('tab-registry', scope='window', window=win_id)
+        return browser, registry
+
+    def _open_tabs(
+            self,
+            workspace_id: uuid.UUID,
+            tab_ids: Iterable[int],
+            *,
+            newwindow: bool,
+            win_id: int,
+    ) -> tuple[int, int]:
+        """Open the URLs of *tab_ids*, reusing live tabs when possible.
+
+        A live tab whose ``url().toString()`` matches a requested URL is
+        focused via ``setCurrentWidget`` (counted as *reused*); otherwise
+        the URL is opened through ``tabopen`` (counted as *opened*).
+
+        Returns:
+            ``(opened, reused)``.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        browser, registry = self._window_resources(win_id)
+
+        urls: list[str] = []
+        if workspace is not None:
+            by_id = {tab.tab_id: tab for tab in workspace.tabs}
+            for tab_id in tab_ids:
+                tab = by_id.get(tab_id)
+                if tab is not None and tab.url:
+                    urls.append(tab.url)
+
+        opened = 0
+        reused = 0
+        for url in urls:
+            match: Any = None
+            for live in registry.values():
+                try:
+                    if live.url().toString() == url:
+                        match = live
+                        break
+                except (AttributeError, NotImplementedError):
+                    continue
+            if match is not None:
+                browser.widget.setCurrentWidget(match)
+                reused += 1
+            else:
+                browser.tabopen(QUrl(url), newwindow=newwindow)
+                opened += 1
+        return opened, reused
+
+    def open_tabs_in_new_window(
+            self,
+            workspace_id: uuid.UUID,
+            tab_ids: Iterable[int],
+            *,
+            win_id: int = 0,
+    ) -> tuple[int, int]:
+        """Open *tab_ids* in a new window, reusing matching live tabs.
+
+        Returns:
+            ``(opened, reused)``.
+        """
+        return self._open_tabs(
+            workspace_id, tab_ids, newwindow=True, win_id=win_id)
+
+    def open_tabs_as_new_tabs(
+            self,
+            workspace_id: uuid.UUID,
+            tab_ids: Iterable[int],
+            *,
+            win_id: int = 0,
+    ) -> tuple[int, int]:
+        """Open *tab_ids* as new tabs, reusing matching live tabs.
+
+        Returns:
+            ``(opened, reused)``.
+        """
+        return self._open_tabs(
+            workspace_id, tab_ids, newwindow=False, win_id=win_id)
 
     # --- metadata capture / collection (VP-F1) ---
 

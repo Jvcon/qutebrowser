@@ -8,6 +8,9 @@ import uuid
 
 import pytest
 
+from qutebrowser.qt.core import QUrl
+
+from qutebrowser.workspaces import manager as manager_module
 from qutebrowser.workspaces.manager import TabMetadata, WorkspaceManager
 from qutebrowser.workspaces.model import PinnedTab, WorkspaceTab
 from qutebrowser.workspaces.persistence import (PinnedPersistence,
@@ -353,6 +356,208 @@ class TestPinned:
         manager.add_pinned(PinnedTab(tab_id=1, title='old', url='u'))
         manager.add_pinned(PinnedTab(tab_id=1, title='new', url='u'))
         assert [p.title for p in manager.list_pinned()] == ['new']
+
+
+class _FakeLiveTab:
+
+    """Minimal stand-in for a live tab exposing ``url()``."""
+
+    def __init__(self, url: str) -> None:
+        self._url = QUrl(url)
+
+    def url(self) -> QUrl:
+        return self._url
+
+
+class _FakeWidget:
+
+    """Stand-in for the browser's QTabWidget."""
+
+    def __init__(self) -> None:
+        self.set_calls: list[object] = []
+
+    def setCurrentWidget(self, widget: object) -> None:  # noqa: N802
+        self.set_calls.append(widget)
+
+
+class _FakeBrowser:
+
+    """Stand-in for TabbedBrowser recording ``tabopen`` calls."""
+
+    def __init__(self) -> None:
+        self.widget = _FakeWidget()
+        self.opened: list[tuple[str, bool]] = []
+
+    def tabopen(self, url: QUrl, newwindow: bool = False) -> None:
+        self.opened.append((url.toString(), newwindow))
+
+
+class TestBatchOperations:
+
+    """Tests for the VP-F4 batched manager APIs."""
+
+    def test_move_tabs_into_group(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=2))
+
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+        moved = manager.move_tabs(workspace.id, [1, 2], group.group_id)
+
+        assert moved == 2
+        assert all(tab.group_id == group.group_id for tab in workspace.tabs)
+        assert changes
+
+    def test_move_tabs_to_standalone(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        manager.add_tab(
+            workspace.id, WorkspaceTab(tab_id=1, group_id=group.group_id))
+
+        moved = manager.move_tabs(workspace.id, [1], None)
+
+        assert moved == 1
+        assert workspace.tabs[0].group_id is None
+
+    def test_move_tabs_skips_unknown(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        assert manager.move_tabs(workspace.id, [1, 99], None) == 1
+
+    def test_move_tabs_noop_emits_nothing(self, manager):
+        workspace = manager.add_workspace('w')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        assert manager.move_tabs(workspace.id, [99], None) == 0
+        assert changes == []
+
+    def test_set_reading_status_valid(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=2))
+
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+        count = manager.set_reading_status(workspace.id, [1, 2], 'done')
+
+        assert count == 2
+        assert getattr(workspace.tabs[0], 'reading_status') == 'DONE'
+        assert getattr(workspace.tabs[1], 'reading_status') == 'DONE'
+        assert changes
+
+    def test_set_reading_status_invalid_raises(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        with pytest.raises(ValueError):
+            manager.set_reading_status(workspace.id, [1], 'BOGUS')
+
+    def test_set_reading_status_skips_unknown(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        assert manager.set_reading_status(workspace.id, [1, 99], 'FRESH') == 1
+
+    def test_delete_tabs_removes_and_detaches(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=2, parent_id=1))
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=3))
+
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+        removed = manager.delete_tabs(workspace.id, [1, 2])
+
+        assert removed == 2
+        assert [tab.tab_id for tab in workspace.tabs] == [3]
+        assert changes
+
+    def test_delete_tabs_unknown_is_idempotent(self, manager):
+        workspace = manager.add_workspace('w')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        assert manager.delete_tabs(workspace.id, [99]) == 0
+        assert changes == []
+
+    def test_open_tabs_in_new_window_reuses_and_opens(
+            self, manager, monkeypatch):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(
+            workspace.id, WorkspaceTab(tab_id=1, url='https://a.example/'))
+        manager.add_tab(
+            workspace.id, WorkspaceTab(tab_id=2, url='https://b.example/'))
+
+        live = _FakeLiveTab('https://a.example/')
+        browser = _FakeBrowser()
+        registry = {5: live}
+
+        def fake_get(name, **_kwargs):
+            if name == 'tab-registry':
+                return registry
+            if name == 'tabbed-browser':
+                return browser
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+        opened, reused = manager.open_tabs_in_new_window(
+            workspace.id, [1, 2])
+
+        assert (opened, reused) == (1, 1)
+        assert browser.widget.set_calls == [live]
+        assert browser.opened == [('https://b.example/', True)]
+
+    def test_open_tabs_as_new_tabs_reuses_and_opens(
+            self, manager, monkeypatch):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(
+            workspace.id, WorkspaceTab(tab_id=1, url='https://a.example/'))
+        manager.add_tab(
+            workspace.id, WorkspaceTab(tab_id=2, url='https://b.example/'))
+
+        browser = _FakeBrowser()
+        registry: dict[int, object] = {}
+
+        def fake_get(name, **_kwargs):
+            if name == 'tab-registry':
+                return registry
+            if name == 'tabbed-browser':
+                return browser
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+        opened, reused = manager.open_tabs_as_new_tabs(workspace.id, [1, 2])
+
+        assert (opened, reused) == (2, 0)
+        assert browser.opened == [
+            ('https://a.example/', False),
+            ('https://b.example/', False),
+        ]
+
+    def test_open_tabs_skips_unknown_and_missing_url(
+            self, manager, monkeypatch):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1, url=''))
+
+        browser = _FakeBrowser()
+
+        def fake_get(name, **_kwargs):
+            if name == 'tab-registry':
+                return {}
+            if name == 'tabbed-browser':
+                return browser
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+        assert manager.open_tabs_as_new_tabs(workspace.id, [1, 99]) == (0, 0)
+        assert browser.opened == []
 
 
 class TestSaveLoad:
