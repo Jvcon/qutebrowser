@@ -108,6 +108,22 @@ class TestWorkspaceTab:
         assert tab.fetch_attempts == 0
         assert tab.last_error is None
 
+    def test_open_status_defaults_to_suspended(self):
+        assert model.WorkspaceTab(tab_id=1).open_status == 'SUSPENDED'
+
+    def test_open_status_roundtrips(self):
+        tab = model.WorkspaceTab(tab_id=1, open_status='OPEN')
+        assert model.WorkspaceTab.from_dict(tab.to_dict()) == tab
+
+    def test_from_dict_missing_open_status_defaults_suspended(self):
+        tab = model.WorkspaceTab.from_dict({'tab_id': 1})
+        assert tab.open_status == 'SUSPENDED'
+
+    def test_from_dict_preserves_explicit_open_status(self):
+        tab = model.WorkspaceTab.from_dict(
+            {'tab_id': 1, 'open_status': 'OPEN'})
+        assert tab.open_status == 'OPEN'
+
     def test_user_edited_always_has_three_keys(self):
         tab = model.WorkspaceTab(tab_id=1)
         assert tab.user_edited == {
@@ -168,7 +184,7 @@ class TestWorkspaceTab:
         assert {
             'tab_id', 'parent_id', 'group_id', 'title', 'url',
             'description', 'source', 'favicon', 'user_edited',
-            'last_fetched', 'fetch_attempts', 'last_error',
+            'last_fetched', 'fetch_attempts', 'last_error', 'open_status',
         } <= set(d)
         assert all(not isinstance(value, uuid.UUID)
                    for value in d.values())

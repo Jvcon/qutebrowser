@@ -89,6 +89,7 @@ class _TabState:
     recently_audible: bool = False
     muted: bool = False
     pinned: bool = False
+    suspended: bool = False
 
     def status(self) -> Status:
         """Combine the tracked booleans into a :class:`Status` flag set."""
@@ -99,6 +100,8 @@ class _TabState:
             status |= Status.AUDIBLE
         if self.pinned:
             status |= Status.PINNED
+        if self.suspended:
+            status |= Status.SUSPENDED
         return status
 
 
@@ -302,6 +305,11 @@ class WorkspaceBridge(QObject):
             # Already bridged (e.g. the single-shot re-sync); just refresh
             # the index cache without shifting it again.
             self._tab_index[idx] = tab_id
+            workspace_id = self._active_workspace_id()
+            if workspace_id is not None:
+                self._manager.set_open_status(  # type: ignore[union-attr]
+                    workspace_id, tab_id, 'OPEN')
+            self._tab_state[tab_id].suspended = False
             self._push(tab_id)
             return
 
@@ -310,9 +318,20 @@ class WorkspaceBridge(QObject):
             return
         workspace = self._manager.get_active()  # type: ignore[union-attr]
         assert workspace is not None
-        if not any(existing.tab_id == tab_id for existing in workspace.tabs):
+        existing = next(
+            (entry for entry in workspace.tabs if entry.tab_id == tab_id),
+            None,
+        )
+        if existing is None:
             self._manager.add_tab(  # type: ignore[union-attr]
-                workspace_id, WorkspaceTab(tab_id=tab_id))
+                workspace_id,
+                WorkspaceTab(tab_id=tab_id, open_status='OPEN'),
+            )
+        else:
+            # Re-using a retained entry (e.g. after a suspend): mark it OPEN
+            # again and clear the SUSPENDED status bit before pushing.
+            self._manager.set_open_status(  # type: ignore[union-attr]
+                workspace_id, tab_id, 'OPEN')
 
         # A tab inserted at *idx* shifts every later index up by one.
         self._tab_index = {
@@ -322,6 +341,7 @@ class WorkspaceBridge(QObject):
         self._tab_index[idx] = tab_id
 
         state = self._tab_state.setdefault(tab_id, _TabState())
+        state.suspended = False
         data = getattr(tab, 'data', None)
         state.pinned = bool(getattr(data, 'pinned', False))
         try:
@@ -506,8 +526,14 @@ class WorkspaceBridge(QObject):
         }
         self._remove_tab_id(tab_id)
 
+    def _push_suspended(self, tab_id: int) -> None:
+        """Mark *tab_id* as SUSPENDED in the model so the badge paints."""
+        state = self._state_for(tab_id)
+        state.suspended = True
+        self._push(tab_id)
+
     def _remove_tab_id(self, tab_id: int) -> None:
-        """Drop *tab_id* from the model cache and the active workspace."""
+        """Suspend *tab_id* and clear its live display data from the model."""
         self._tab_state.pop(tab_id, None)
         self._attached.discard(tab_id)
         if self._model is not None and not sip.isdeleted(self._model):
@@ -520,6 +546,11 @@ class WorkspaceBridge(QObject):
                 self._model.set_active_tab_id(None)
         if self._manager is None:
             return
-        workspace = self._manager.get_active()
-        if workspace is not None:
-            self._manager.remove_tab(workspace.id, tab_id)
+        workspace_id = self._active_workspace_id()
+        if workspace_id is None:
+            return
+        # D1: closing a tab keeps its entry in the workspace but flips it to
+        # SUSPENDED, so it can be resurrected later instead of being lost.
+        self._manager.set_open_status(
+            workspace_id, tab_id, 'SUSPENDED')
+        self._push_suspended(tab_id)

@@ -74,6 +74,9 @@ def _make_workspace():
             group_tab_a, group_tab_b, group_tab_c,
         ],
     )
+    # These fixtures represent live entries; older files default to SUSPENDED.
+    for tab in workspace.tabs:
+        tab.open_status = 'OPEN'
     return workspace
 
 
@@ -194,6 +197,24 @@ class TestTabTreeModel:
 
         model.set_tab_pinned(20, False)
         assert standalone.data(tabtree.PinStateRole) is False
+
+    def test_open_status_role_and_suspension(self, model):
+        """OpenStatusRole exposes the entry state and drives the zZ badge."""
+        root = QModelIndex()
+        standalone = model.index(2, 0, root)  # tab id 20
+
+        assert standalone.data(tabtree.OpenStatusRole) == 'OPEN'
+        assert not (standalone.data(tabtree.StatusRole)
+                    & tabtree.Status.SUSPENDED)
+
+        for tab in model._workspace.tabs:
+            if tab.tab_id == 20:
+                tab.open_status = 'SUSPENDED'
+        model.set_workspace(model._workspace)
+        standalone = model.index(2, 0, root)
+
+        assert standalone.data(tabtree.OpenStatusRole) == 'SUSPENDED'
+        assert standalone.data(tabtree.StatusRole) & tabtree.Status.SUSPENDED
 
     def test_empty_group_badge_zero(self):
         """Empty groups report a +0 badge."""
