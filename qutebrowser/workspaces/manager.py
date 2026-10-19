@@ -567,6 +567,64 @@ class WorkspaceManager(QObject):
         self.changed.emit()
         return len(removed)
 
+    def close_group(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> tuple[int, int]:
+        """Close every OPEN tab in *group_id*; return ``(closed, skipped)``.
+
+        Each close goes through the browser's ``tabCloseRequested`` signal
+        so the bridge's existing ``_on_tree_close_requested`` path flips the
+        entry to SUSPENDED and emits :attr:`changed`. Tabs that are already
+        SUSPENDED are skipped silently. Tabs that have no live match in the
+        active window's ``tab-registry``, or whose ``tabCloseRequested``
+        handler raises, count toward *skipped* and do not abort the batch.
+
+        The group itself (and its tab entries) is preserved so it can be
+        reopened later; it is never deleted.
+
+        Raises:
+            KeyError: When *group_id* does not exist in *workspace_id*.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return (0, 0)
+        # Verify the group exists before touching any tab.
+        self._find_group(workspace_id, group_id)
+
+        win_id = 0  # active window — objreg default scope
+        try:
+            registry = objreg.get(
+                'tab-registry', scope='window', window=win_id) or {}
+            browser = objreg.get(
+                'tabbed-browser', scope='window', window=win_id)
+        except (KeyError, objreg.RegistryUnavailableError):
+            registry, browser = {}, None
+
+        closed = skipped = 0
+        for tab in workspace.tabs:
+            if tab.group_id != group_id or tab.open_status != 'OPEN':
+                continue
+            live = registry.get(tab.tab_id)
+            if live is None or browser is None:
+                skipped += 1
+                continue
+            try:
+                widget_idx = browser.widget.indexOf(live)
+                if widget_idx < 0:
+                    skipped += 1
+                    continue
+                browser.widget.tabCloseRequested.emit(widget_idx)
+                closed += 1
+            except Exception as e:  # noqa: BLE001 — closing is best-effort
+                log.workspaces.debug(
+                    f"close_group: tabCloseRequested raised for "
+                    f"{tab.tab_id}: {e}")
+                skipped += 1
+        if closed:
+            self.changed.emit()
+        log.workspaces.debug(
+            f"close_group: group={group_id} closed={closed} skipped={skipped}")
+        return (closed, skipped)
+
     @staticmethod
     def _window_resources(win_id: int) -> tuple[Any, Mapping[int, Any]]:
         """Return ``(tabbed_browser, tab_registry)`` for *win_id*."""
