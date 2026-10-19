@@ -234,6 +234,7 @@ class TabTreeModel(QAbstractItemModel):
         # tab row carrying the transient highlight.
         self._active_group_id: Optional[uuid.UUID] = None
         self._highlighted_tab_id: Optional[int] = None
+        self._highlight_timer: Optional[QTimer] = None
         self._show_archived = False
         # Multi-select (VP-F4).  The ids survive ``set_workspace`` rebuilds
         # so a batch command that emits ``changed`` does not wipe the
@@ -385,12 +386,20 @@ class TabTreeModel(QAbstractItemModel):
 
         Emits a ``dataChanged`` carrying :data:`HighlightRole` for the row
         and schedules an automatic clear after *timeout_ms* milliseconds
-        (skipped when *tab_id* is ``None``).  The scheduled callback only
-        clears the highlight when it is still the one it was created for, so
-        a newer highlight is never wiped by a stale timer.
+        (skipped when *tab_id* is ``None`` or *timeout_ms* is non-positive).
+
+        A single instance timer is kept: starting a new highlight cancels
+        any pending one first, so an older timer can never clear a newer
+        highlight -- even when the same tab is highlighted again
+        (A -> B -> A).  ``_clear_highlight`` additionally re-checks the id
+        before clearing.
         """
         if tab_id == self._highlighted_tab_id:
             return
+        if self._highlight_timer is not None:
+            self._highlight_timer.stop()
+            self._highlight_timer.deleteLater()
+            self._highlight_timer = None
         previous = self._highlighted_tab_id
         self._highlighted_tab_id = tab_id
         for changed_id in (previous, tab_id):
@@ -402,11 +411,12 @@ class TabTreeModel(QAbstractItemModel):
             idx = self._index_for_node(node)
             if idx.isValid():
                 self.dataChanged.emit(idx, idx, [HighlightRole])
-        if tab_id is not None:
-            QTimer.singleShot(
-                timeout_ms,
-                lambda expected=tab_id: self._clear_highlight(expected),
-            )
+        if timeout_ms > 0 and tab_id is not None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self._clear_highlight(tab_id))
+            timer.start(timeout_ms)
+            self._highlight_timer = timer
 
     def _clear_highlight(self, tab_id: int) -> None:
         """Clear the highlight created for *tab_id* if still current."""
