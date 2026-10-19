@@ -21,7 +21,7 @@ import yaml
 
 from qutebrowser.qt.core import QObject, QUrl, pyqtSignal
 
-from qutebrowser.utils import log, objreg
+from qutebrowser.utils import log, objreg, qtutils
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
 from qutebrowser.workspaces.persistence import (PinnedPersistence,
@@ -313,7 +313,11 @@ class WorkspaceManager(QObject):
         for group in workspace.groups:
             if group.name.lower() == 'inbox':
                 return group
-        return self.create_group(workspace_id, 'Inbox')
+        group = self.create_group(workspace_id, 'Inbox')
+        log.workspaces.debug(
+            "get_or_create_inbox: workspace %s created Inbox (1 group)",
+            workspace_id)
+        return group
 
     # --- group lifecycle (pin / archive / reorder / purge) ---
 
@@ -367,10 +371,6 @@ class WorkspaceManager(QObject):
 
         Reordering is independent of the pin flag: pinning only changes the
         display sort order, not the underlying list order.
-
-        Raises:
-            ValueError: If *new_index* is outside
-                ``[0, len(workspace.groups))``.
         """
         workspace = self._workspaces[workspace_id]
         group = self._find_group(workspace_id, group_id)
@@ -458,6 +458,8 @@ class WorkspaceManager(QObject):
                 tab.assign_group(group_id)
                 moved += 1
         if moved:
+            log.workspaces.debug(
+                "move_tabs: workspace %s moved %d tab(s)", workspace_id, moved)
             self.changed.emit()
         return moved
 
@@ -500,6 +502,9 @@ class WorkspaceManager(QObject):
         for tab in workspace.tabs:
             if tab.parent_id in id_set:
                 tab.clear_parent()
+        log.workspaces.debug(
+            "delete_tabs: workspace %s removed %d tab(s)",
+            workspace_id, len(removed))
         self.changed.emit()
         return len(removed)
 
@@ -561,11 +566,15 @@ class WorkspaceManager(QObject):
             from qutebrowser.mainwindow import mainwindow as _mw
             window = _mw.MainWindow(private=browser.is_private)
             for url in to_open:
-                window.tabbed_browser.tabopen(QUrl(url))
+                qurl = QUrl(url)
+                qtutils.ensure_valid(qurl)
+                window.tabbed_browser.tabopen(qurl)
             window.show()
         else:
             for url in to_open:
-                browser.tabopen(QUrl(url))
+                qurl = QUrl(url)
+                qtutils.ensure_valid(qurl)
+                browser.tabopen(qurl)
         opened = len(to_open)
         return opened, reused
 
@@ -592,8 +601,12 @@ class WorkspaceManager(QObject):
         Returns:
             ``(opened, reused)``.
         """
-        return self._open_tabs(
+        result = self._open_tabs(
             workspace_id, tab_ids, newwindow=True, win_id=win_id)
+        log.workspaces.debug(
+            "open_tabs_in_new_window: workspace %s opened %d tab(s)",
+            workspace_id, result[0])
+        return result
 
     def open_tabs_as_new_tabs(
             self,
@@ -607,8 +620,12 @@ class WorkspaceManager(QObject):
         Returns:
             ``(opened, reused)``.
         """
-        return self._open_tabs(
+        result = self._open_tabs(
             workspace_id, tab_ids, newwindow=False, win_id=win_id)
+        log.workspaces.debug(
+            "open_tabs_as_new_tabs: workspace %s opened %d tab(s)",
+            workspace_id, result[0])
+        return result
 
     # --- metadata capture / collection (VP-F1) ---
 
@@ -645,9 +662,6 @@ class WorkspaceManager(QObject):
 
         Returns:
             1 if the entry was found and updated, 0 otherwise.
-
-        Raises:
-            ValueError: If *status* is not ``'OPEN'`` or ``'SUSPENDED'``.
         """
         if status not in ('OPEN', 'SUSPENDED'):
             raise ValueError(
@@ -658,6 +672,9 @@ class WorkspaceManager(QObject):
             return 0
         if tab.open_status != status:
             tab.open_status = status
+            log.workspaces.debug(
+                "set_open_status: workspace %s tab %s -> %s (1)",
+                workspace_id, tab_id, status)
             self.changed.emit()
         return 1
 
@@ -925,9 +942,6 @@ class WorkspaceManager(QObject):
 
         Returns:
             The number of tabs that were matched (and assigned *status*).
-
-        Raises:
-            ValueError: If *status* is not a valid reading status.
         """
         # Normalise lowercase callers (e.g. ``'done'``) before validation so
         # both the :vp-status-set / :vp-batch-status commands and direct
@@ -945,6 +959,9 @@ class WorkspaceManager(QObject):
                 tab.reading_status = status
                 count += 1
         if count > 0:
+            log.workspaces.debug(
+                "set_reading_status: workspace %s -> %s (%d)",
+                workspace_id, status, count)
             self.changed.emit()
         return count
 
@@ -1011,6 +1028,9 @@ class WorkspaceManager(QObject):
             for tab in workspace.tabs:
                 if tab.parent_id in removed_ids:
                     tab.clear_parent()
+            log.workspaces.debug(
+                "cleanup_old_done: workspace %s removed %d tab(s)",
+                workspace_id, len(removed_ids))
             self.changed.emit()
         return len(removed_ids)
 
