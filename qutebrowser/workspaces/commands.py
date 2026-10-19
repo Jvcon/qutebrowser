@@ -579,6 +579,36 @@ def vp_group_close(target: str) -> None:
         f"Closed {closed} tab(s) in '{group.name}'; skipped {skipped}.")
 
 
+@cmdutils.register(name='vp-group-reopen')
+@cmdutils.argument('target', metavar='target')
+def vp_group_reopen(target: str) -> None:
+    """Reopen every suspended tab in the group, reusing live tabs by URL.
+
+    Already-open tabs are left untouched. An OPEN group is a no-op, and an
+    archived group must be restored first.
+
+    Args:
+        target: The name or UUID of the group.
+    """
+    manager = _manager()
+    workspace, group = _resolve_group_target(manager, target)
+    state = manager.group_state(workspace.id, group.group_id)
+    if state == 'OPEN':
+        message.info(f"Group '{group.name}' is already open.")
+        return
+    if state == 'ARCHIVED':
+        message.info(f"Group '{group.name}' is archived; restore it first.")
+        return
+    opened, reused, skipped = manager.reopen_group(
+        workspace.id, group.group_id)
+    if opened == 0 and reused == 0 and skipped == 0:
+        message.info(f"Group '{group.name}' has no suspended tabs.")
+        return
+    message.info(
+        f"Reopened group '{group.name}': opened {opened}, reused {reused}, "
+        f"skipped {skipped}.")
+
+
 # VP-F3 (vp/15): three-state reading status + auto-cleanup. The status
 # commands target a single tab within the active workspace; VP-F4 reuses
 # ``WorkspaceManager.set_reading_status`` for its multi-select UI.

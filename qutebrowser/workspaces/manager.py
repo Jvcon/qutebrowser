@@ -625,6 +625,149 @@ class WorkspaceManager(QObject):
             f"close_group: group={group_id} closed={closed} skipped={skipped}")
         return (closed, skipped)
 
+    def _all_window_resources(self) -> list[tuple[int, Mapping[int, Any], Any]]:
+        """Return ``(win_id, registry, browser)`` for every open window.
+
+        Used by :meth:`reopen_group` to support cross-window URL reuse. Any
+        window whose ``tab-registry`` / ``tabbed-browser`` is unavailable is
+        skipped. When no window is registered at all, a single safe default
+        ``(0, {}, None)`` is returned so callers can rely on ``[0]`` existing.
+        """
+        win_ids = getattr(objreg.window_registry, 'window_ids', None)
+        if win_ids is None:
+            try:
+                win_ids = list(objreg.window_registry)
+            except TypeError:  # pragma: no cover - defensive
+                win_ids = []
+        win_ids = list(win_ids) or [0]
+
+        out: list[tuple[int, Mapping[int, Any], Any]] = []
+        for win_id in win_ids:
+            try:
+                registry = objreg.get(
+                    'tab-registry', scope='window', window=win_id)
+                browser = objreg.get(
+                    'tabbed-browser', scope='window', window=win_id)
+            except (KeyError, objreg.RegistryUnavailableError):
+                continue
+            if registry is None or browser is None:
+                continue
+            out.append((win_id, registry, browser))
+        return out or [(0, {}, None)]
+
+    def _find_live_tab_in_windows(
+            self,
+            windows: Iterable[tuple[int, Mapping[int, Any], Any]],
+            url: str,
+    ) -> Optional[tuple[Any, Any]]:
+        """Return ``(browser, live_tab)`` for the first live URL match."""
+        for _win_id, registry, browser in windows:
+            live = self._live_tab_for_url(registry, url)
+            if live is not None:
+                return browser, live
+        return None
+
+    def _focus_live_tab(
+            self,
+            workspace_id: uuid.UUID,
+            tab: WorkspaceTab,
+            browser: Any,
+            live: Any,
+    ) -> bool:
+        """Focus *live* and flip *tab* to OPEN; return True on success."""
+        try:
+            browser.widget.setCurrentWidget(live)
+            self.set_open_status(workspace_id, tab.tab_id, 'OPEN')
+            return True
+        except Exception as e:  # noqa: BLE001 - reopening is best-effort
+            log.workspaces.debug(
+                f"reopen_group: setCurrentWidget failed for {tab.tab_id}: {e}")
+            return False
+
+    @staticmethod
+    def _open_url_in_browser(browser: Any, url: str) -> bool:
+        """Open *url* via ``tabopen``; return True on success."""
+        try:
+            qurl = QUrl(url)
+            qtutils.ensure_valid(qurl)
+            browser.tabopen(qurl)
+            return True
+        except Exception as e:  # noqa: BLE001 - reopening is best-effort
+            log.workspaces.debug(
+                f"reopen_group: tabopen failed for url={url!r}: {e}")
+            return False
+
+    def reopen_group(
+            self,
+            workspace_id: uuid.UUID,
+            group_id: uuid.UUID,
+            *,
+            win_id: int = 0,
+    ) -> tuple[int, int, int]:
+        """Reopen every SUSPENDED tab in *group_id*.
+
+        For each SUSPENDED entry:
+
+        * A live tab in *any* window whose URL matches is focused via
+          ``setCurrentWidget`` and the entry is flipped to OPEN through
+          :meth:`set_open_status`; this is counted as *reused*.
+        * Otherwise the URL is opened via ``tabopen`` in the *win_id* window;
+          the bridge's ``_register_tab`` (VP-D1) auto-rebinds the entry and
+          flips it to OPEN. This is counted as *opened*.
+        * Empty URLs, missing browsers and any exception raised by
+          ``setCurrentWidget`` / ``tabopen`` are counted as *skipped* and do
+          not abort the batch.
+
+        :attr:`changed` is emitted when at least one tab was opened or reused.
+
+        Returns:
+            ``(opened, reused, skipped)``.
+
+        Raises:
+            KeyError: When *group_id* does not exist in *workspace_id*.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return (0, 0, 0)
+        # Verify the group exists before touching any tab.
+        self._find_group(workspace_id, group_id)
+
+        windows = self._all_window_resources()
+        by_win = {w_win_id: w_browser
+                  for w_win_id, _registry, w_browser in windows}
+        cur_browser = by_win.get(win_id)
+
+        opened = reused = skipped = 0
+        for tab in list(workspace.tabs):
+            if tab.group_id != group_id or tab.open_status != 'SUSPENDED':
+                continue
+            if not tab.url:
+                skipped += 1
+                continue
+            hit = self._find_live_tab_in_windows(windows, tab.url)
+            if hit is not None:
+                browser, live = hit
+                if self._focus_live_tab(workspace_id, tab, browser, live):
+                    reused += 1
+                else:
+                    skipped += 1
+                continue
+            if cur_browser is None:
+                skipped += 1
+                continue
+            if self._open_url_in_browser(cur_browser, tab.url):
+                # The bridge auto-flips the entry to OPEN via _register_tab.
+                opened += 1
+            else:
+                skipped += 1
+
+        if opened + reused:
+            self.changed.emit()
+        log.workspaces.debug(
+            f"reopen_group: group={group_id} opened={opened} reused={reused} "
+            f"skipped={skipped}")
+        return (opened, reused, skipped)
+
     @staticmethod
     def _window_resources(win_id: int) -> tuple[Any, Mapping[int, Any]]:
         """Return ``(tabbed_browser, tab_registry)`` for *win_id*."""
