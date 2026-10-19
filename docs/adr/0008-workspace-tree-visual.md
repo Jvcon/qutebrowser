@@ -179,6 +179,63 @@ may be a member of a group AND have a parent tab; both nestings are displayed
 simultaneously in the tree. The model's `group_id` and `parent_id` fields are
 independent.
 
+### 3a. Vertical Panel state model
+
+The panel's runtime state spans **WorkspaceTab** and **Group** and is split
+into two orthogonal axes: a **runtime presence** axis (driven by the browser)
+and a **user-applied** axis (driven by the user / policies).
+
+| Concept | Lives on | Values | Source | Reset on restart |
+|---|---|---|---|---|
+| `open_status` | `WorkspaceTab` | `OPEN` \| `SUSPENDED` | Bridge: `OPEN` while the browser has a live tab; `SUSPENDED` after the tab is closed or the entry is kept. | All entries restored as `SUSPENDED`; first `_register_tab` flips the matching entry to `OPEN`. |
+| `reading_status` | `WorkspaceTab` | `FRESH` \| `ACTIVE` \| `DONE` | User command (`:vp-status-set` / `:vp-status-cycle`) or batch (`:vp-batch-status`). | Persisted; survives restart. |
+| `created_at` | `WorkspaceTab` | ISO 8601 UTC | `__post_init__` auto-stamp; user-editable? No. | Persisted; survives restart. |
+| `Group.state` (derived) | `Group` (property) | `ARCHIVED` \| `UNKNOWN` | Local: `ARCHIVED` if `group.archived` else `UNKNOWN`. The full `OPEN`/`SUSPENDED`/`ARCHIVED` resolution lives in `WorkspaceManager.group_state(workspace_id, group_id)` so it can read `workspace.tabs`. | Computed at every model rebuild. |
+| `pinned` | `Group` | bool | User command. | Persisted. |
+| `archived` (group) | `Group` | bool | User command; orthogonal to `Group.state`. | Persisted. |
+| `folded` | `Group` | bool | Click / keyboard toggle. | Persisted. |
+
+**Group.state precedence** (resolved by `manager.group_state`):
+
+1. If `group.archived` → `'ARCHIVED'` (archived wins over runtime).
+2. Else if at least one member has `open_status == 'OPEN'` → `'OPEN'`.
+3. Else → `'SUSPENDED'`.
+
+**Derived counts** (used by the Group header badge):
+
+- `manager.group_open_count(workspace_id, group_id)` — tabs in the group with `open_status == 'OPEN'`.
+- `manager.group_total_count(workspace_id, group_id)` — total tabs in the group.
+
+The TabTree renders the badge as `f"{open}/{total}"` (e.g. `"3/12"`,
+`"0/5"`) instead of the previous `"+{total}"` form. The `GroupStateRole`
+(roles section below) exposes the resolved state string per row; the
+delegate uses it to dim SUSPENDED groups and mark ARCHIVED groups.
+
+**Sort order** (configurable via `content.vertical_panel.sort_open_groups_first`,
+default `True`):
+
+- Pinned first (always).
+- Then OPEN groups.
+- Then SUSPENDED / ARCHIVED.
+- Within each band, by `group.name`.
+- Setting `sort_open_groups_first=False` preserves the original (pinned-first, then
+  insertion order).
+
+### 3b. Multi-select & batch ops
+
+The TabTree supports a **selection mode** that overlays a left-margin
+checkmark on selected rows. Mouse handling in `TabTreeItemDelegate.editorEvent`
+honours `ShiftModifier` (range select via anchor), `ControlModifier` /
+`MetaModifier` (toggle single), and plain click (toggle single).
+`Ctrl+Space` toggles selection mode itself; the binding is registered in
+`bindings.default.workspace_panel:` and removes the previous host-level
+`QShortcut` that bypassed the binding system.
+
+The host emits a new `group_focus_requested` signal from the bridge when
+the browser's `current_tab_changed` fires, so the active row and its
+containing group (if any) auto-locate in the tree (see
+`VP-D5 auto-locate on tab switch`).
+
 ### 4. WorkspaceIndicator
 
 A `QToolBar` with `QToolButton`s in a single horizontal row.
@@ -380,6 +437,9 @@ groups:
   - group_id: <uuid>
     name: github
     folded: false               # auto-created by auto-group-rules
+    pinned: false               # optional; pinned groups sort first
+    archived: false             # optional; per-group archive (orthogonal to workspace archived)
+    created_at: <iso8601>       # optional; auto-stamped in __post_init__
   - group_id: <uuid>
     name: client-A docs
     folded: false
@@ -390,23 +450,47 @@ tabs:
   - tab_id: <int>
     parent_id: null
     group_id: null              # standalone top-level tab
+    # F1 metadata (backward-compat: older YAML lacks these; from_dict defaults)
+    title: ''
+    url: ''
+    description: ''
+    source: ''
+    favicon: null               # base64-encoded PNG string, or null
+    user_edited: {title: false, description: false, source: false}
+    last_fetched: null          # ISO 8601 UTC; stamped on a successful meta fetch
+    fetch_attempts: 0
+    last_error: null
+    # VP-D1 + VP-F3 state (backward-compat: missing → 'SUSPENDED' / 'FRESH' / now())
+    open_status: SUSPENDED      # OPEN | SUSPENDED — runtime: tab live in the browser
+    reading_status: FRESH       # FRESH | ACTIVE | DONE — user-applied reading marker
+    created_at: <iso8601>       # auto-stamped in __post_init__ when missing
   - tab_id: <int>
     parent_id: <int>
     group_id: null              # standalone child of a parent tab
+    # ... (same metadata + state fields as above)
   - tab_id: <int>
     parent_id: null
     group_id: <uuid>            # belongs to a group, no parent
+    # ...
   - tab_id: <int>
     parent_id: <int>
     group_id: <uuid>            # inside a group AND child of a parent in that group
+    # ...
   - tab_id: <int>
     parent_id: null
     group_id: <uuid>            # auto-assigned by auto-group-rules
+    # ...
 ```
 
 Groups are workspace-scoped. Deleting a group nulls its members' `group_id`;
 empty groups (`+0`) can be deleted without confirmation. Auto-created groups are
 persisted exactly like manually created groups once they exist.
+
+**Backward compatibility**: `WorkspaceTab.from_dict` and `Group.from_dict` use
+`.get()` with explicit defaults for every field added after the original
+format (`pinned`, `archived`, `created_at`, `title`, `url`, …, `open_status`,
+`reading_status`, `created_at`). Older YAML files load without migration.
+Adding a new field never requires a version bump or data fix-up.
 
 ## Storage layout
 
@@ -464,8 +548,27 @@ builds side-by-side during the migration window.
 | `group-rename <old> <new>` | Rename a group. |
 | `group-delete <name>` | Delete group; tabs become standalone. Confirm if non-empty. |
 | `group-list` | List groups in the active workspace. |
+| `group-pin <target>` / `group-unpin <target>` | Pin / unpin a group so it sorts first. |
+| `group-archive <target>` / `group-restore <target>` | Archive / restore a group (hidden from the normal list, kept on disk). |
 | `tab-move-to-group <tab_id> <group_name>` | Move tab into a group; use `root` for standalone. Overrides auto-group rules. |
 | `tab-move <from> <to> [<group_name>]` | Existing move command; can update both `parent_id` and `group_id` in one move. |
+| `tab-collect [<group>]` | Collect the current tab into a group; when *group* is omitted, lands in the Inbox default. (VP-F1, VP-F5) |
+| `vp-collect-all [<group>]` | Collect every collectable tab in the current window into a group; Inbox default. (VP-F1, VP-F5) |
+| `vp-group-new <name>` | New Group in the active workspace. (VP-F2) |
+| `vp-group-rename` / `pin` / `unpin` / `archive` / `restore` / `delete` | Manage a Group. (VP-F2) |
+| `vp-group-close <target>` | Close every OPEN tab in the group; entries auto-flip to `SUSPENDED`. Group preserved. (VP-D3) |
+| `vp-group-reopen <target>` | Reopen every SUSPENDED tab; reuse live tabs by URL, else `tabopen` in the current window. (VP-D4) |
+| `vp-status-set <target> <status>` | Set the reading status (`FRESH`/`ACTIVE`/`DONE`) of a tab. (VP-F3) |
+| `vp-status-cycle <target>` | Cycle FRESH → ACTIVE → DONE → FRESH. (VP-F3) |
+| `vp-cleanup-done [days]` | Remove DONE+SUSPENDED tabs older than *days* (30–180, default from `content.vertical_panel.auto_cleanup_days`). Silent on N=0. (VP-F3) |
+| `vp-select-mode` | Toggle multi-select mode in the TabTree. (VP-F4) |
+| `vp-select-toggle <tab_id>` | Toggle a single tab's selection. (VP-F4) |
+| `vp-select-all` / `vp-select-none` | Bulk select. (VP-F4) |
+| `vp-batch-move <group>` | Move the selected tabs into a group. (VP-F4) |
+| `vp-batch-status <status>` | Apply a reading status to the selected tabs. (VP-F4) |
+| `vp-batch-delete` (or `-!` to skip confirm) | Delete the selected tabs. (VP-F4) |
+| `vp-batch-open-window` | Open the selected tabs in a single new window; reuse live tabs by URL. (VP-F4) |
+| `vp-batch-open-tabs` | Open the selected tabs as new tabs in the current window. (VP-F4) |
 | `auto-group-reapply` | Re-run `auto-group-rules` on every tab in the active workspace. |
 
 ## Per-decision specifics
@@ -693,8 +796,8 @@ they register in `bindings.default:`.
 
 | Class | Registered in | Example commands | Target semantics |
 |---|---|---|---|
-| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tab-close`, `tab-only`, `tab-clone`, `tab-reload` | In `normal:`, the target is the webview's active tab. In `workspace_panel:`, the target is the TabTree's selected row (which may be a different tab). |
-| **Panel-state operations** | `bindings.default.workspace_panel:` only | `workspace-add`, `workspace-rename`, `workspace-delete`, `workspace-archive`, `workspace-unarchive`, `workspace-next`, `workspace-prev`, `workspace-switch`, `pintab-style-toggle`, `group-create`, `group-rename`, `group-delete`, `group-list`, `auto-group-reapply` | Operate on the active workspace / selected group / pinned-tab list. Have no meaning from `normal:` because they have no active-tab target. |
+| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tab-close`, `tab-only`, `tab-clone`, `tab-reload`, `tab-collect`, `vp-status-set`, `vp-status-cycle`, `vp-select-toggle` | In `normal:`, the target is the webview's active tab. In `workspace_panel:`, the target is the TabTree's selected row (which may be a different tab). |
+| **Panel-state operations** | `bindings.default.workspace_panel:` only | `workspace-add`, `workspace-rename`, `workspace-delete`, `workspace-archive`, `workspace-unarchive`, `workspace-next`, `workspace-prev`, `workspace-switch`, `pintab-style-toggle`, `group-create`, `group-rename`, `group-delete`, `group-list`, `vp-group-new`, `vp-group-rename`, `vp-group-pin`, `vp-group-unpin`, `vp-group-archive`, `vp-group-restore`, `vp-group-delete`, `vp-group-close`, `vp-group-reopen`, `vp-collect-all`, `vp-cleanup-done`, `vp-select-mode`, `vp-select-all`, `vp-select-none`, `vp-batch-move`, `vp-batch-status`, `vp-batch-delete`, `vp-batch-open-window`, `vp-batch-open-tabs`, `auto-group-reapply` | Operate on the active workspace / selected group / pinned-tab list. Have no meaning from `normal:` because they have no active-tab target. |
 | **Global operations** | `bindings.default.normal:` only | `vertical-panel-toggle` | Toggle panel visibility; no tab/group target. |
 
 **Registration rule for Phase 5**: every new command MUST be classified
