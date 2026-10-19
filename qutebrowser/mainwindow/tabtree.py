@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import enum
 import uuid
+from collections.abc import Iterable
 from typing import Optional
 
 from qutebrowser.qt.core import (
@@ -86,6 +87,7 @@ UrlRole = Qt.ItemDataRole.UserRole + 5
 ActiveRole = Qt.ItemDataRole.UserRole + 6
 PinStateRole = Qt.ItemDataRole.UserRole + 7
 OpenStatusRole = Qt.ItemDataRole.UserRole + 8
+SelectionRole = Qt.ItemDataRole.UserRole + 9
 
 
 class Kind(enum.IntEnum):
@@ -167,6 +169,8 @@ class TabTreeModel(QAbstractItemModel):
         ActiveRole: Role id for whether the row is the active tab (bool).
         PinStateRole: Role id for whether the tab row is pinned (bool).
         OpenStatusRole: Role id for the entry's OPEN/SUSPENDED state (str).
+        SelectionRole: Role id for whether the tab row is multi-selected
+            (bool).  Group rows always report ``False``.
     """
 
     KindRole = KindRole
@@ -177,6 +181,7 @@ class TabTreeModel(QAbstractItemModel):
     ActiveRole = ActiveRole
     PinStateRole = PinStateRole
     OpenStatusRole = OpenStatusRole
+    SelectionRole = SelectionRole
 
     def __init__(
             self,
@@ -192,6 +197,11 @@ class TabTreeModel(QAbstractItemModel):
         self._folded_state: dict[int, bool] = {}
         self._active_tab_id: Optional[int] = None
         self._show_archived = False
+        # Multi-select (VP-F4).  The ids survive ``set_workspace`` rebuilds
+        # so a batch command that emits ``changed`` does not wipe the
+        # selection mid-operation.
+        self._selected: set[int] = set()
+        self._selection_mode: bool = False
         self._placeholder_pixmap = self._create_placeholder_pixmap()
         self.set_workspace(manager.get_active())
 
@@ -299,6 +309,77 @@ class TabTreeModel(QAbstractItemModel):
     def active_tab_id(self) -> Optional[int]:
         """Return the tab id currently marked active, or ``None``."""
         return self._active_tab_id
+
+    # --- multi-select (VP-F4) ---
+
+    def set_selection_mode(self, enabled: bool) -> None:
+        """Enable or disable multi-select mode.
+
+        Disabling the mode clears the current selection and repaints every
+        visible tab row.  Enabling it deliberately does *not* select
+        anything: the caller (a command or shortcut) drives the selection.
+        """
+        if enabled == self._selection_mode:
+            return
+        self._selection_mode = enabled
+        if not enabled and self._selected:
+            self._selected.clear()
+            for node in self._tab_nodes.values():
+                self._emit_selection_changed(node)
+
+    def selection_mode(self) -> bool:
+        """Return whether multi-select mode is currently active."""
+        return self._selection_mode
+
+    def selected_tab_ids(self) -> set[int]:
+        """Return a copy of the currently selected tab ids."""
+        return set(self._selected)
+
+    def set_selected(self, tab_id: int, selected: bool) -> None:
+        """Add or remove *tab_id* from the selection.
+
+        Emits a targeted ``dataChanged`` carrying :data:`SelectionRole` for
+        the tab's row when it is present in the current workspace.
+        """
+        if selected:
+            self._selected.add(tab_id)
+        else:
+            self._selected.discard(tab_id)
+        node = self._tab_nodes.get(tab_id)
+        if node is not None:
+            self._emit_selection_changed(node)
+
+    def select_range(
+            self,
+            tab_ids: Iterable[int],
+            selected: bool = True,
+    ) -> None:
+        """Bulk add/remove every id in *tab_ids* and repaint the rows."""
+        changed_nodes: list[_Node] = []
+        for tab_id in tab_ids:
+            if selected:
+                if tab_id in self._selected:
+                    continue
+                self._selected.add(tab_id)
+            else:
+                if tab_id not in self._selected:
+                    continue
+                self._selected.discard(tab_id)
+            node = self._tab_nodes.get(tab_id)
+            if node is not None:
+                changed_nodes.append(node)
+        for node in changed_nodes:
+            self._emit_selection_changed(node)
+
+    def select_all(self, selected: bool = True) -> None:
+        """Select (or deselect) every tab in the current workspace."""
+        self.select_range(list(self._tab_nodes), selected)
+
+    def _emit_selection_changed(self, node: _Node) -> None:
+        """Emit ``dataChanged`` (SelectionRole) for *node*."""
+        idx = self._index_for_node(node)
+        if idx.isValid():
+            self.dataChanged.emit(idx, idx, [SelectionRole])
 
     def tab_id_for_index(self, index: QModelIndex) -> Optional[int]:
         """Return the tab id behind *index*, or ``None`` for groups/invalid."""
@@ -461,6 +542,8 @@ class TabTreeModel(QAbstractItemModel):
             return None
         if role == ActiveRole:
             return False
+        if role == SelectionRole:
+            return False
         return None
 
     def _tab_data(self, tab: WorkspaceTab, role: int, kind: Kind):
@@ -487,6 +570,8 @@ class TabTreeModel(QAbstractItemModel):
             return status
         if role == PinStateRole:
             return info.status & Status.PINNED != 0
+        if role == SelectionRole:
+            return tab.tab_id in self._selected
         if role == BadgeRole:
             return None
         return None
@@ -542,6 +627,10 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             clicked.
         pin_toggled: Emitted when the pin glyph of a tab is clicked.
         activated: Emitted when the body of a row is clicked.
+        selection_toggled: Emitted when a tab row is clicked while the model
+            is in multi-select mode.  The click is consumed instead of
+            triggering :attr:`activated`; the host decides whether to add,
+            remove or extend the selection.
     """
 
     fold_toggled = pyqtSignal(QModelIndex)
@@ -549,6 +638,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
     close_requested = pyqtSignal(QModelIndex)
     pin_toggled = pyqtSignal(QModelIndex)
     activated = pyqtSignal(QModelIndex)
+    selection_toggled = pyqtSignal(QModelIndex)
 
     ROW_HEIGHT_GROUP = 24
     ROW_HEIGHT_TAB = 22
@@ -563,6 +653,8 @@ class TabTreeItemDelegate(QStyledItemDelegate):
     PIN_WIDTH = 14
     GAP_BEFORE_PIN = 6
     ACTIVE_ACCENT_WIDTH = 2
+    #: Width of the multi-select checkmark drawn in the left margin.
+    SELECTION_INDICATOR_WIDTH = 12
 
     #: Upper bound for the per-index close-glyph hit-rect cache.
     CLOSE_RECT_CACHE_SIZE = 200
@@ -655,6 +747,11 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         self._draw_row_content(
             painter, option, index, kind, rect, x, text_color)
 
+        # Multi-select checkmark (VP-F4): drawn as an overlay in the left
+        # margin so the title / favicon / badge layout is untouched.
+        if bool(index.data(SelectionRole)):
+            self._draw_selection_indicator(painter, rect, option)
+
         # Focus ring (keyboard focus only; skip hover-only focus).
         if (
                 option.state & QStyle.StateFlag.State_HasFocus
@@ -683,6 +780,17 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             return super().editorEvent(event, model, option, index)
 
         kind = index.data(KindRole)
+
+        # Multi-select mode (VP-F4): a click on a tab row toggles its
+        # selection and is consumed so it never activates the tab.  The
+        # delegate only reports the hit; the host (which owns both the
+        # model and the selection-mode state) decides add/remove/extend.
+        selection_mode = getattr(model, 'selection_mode', None)
+        if (callable(selection_mode) and selection_mode()
+                and kind in (Kind.Tab, Kind.ParentTab)):
+            self.selection_toggled.emit(index)
+            return True
+
         rect = option.rect
         x = rect.x()
 
@@ -959,6 +1067,23 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         painter.drawLine(line_rect.topRight(), line_rect.bottomLeft())
         painter.restore()
 
+    def _draw_selection_indicator(
+            self,
+            painter: QPainter,
+            rect: QRect,
+            option: QStyleOptionViewItem,
+    ) -> None:
+        """Draw the multi-select checkmark in the row's left margin."""
+        size = self.SELECTION_INDICATOR_WIDTH
+        y = rect.y() + (rect.height() - size) // 2
+        box = QRect(
+            rect.x() + self.ACTIVE_ACCENT_WIDTH + 2, y, size, size)
+        painter.save()
+        painter.fillRect(box, option.palette.highlight().color())
+        painter.setPen(option.palette.highlightedText().color())
+        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, '✓')
+        painter.restore()
+
     def _remember_close_rect(self, index: QModelIndex, rect: QRect) -> None:
         """Cache the close-glyph hit rect for *index*, bounding the cache."""
         self._last_close_rect[index] = rect
@@ -1069,6 +1194,9 @@ class TabTree(QWidget):
             glyph is clicked.
         pin_toggled: Forwarded from the delegate when the pin glyph is
             clicked.
+        selection_toggled: Emitted when a tab row is clicked while
+            multi-select mode is active.  Argument: the clicked
+            ``QModelIndex``.
     """
 
     activated = pyqtSignal(QModelIndex)
@@ -1077,6 +1205,7 @@ class TabTree(QWidget):
     audio_toggled = pyqtSignal(QModelIndex)
     close_requested = pyqtSignal(QModelIndex)
     pin_toggled = pyqtSignal(QModelIndex)
+    selection_toggled = pyqtSignal(QModelIndex)
 
     def __init__(
             self,
@@ -1087,6 +1216,8 @@ class TabTree(QWidget):
         super().__init__(parent)
         self._win_id = win_id
         self._manager = manager
+        # Anchor for shift+J/K range extension in multi-select mode.
+        self._selection_anchor: Optional[QModelIndex] = None
 
         self.setObjectName('tab-tree')
 
@@ -1136,6 +1267,7 @@ class TabTree(QWidget):
         self._delegate.close_requested.connect(self.close_requested)
         self._delegate.pin_toggled.connect(self.pin_toggled)
         self._delegate.activated.connect(self.activated)
+        self._delegate.selection_toggled.connect(self._on_selection_toggled)
 
         # Keyboard selection (J/K).  These are a *secondary* affordance: the
         # host only emits ``activated``; the bridge turns that into a
@@ -1149,6 +1281,21 @@ class TabTree(QWidget):
             shortcut.activated.connect(
                 lambda d=delta: self._move_selection(d))
             self._shortcuts.append(shortcut)
+
+        # Multi-select shortcuts (VP-F4): Ctrl+Space toggles the mode;
+        # Shift+J / Shift+K extend the selection while it is active.
+        toggle_shortcut = QShortcut(QKeySequence('Ctrl+Space'), self._view)
+        toggle_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        toggle_shortcut.activated.connect(self._toggle_selection_mode)
+        self._shortcuts.append(toggle_shortcut)
+        for keyseq, delta in (('J', +1), ('K', -1)):
+            ext_shortcut = QShortcut(QKeySequence(keyseq), self._view)
+            ext_shortcut.setContext(
+                Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            ext_shortcut.activated.connect(
+                lambda d=delta: self._extend_selection(d))
+            self._shortcuts.append(ext_shortcut)
 
         # Refresh when the manager signals a mutation.
         # TODO(v0.2): Replace wholesale rebuild with fine-grained inserts/removes.
@@ -1178,6 +1325,98 @@ class TabTree(QWidget):
         # in the tree for iterative J/K navigation instead of yanking
         # it back to the webview on every keypress.
         self.keyboard_activated.emit(index)
+
+    # --- multi-select (VP-F4) ---
+
+    def model(self) -> TabTreeModel:
+        """Return the backing model (used by the ``:vp-select-*`` commands)."""
+        return self._model
+
+    def set_selection_mode(self, enabled: bool) -> None:
+        """Enable or disable the model's multi-select mode."""
+        self._model.set_selection_mode(enabled)
+        if not enabled:
+            self._selection_anchor = None
+
+    def selection_mode(self) -> bool:
+        """Return whether multi-select mode is currently active."""
+        return self._model.selection_mode()
+
+    def _toggle_selection_mode(self) -> None:
+        """Flip multi-select mode (Ctrl+Space shortcut)."""
+        self.set_selection_mode(not self._model.selection_mode())
+
+    def _on_selection_toggled(self, index: QModelIndex) -> None:
+        """Toggle the model selection for the tab behind a clicked row."""
+        tab_id = self._model.tab_id_for_index(index)
+        if tab_id is None:
+            return
+        selected = tab_id in self._model.selected_tab_ids()
+        self._model.set_selected(tab_id, not selected)
+        self.selection_toggled.emit(index)
+
+    def _extend_selection(self, delta: int) -> None:
+        """Move the cursor by *delta* and extend the selection to it.
+
+        Outside multi-select mode this falls back to the plain J/K tab
+        switch so the shortcut keeps working.
+        """
+        if not self._model.selection_mode():
+            self._move_selection(delta)
+            return
+        direction = (
+            QAbstractItemView.CursorAction.MoveDown
+            if delta > 0
+            else QAbstractItemView.CursorAction.MoveUp
+        )
+        previous = self._view.currentIndex()
+        index = self._view.moveCursor(
+            direction, Qt.KeyboardModifier.NoModifier)
+        if not index.isValid():
+            return
+        self._view.setCurrentIndex(index)
+        self._view.scrollTo(index)
+        anchor = (
+            self._selection_anchor
+            if self._selection_anchor is not None
+            else previous
+        )
+        self._selection_anchor = anchor
+        self._model.select_range(
+            self._tab_ids_between(anchor, index), True)
+
+    def _tab_ids_between(
+            self,
+            first: QModelIndex,
+            last: QModelIndex,
+    ) -> list[int]:
+        """Return the tab ids in display order between two indices."""
+        order = self._visible_tab_ids()
+        first_id = self._model.tab_id_for_index(first)
+        last_id = self._model.tab_id_for_index(last)
+        if first_id is None or last_id is None:
+            return [last_id] if last_id is not None else []
+        if first_id not in order or last_id not in order:
+            return [last_id]
+        start = order.index(first_id)
+        end = order.index(last_id)
+        low, high = sorted((start, end))
+        return order[low:high + 1]
+
+    def _visible_tab_ids(self) -> list[int]:
+        """Return every tab id in the model, in display order."""
+        ids: list[int] = []
+
+        def walk(parent: QModelIndex) -> None:
+            for row in range(self._model.rowCount(parent)):
+                child = self._model.index(row, 0, parent)
+                tab_id = self._model.tab_id_for_index(child)
+                if tab_id is not None:
+                    ids.append(tab_id)
+                walk(child)
+
+        walk(QModelIndex())
+        return ids
 
     def _return_focus_to_webview(self) -> None:
         """Focus the currently selected tab's webview, if reachable.

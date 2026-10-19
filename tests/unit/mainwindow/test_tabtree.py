@@ -20,6 +20,7 @@ from qutebrowser.qt.core import (
 )
 from qutebrowser.qt.gui import (
     QHelpEvent,
+    QImage,
     QKeySequence,
     QMouseEvent,
     QPainter,
@@ -540,6 +541,120 @@ class TestTabTreeItemDelegate:
         assert delegate._last_active_accent is None
 
 
+class TestSelectionMode:
+
+    """Tests for the VP-F4 multi-select API."""
+
+    @pytest.fixture
+    def model(self, qtbot):
+        """Model backed by a populated workspace with per-tab titles."""
+        manager = MockManager(_make_workspace())
+        m = tabtree.TabTreeModel(manager, parent=None)
+        for tab_id in (10, 11, 12, 20, 21, 30, 31, 32):
+            m.set_tab_info(tab_id, title=str(tab_id))
+        return m
+
+    def test_selection_role_defaults_false(self, model):
+        """SelectionRole is False for tabs and groups until set."""
+        root = QModelIndex()
+        assert model.index(2, 0, root).data(tabtree.SelectionRole) is False
+        assert model.index(0, 0, root).data(tabtree.SelectionRole) is False
+
+    def test_set_selected_updates_role_and_emits(self, model):
+        """set_selected flips the role and emits SelectionRole."""
+        changes = []
+        model.dataChanged.connect(lambda *args: changes.append(args))
+
+        model.set_selected(20, True)
+
+        assert model.selected_tab_ids() == {20}
+        standalone = model.index(2, 0, QModelIndex())
+        assert standalone.data(tabtree.SelectionRole) is True
+        assert changes[-1][2] == [tabtree.SelectionRole]
+
+        model.set_selected(20, False)
+        assert standalone.data(tabtree.SelectionRole) is False
+
+    def test_select_range_adds_and_removes(self, model):
+        """select_range is a bulk version of set_selected."""
+        model.select_range([10, 11, 20])
+        assert model.selected_tab_ids() == {10, 11, 20}
+
+        model.select_range([11], selected=False)
+        assert model.selected_tab_ids() == {10, 20}
+
+    def test_select_all_and_none(self, model):
+        """select_all covers every tab in the workspace, then clears."""
+        model.select_all(True)
+        assert model.selected_tab_ids() == {10, 11, 12, 20, 21, 30, 31, 32}
+
+        model.select_all(False)
+        assert model.selected_tab_ids() == set()
+
+    def test_selection_mode_toggle_and_clear(self, model):
+        """Leaving selection mode clears the selection."""
+        assert model.selection_mode() is False
+
+        model.select_range([20, 21])
+        model.set_selection_mode(True)
+        assert model.selection_mode() is True
+        assert model.selected_tab_ids() == {20, 21}
+
+        model.set_selection_mode(False)
+        assert model.selection_mode() is False
+        assert model.selected_tab_ids() == set()
+
+    def test_disable_emits_data_changed(self, model):
+        """Disabling selection mode repaints rows carrying SelectionRole."""
+        model.set_selection_mode(True)
+        model.set_selected(20, True)
+
+        changes = []
+        model.dataChanged.connect(lambda *args: changes.append(args))
+        model.set_selection_mode(False)
+
+        assert any(args[2] == [tabtree.SelectionRole] for args in changes)
+
+    def test_paint_selected_row_does_not_raise(self, model):
+        """Painting a selected row runs cleanly and draws the checkmark."""
+        model.set_selected(20, True)
+        delegate = tabtree.TabTreeItemDelegate()
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 220, 22)
+        index = model.index(2, 0, QModelIndex())
+
+        image = QImage(220, 22, QImage.Format.Format_ARGB32)
+        painter = QPainter(image)
+        try:
+            delegate.paint(painter, option, index)
+        finally:
+            painter.end()
+
+    def test_delegate_consumes_click_in_selection_mode(self, model):
+        """A click on a tab row in selection mode emits selection_toggled."""
+        model.set_selection_mode(True)
+        delegate = tabtree.TabTreeItemDelegate()
+        captured = []
+        activated = []
+        delegate.selection_toggled.connect(
+            lambda idx: captured.append(idx))
+        delegate.activated.connect(lambda idx: activated.append(idx))
+
+        option = QStyleOptionViewItem()
+        option.rect = QRect(0, 0, 220, 22)
+        index = model.index(2, 0, QModelIndex())
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(QPoint(60, 11)),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        assert delegate.editorEvent(event, model, option, index) is True
+        assert captured == [index]
+        assert activated == []
+
+
 class TestTabTree:
 
     """Tests for the host :class:`tabtree.TabTree` widget."""
@@ -630,3 +745,33 @@ class TestTabTree:
         idx = tree._model.index(1, 0)
         tree._delegate.pin_toggled.emit(idx)
         assert emitted == [idx]
+
+    def test_host_selection_mode_toggle(self, qtbot):
+        """The host exposes set_selection_mode / selection_mode."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+
+        assert tree.selection_mode() is False
+        tree.set_selection_mode(True)
+        assert tree.selection_mode() is True
+        tree.set_selection_mode(False)
+        assert tree.selection_mode() is False
+
+    def test_host_selection_toggled_toggles_model(self, qtbot):
+        """A delegate selection_toggled toggles the model and re-emits."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        tree.set_selection_mode(True)
+
+        emitted = []
+        tree.selection_toggled.connect(lambda idx: emitted.append(idx))
+        idx = tree._model.index(2, 0)  # standalone tab id 20
+
+        tree._delegate.selection_toggled.emit(idx)
+        assert tree.model().selected_tab_ids() == {20}
+        assert emitted == [idx]
+
+        tree._delegate.selection_toggled.emit(idx)
+        assert tree.model().selected_tab_ids() == set()

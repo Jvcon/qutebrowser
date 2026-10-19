@@ -38,9 +38,14 @@ class FakeManager:
         self.archived: list[uuid.UUID] = []
         self.deleted: list[uuid.UUID] = []
         self.purged: list[uuid.UUID] = []
-        self.reading_status_sets: list[tuple[list[int], str]] = []
+        self.reading_status_sets: list[tuple[set[int], str]] = []
         self.cleanups: list[tuple[uuid.UUID, int]] = []
         self.cleanup_result = 0
+        self.moved: list[tuple[set[int], Optional[uuid.UUID]]] = []
+        self.statuses: list[tuple[set[int], str]] = []
+        self.deleted_tabs: list[int] = []
+        self.opened_windows: list[tuple[uuid.UUID, set[int]]] = []
+        self.opened_tabs: list[tuple[uuid.UUID, set[int]]] = []
 
     def add_workspace(self, name: str) -> Workspace:
         workspace = Workspace(id=uuid.uuid4(), name=name,
@@ -151,8 +156,8 @@ class FakeManager:
         return None
 
     def set_reading_status(self, workspace_id: uuid.UUID,
-                           tab_ids: list[int], status: str) -> int:
-        wanted = list(tab_ids)
+                           tab_ids: 'set[int] | list[int]', status: str) -> int:
+        wanted = set(tab_ids)
         count = 0
         for tab in self._workspaces[workspace_id].tabs:
             if tab.tab_id in wanted:
@@ -164,6 +169,44 @@ class FakeManager:
     def cleanup_old_done(self, workspace_id: uuid.UUID, days: int) -> int:
         self.cleanups.append((workspace_id, days))
         return self.cleanup_result
+
+    # --- batched operations (VP-F4) ---
+
+    def add_tab(self, workspace_id: uuid.UUID, tab: WorkspaceTab) -> None:
+        self._workspaces[workspace_id].tabs.append(tab)
+
+    def move_tabs(self, workspace_id: uuid.UUID, tab_ids: set[int],
+                  group_id: Optional[uuid.UUID]) -> int:
+        id_set = set(tab_ids)
+        count = 0
+        for tab in self._workspaces[workspace_id].tabs:
+            if tab.tab_id in id_set:
+                tab.assign_group(group_id)
+                count += 1
+        self.moved.append((id_set, group_id))
+        return count
+
+    def delete_tabs(self, workspace_id: uuid.UUID,
+                    tab_ids: set[int]) -> int:
+        workspace = self._workspaces[workspace_id]
+        id_set = set(tab_ids)
+        removed = [tab for tab in workspace.tabs if tab.tab_id in id_set]
+        workspace.tabs = [tab for tab in workspace.tabs
+                          if tab.tab_id not in id_set]
+        self.deleted_tabs.extend(tab.tab_id for tab in removed)
+        return len(removed)
+
+    def open_tabs_in_new_window(
+            self, workspace_id: uuid.UUID, tab_ids: set[int],
+            *, win_id: int = 0) -> tuple[int, int]:
+        self.opened_windows.append((workspace_id, set(tab_ids)))
+        return (3, 1)
+
+    def open_tabs_as_new_tabs(
+            self, workspace_id: uuid.UUID, tab_ids: set[int],
+            *, win_id: int = 0) -> tuple[int, int]:
+        self.opened_tabs.append((workspace_id, set(tab_ids)))
+        return (2, 0)
 
 
 class FakeTab:
@@ -181,6 +224,44 @@ class FakeTab:
     def title(self) -> str:
         return self._title
 
+
+class FakeModel:
+
+    """Minimal TabTreeModel stand-in for selection commands."""
+
+    def __init__(self) -> None:
+        self.selected: set[int] = set()
+
+    def selected_tab_ids(self) -> set[int]:
+        return set(self.selected)
+
+    def set_selected(self, tab_id: int, selected: bool) -> None:
+        if selected:
+            self.selected.add(tab_id)
+        else:
+            self.selected.discard(tab_id)
+
+    def select_all(self, selected: bool = True) -> None:
+        if not selected:
+            self.selected.clear()
+
+
+class FakeTree:
+
+    """Minimal TabTree stand-in exposing the selection API."""
+
+    def __init__(self) -> None:
+        self._model = FakeModel()
+        self._selection_mode = False
+
+    def model(self) -> FakeModel:
+        return self._model
+
+    def selection_mode(self) -> bool:
+        return self._selection_mode
+
+    def set_selection_mode(self, enabled: bool) -> None:
+        self._selection_mode = enabled
 
 
 @pytest.fixture
@@ -231,6 +312,20 @@ def confirmations(monkeypatch: pytest.MonkeyPatch) -> list[Callable[[], None]]:
 
     monkeypatch.setattr(commands.message, 'confirm_async', confirm_async)
     return pending
+
+
+@pytest.fixture
+def fake_tree(monkeypatch: pytest.MonkeyPatch) -> FakeTree:
+    """A FakeTree wired into objreg so the :vp-select-* commands find it."""
+    tree = FakeTree()
+
+    def fake_get(name: str, **_kwargs: object) -> object:
+        if name == 'tab-tree':
+            return tree
+        raise KeyError(name)
+
+    monkeypatch.setattr(commands.objreg, 'get', fake_get)
+    return tree
 
 
 class TestWorkspaceCreate:
@@ -644,6 +739,160 @@ def pers(tmp_path: pathlib.Path) -> tuple[WorkspacePersistence,
         WorkspacePersistence(base_path=tmp_path / 'workspaces'),
         PinnedPersistence(path=tmp_path / 'profile' / 'pinned.yml'),
     )
+
+
+class TestBatchCommands:
+
+    """Tests for the VP-F4 :vp-select-* / :vp-batch-* commands."""
+
+    def test_vp_select_mode_toggles(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        assert fake_tree.selection_mode() is False
+
+        commands.vp_select_mode(win_id=0)
+        assert fake_tree.selection_mode() is True
+        assert messages == ["Selection mode enabled."]
+
+        commands.vp_select_mode(win_id=0)
+        assert fake_tree.selection_mode() is False
+        assert messages[-1] == "Selection mode disabled."
+
+    def test_vp_select_toggle_adds_and_removes(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        commands.vp_select_toggle(20, win_id=0)
+        assert fake_tree.model().selected_tab_ids() == {20}
+
+        commands.vp_select_toggle(20, win_id=0)
+        assert fake_tree.model().selected_tab_ids() == set()
+
+    def test_vp_select_all_and_none(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        # select_all on the fake is a no-op for True; just check it enables
+        # selection mode and clears on none.
+        commands.vp_select_all(win_id=0)
+        assert fake_tree.selection_mode() is True
+
+        fake_tree.model().selected.add(1)
+        commands.vp_select_none(win_id=0)
+        assert fake_tree.model().selected_tab_ids() == set()
+
+    def test_vp_batch_move_resolves_group(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        fake_manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        fake_manager.add_tab(workspace.id, WorkspaceTab(tab_id=2))
+        fake_tree.model().selected.update({1, 2})
+
+        commands.vp_batch_move('g', win_id=0)
+
+        assert workspace.tabs[0].group_id == group.group_id
+        assert workspace.tabs[1].group_id == group.group_id
+        assert messages == ["Moved 2 tab(s) into 'g'."]
+
+    def test_vp_batch_move_empty_selection_raises(
+            self, fake_manager: FakeManager, fake_tree: FakeTree) -> None:
+        fake_manager.add_workspace('w')
+        with pytest.raises(cmdutils.CommandError, match='No tabs selected'):
+            commands.vp_batch_move('g', win_id=0)
+
+    def test_vp_batch_status_updates(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        fake_tree.model().selected.add(1)
+
+        commands.vp_batch_status('done', win_id=0)
+
+        assert fake_manager.statuses == [({1}, 'DONE')]
+        assert messages == ["Marked 1 tab(s) as DONE."]
+
+    def test_vp_batch_status_invalid_raises(
+            self, fake_manager: FakeManager, fake_tree: FakeTree) -> None:
+        fake_manager.add_workspace('w')
+        fake_tree.model().selected.add(1)
+        with pytest.raises(cmdutils.CommandError):
+            commands.vp_batch_status('bogus', win_id=0)
+
+    def test_vp_batch_delete_confirms(
+            self,
+            fake_manager: FakeManager,
+            fake_tree: FakeTree,
+            confirmations: list[Callable[[], None]],
+            messages: list[str],
+    ) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        fake_manager.add_tab(workspace.id, WorkspaceTab(tab_id=2))
+        fake_tree.model().selected.update({1, 2})
+
+        commands.vp_batch_delete(win_id=0)
+
+        assert len(confirmations) == 1
+        assert workspace.tabs  # nothing deleted before confirmation
+        confirmations[0]()
+        assert sorted(fake_manager.deleted_tabs) == [1, 2]
+        assert workspace.tabs == []
+        assert messages == ["Deleted 2 tab(s)."]
+
+    def test_vp_batch_delete_force_skips_confirmation(
+            self,
+            fake_manager: FakeManager,
+            fake_tree: FakeTree,
+            confirmations: list[Callable[[], None]],
+            messages: list[str],
+    ) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        fake_tree.model().selected.add(1)
+
+        commands.vp_batch_delete(force=True, win_id=0)
+
+        assert confirmations == []
+        assert fake_manager.deleted_tabs == [1]
+        assert workspace.tabs == []
+
+    def test_vp_batch_delete_empty_selection_noop(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            confirmations: list[Callable[[], None]],
+            messages: list[str]) -> None:
+        commands.vp_batch_delete(win_id=0)
+        assert confirmations == []
+        assert messages == ["No tabs selected."]
+
+    def test_vp_batch_open_window_dispatches(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_tree.model().selected.add(1)
+
+        commands.vp_batch_open_window(win_id=0)
+
+        assert fake_manager.opened_windows == [(workspace.id, {1})]
+        assert messages == [
+            "Opened 3 tab(s) in a new window; reused 1."]
+
+    def test_vp_batch_open_tabs_dispatches(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_tree.model().selected.add(1)
+
+        commands.vp_batch_open_tabs(win_id=0)
+
+        assert fake_manager.opened_tabs == [(workspace.id, {1})]
+        assert messages == ["Opened 2 tab(s); reused 0."]
+
+    def test_vp_batch_open_empty_selection_noop(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        commands.vp_batch_open_window(win_id=0)
+        assert messages == ["No tabs selected."]
 
 
 class TestPersistence:
