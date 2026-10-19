@@ -255,6 +255,23 @@ def tab_collect(tab: Any, group_id: str = '') -> None:
     group = _resolve_group(manager, workspace, group_id)
 
     metadata = _metadata_from_tab(tab)
+
+    # D1: a tab whose URL already has a registered entry (e.g. one created
+    # by WorkspaceBridge when the tab was opened) is only "associated" with
+    # that entry.  The bridge already fired ``_on_new_tab`` for it, so mark
+    # the existing entry OPEN and skip collecting/fetching again to avoid
+    # creating a duplicate entry or a redundant ``tabentry_fetch``.
+    if metadata.url:
+        existing = next(
+            (entry for entry in workspace.tabs
+             if entry.url == metadata.url),
+            None,
+        )
+        if existing is not None:
+            manager.set_open_status(workspace.id, existing.tab_id, 'OPEN')
+            message.info("Collected tab.")
+            return
+
     collected = manager.collect_tab(
         workspace.id, tab.tab_id, group, metadata=metadata)
     _persist_description(manager, workspace.id, collected.tab_id, tab)
