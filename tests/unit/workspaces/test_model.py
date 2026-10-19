@@ -115,6 +115,20 @@ class TestWorkspaceTab:
         tab = model.WorkspaceTab(tab_id=1, open_status='OPEN')
         assert model.WorkspaceTab.from_dict(tab.to_dict()) == tab
 
+    def test_created_at_stamped_when_missing(self):
+        tab = model.WorkspaceTab(tab_id=1)
+        assert tab.created_at is not None
+        assert tab.created_at.endswith('+00:00')
+
+    def test_created_at_kept_when_explicit(self):
+        tab = model.WorkspaceTab(
+            tab_id=1, created_at='2026-01-01T00:00:00+00:00')
+        assert tab.created_at == '2026-01-01T00:00:00+00:00'
+
+    def test_from_dict_missing_created_at_stamps_it(self):
+        tab = model.WorkspaceTab.from_dict({'tab_id': 1})
+        assert tab.created_at is not None
+
     def test_from_dict_missing_open_status_defaults_suspended(self):
         tab = model.WorkspaceTab.from_dict({'tab_id': 1})
         assert tab.open_status == 'SUSPENDED'

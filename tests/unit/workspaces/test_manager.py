@@ -626,15 +626,39 @@ class TestCleanupOldDone:
 
         assert removed == 1
 
-    def test_falls_back_to_now_when_no_dates(self, manager):
+    def test_falls_back_to_created_at_when_no_dates(self, manager):
         workspace = manager.add_workspace('w')
         workspace.last_active = None
-        self._add(manager, workspace, 1, last_fetched=None)
+        tab = self._add(manager, workspace, 1, last_fetched=None)
+        tab.created_at = _old_timestamp()
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 1
+        assert workspace.tabs == []
+
+    def test_keeps_tab_with_no_dates_at_all(self, manager):
+        workspace = manager.add_workspace('w')
+        workspace.last_active = None
+        tab = self._add(manager, workspace, 1, last_fetched=None)
+        tab.created_at = None
 
         removed = manager.cleanup_old_done(workspace.id, 30)
 
         assert removed == 0
-        assert [tab.tab_id for tab in workspace.tabs] == [1]
+        assert [t.tab_id for t in workspace.tabs] == [1]
+
+    def test_detaches_children_of_removed_parent(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, last_fetched=_old_timestamp())
+        child = WorkspaceTab(tab_id=2, parent_id=1, reading_status='ACTIVE')
+        manager.add_tab(workspace.id, child)
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 1
+        assert [t.tab_id for t in workspace.tabs] == [2]
+        assert child.parent_id is None
 
     def test_removes_only_matching_tabs(self, manager):
         workspace = manager.add_workspace('w')

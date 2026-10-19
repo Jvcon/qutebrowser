@@ -153,6 +153,9 @@ class WorkspaceTab:
         reading_status: Three-state reading marker, one of ``'FRESH'`` (just
             collected, not yet looked at), ``'ACTIVE'`` (currently being
             read) or ``'DONE'`` (finished, eligible for auto-cleanup).
+        created_at: ISO 8601 UTC timestamp of when the entry was created.
+            Populated automatically when left as ``None``; used as the final
+            fallback by the auto-cleanup age heuristic.
     """
 
     tab_id: int
@@ -169,6 +172,7 @@ class WorkspaceTab:
     last_error: Optional[str] = None
     open_status: str = 'SUSPENDED'
     reading_status: str = 'FRESH'
+    created_at: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Ensure every user-editable field has an explicit flag."""
@@ -179,6 +183,9 @@ class WorkspaceTab:
         for key in ('title', 'description', 'source'):
             edited.setdefault(key, False)
         self.user_edited = edited
+        if self.created_at is None:
+            self.created_at = datetime.datetime.now(
+                datetime.timezone.utc).isoformat()
 
     def assign_group(self, group_id: Optional[uuid.UUID]) -> None:
         """Move this tab into *group_id* (or to standalone when None)."""
@@ -211,6 +218,7 @@ class WorkspaceTab:
             'last_error': self.last_error,
             'open_status': self.open_status,
             'reading_status': self.reading_status,
+            'created_at': self.created_at,
         }
 
     @classmethod
@@ -244,6 +252,7 @@ class WorkspaceTab:
             last_error=d.get('last_error'),
             open_status=d.get('open_status', 'SUSPENDED') or 'SUSPENDED',
             reading_status=d.get('reading_status', 'FRESH') or 'FRESH',
+            created_at=d.get('created_at'),
         )
 
 

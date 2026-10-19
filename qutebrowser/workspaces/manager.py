@@ -951,7 +951,9 @@ class WorkspaceManager(QObject):
           ``'SUSPENDED'`` fallback so this works before VP-D1 adds the
           field);
         * its effective timestamp — ``last_fetched``, else the workspace's
-          ``last_active``, else "now" — is older than *days*.
+          ``last_active``, else the entry's ``created_at`` — is older than
+          *days*.  Entries with no usable timestamp are treated as recent and
+          kept.
 
         Groups are never touched. :attr:`changed` is emitted once if (and
         only if) at least one tab was removed.
@@ -962,7 +964,7 @@ class WorkspaceManager(QObject):
         workspace = self._workspaces[workspace_id]
         cutoff = (datetime.datetime.now(datetime.timezone.utc)
                   - datetime.timedelta(days=days))
-        removed = 0
+        removed_ids: set[int] = set()
         kept: list[WorkspaceTab] = []
         for tab in workspace.tabs:
             if tab.reading_status != 'DONE':
@@ -972,16 +974,21 @@ class WorkspaceManager(QObject):
                 kept.append(tab)
                 continue
             timestamp = (tab.last_fetched or workspace.last_active
-                         or _now_seconds())
-            parsed = _parse_timestamp(timestamp)
+                         or tab.created_at)
+            parsed = _parse_timestamp(timestamp) if timestamp else None
             if parsed is not None and parsed < cutoff:
-                removed += 1
+                removed_ids.add(tab.tab_id)
             else:
                 kept.append(tab)
-        if removed:
+        if removed_ids:
             workspace.tabs = kept
+            # Detach any surviving children of the removed tabs so they do
+            # not point at a non-existent parent (mirrors :meth:`remove_tab`).
+            for tab in workspace.tabs:
+                if tab.parent_id in removed_ids:
+                    tab.clear_parent()
             self.changed.emit()
-        return removed
+        return len(removed_ids)
 
     # --- pinned tabs ---
 
