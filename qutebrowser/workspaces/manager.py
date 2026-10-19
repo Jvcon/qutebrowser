@@ -584,8 +584,19 @@ class WorkspaceManager(QObject):
             if match is not None:
                 browser.widget.setCurrentWidget(match)
                 reused += 1
+            elif newwindow:
+                # The real ``TabbedBrowser.tabopen`` has no ``newwindow`` kwarg;
+                # the new-window path is to construct a fresh ``MainWindow``
+                # and use *its* tabbed browser, mirroring the
+                # ``tabs.tabs_are_windows`` branch in
+                # :meth:`TabbedBrowser.tabopen`.
+                from qutebrowser.mainwindow import mainwindow as _mw
+                window = _mw.MainWindow(private=browser.is_private)
+                window.tabbed_browser.tabopen(QUrl(url))
+                window.show()
+                opened += 1
             else:
-                browser.tabopen(QUrl(url), newwindow=newwindow)
+                browser.tabopen(QUrl(url))
                 opened += 1
         return opened, reused
 
