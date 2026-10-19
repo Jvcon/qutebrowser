@@ -147,6 +147,9 @@ class WorkspaceTab:
             fetch, if any.
         fetch_attempts: Number of metadata fetch attempts made so far.
         last_error: Short error string from the last failed fetch, if any.
+        reading_status: Three-state reading marker, one of ``'FRESH'`` (just
+            collected, not yet looked at), ``'ACTIVE'`` (currently being
+            read) or ``'DONE'`` (finished, eligible for auto-cleanup).
     """
 
     tab_id: int
@@ -161,6 +164,7 @@ class WorkspaceTab:
     last_fetched: Optional[str] = None
     fetch_attempts: int = 0
     last_error: Optional[str] = None
+    reading_status: str = 'FRESH'
 
     def __post_init__(self) -> None:
         """Ensure every user-editable field has an explicit flag."""
@@ -201,6 +205,7 @@ class WorkspaceTab:
             'last_fetched': self.last_fetched,
             'fetch_attempts': self.fetch_attempts,
             'last_error': self.last_error,
+            'reading_status': self.reading_status,
         }
 
     @classmethod
@@ -232,6 +237,7 @@ class WorkspaceTab:
             last_fetched=d.get('last_fetched'),
             fetch_attempts=int(d.get('fetch_attempts', 0) or 0),
             last_error=d.get('last_error'),
+            reading_status=d.get('reading_status', 'FRESH') or 'FRESH',
         )
 
 

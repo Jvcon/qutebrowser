@@ -4,6 +4,7 @@
 
 """Tests for qutebrowser.workspaces.manager."""
 
+import datetime
 import uuid
 
 import pytest
@@ -333,6 +334,247 @@ class TestCollect:
         assert collected == []
         assert skipped == [1, 2]
         assert workspace.tabs == []
+
+
+def _old_timestamp(days: int = 3650) -> str:
+    """Return an ISO 8601 UTC timestamp *days* days in the past."""
+    return (datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=days)).isoformat()
+
+
+def _recent_timestamp(days: int = 1) -> str:
+    """Return an ISO 8601 UTC timestamp *days* days in the past."""
+    return (datetime.datetime.now(datetime.timezone.utc)
+            - datetime.timedelta(days=days)).isoformat()
+
+
+class TestReadingStatus:
+
+    def test_set_single(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        count = manager.set_reading_status(workspace.id, [1], 'ACTIVE')
+
+        assert count == 1
+        assert workspace.tabs[0].reading_status == 'ACTIVE'
+
+    def test_set_multiple_only_matching(self, manager):
+        workspace = manager.add_workspace('w')
+        for tab_id in (1, 2, 3):
+            manager.add_tab(workspace.id, WorkspaceTab(tab_id=tab_id))
+
+        count = manager.set_reading_status(workspace.id, [1, 3], 'DONE')
+
+        assert count == 2
+        assert [tab.reading_status for tab in workspace.tabs] == [
+            'DONE', 'FRESH', 'DONE']
+
+    def test_set_unknown_ids_returns_zero_without_emitting(self, manager):
+        workspace = manager.add_workspace('w')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        count = manager.set_reading_status(workspace.id, [99], 'DONE')
+
+        assert count == 0
+        assert changes == []
+
+    @pytest.mark.parametrize('status', ['FRESH', 'ACTIVE', 'DONE'])
+    def test_set_all_valid_statuses(self, manager, status):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        manager.set_reading_status(workspace.id, [1], status)
+        assert workspace.tabs[0].reading_status == status
+
+    def test_invalid_status_raises(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        with pytest.raises(ValueError):
+            manager.set_reading_status(workspace.id, [1], 'BOGUS')
+
+    def test_emits_changed_exactly_once_for_batch(self, manager):
+        workspace = manager.add_workspace('w')
+        for tab_id in (1, 2):
+            manager.add_tab(workspace.id, WorkspaceTab(tab_id=tab_id))
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.set_reading_status(workspace.id, [1, 2], 'DONE')
+
+        assert len(changes) == 1
+
+    def test_tabs_by_status_returns_only_matches(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=1, reading_status='DONE'))
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=2, reading_status='ACTIVE'))
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=3, reading_status='DONE'))
+
+        result = manager.tabs_by_status(workspace.id, 'DONE')
+
+        assert [tab.tab_id for tab in result] == [1, 3]
+
+    def test_tabs_by_status_emits_nothing(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=1, reading_status='DONE'))
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.tabs_by_status(workspace.id, 'DONE')
+
+        assert changes == []
+
+    def test_default_status_is_fresh(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        assert workspace.tabs[0].reading_status == 'FRESH'
+        assert manager.tabs_by_status(workspace.id, 'FRESH')
+
+
+class TestCleanupOldDone:
+
+    def _add(self, manager, workspace, tab_id, *, status='DONE',
+             open_status='SUSPENDED', last_fetched=None):
+        tab = WorkspaceTab(tab_id=tab_id, reading_status=status,
+                           last_fetched=last_fetched)
+        if open_status is not None:
+            # ``open_status`` is added by VP-D1; until then it lives as a
+            # plain instance attribute.
+            tab.open_status = open_status  # type: ignore[attr-defined]
+        manager.add_tab(workspace.id, tab)
+        return tab
+
+    def test_removes_old_done_suspended(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, last_fetched=_old_timestamp())
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 1
+        assert workspace.tabs == []
+        assert changes
+
+    def test_keeps_open_tab(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, open_status='OPEN',
+                  last_fetched=_old_timestamp())
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 0
+        assert [tab.tab_id for tab in workspace.tabs] == [1]
+
+    def test_keeps_default_suspended_fallback_missing_field(self, manager):
+        """Without an ``open_status`` attribute the tab counts as SUSPENDED."""
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, open_status=None,
+                  last_fetched=_old_timestamp())
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 1
+
+    @pytest.mark.parametrize('status', ['FRESH', 'ACTIVE'])
+    def test_keeps_not_done(self, manager, status):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, status=status,
+                  last_fetched=_old_timestamp())
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 0
+        assert [tab.tab_id for tab in workspace.tabs] == [1]
+
+    def test_keeps_recent_done(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, last_fetched=_recent_timestamp())
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 0
+        assert [tab.tab_id for tab in workspace.tabs] == [1]
+
+    def test_uses_workspace_last_active_when_no_last_fetched(self, manager):
+        workspace = manager.add_workspace('w')
+        workspace.last_active = _old_timestamp()
+        self._add(manager, workspace, 1, last_fetched=None)
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 1
+
+    def test_falls_back_to_now_when_no_dates(self, manager):
+        workspace = manager.add_workspace('w')
+        workspace.last_active = None
+        self._add(manager, workspace, 1, last_fetched=None)
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 0
+        assert [tab.tab_id for tab in workspace.tabs] == [1]
+
+    def test_removes_only_matching_tabs(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, last_fetched=_old_timestamp())
+        self._add(manager, workspace, 2, status='ACTIVE',
+                  last_fetched=_old_timestamp())
+        self._add(manager, workspace, 3, open_status='OPEN',
+                  last_fetched=_old_timestamp())
+        self._add(manager, workspace, 4, last_fetched=_recent_timestamp())
+
+        removed = manager.cleanup_old_done(workspace.id, 30)
+
+        assert removed == 1
+        assert [tab.tab_id for tab in workspace.tabs] == [2, 3, 4]
+
+    def test_no_emit_when_nothing_removed(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, last_fetched=_recent_timestamp())
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.cleanup_old_done(workspace.id, 30)
+
+        assert changes == []
+
+
+class TestOpenStatusStub:
+
+    def test_sets_status_and_emits(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.set_open_status(workspace.id, 1, 'OPEN')
+
+        assert getattr(workspace.tabs[0], 'open_status', None) == 'OPEN'
+        assert result == 1
+        assert changes
+
+    def test_invalid_status_raises(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        with pytest.raises(ValueError):
+            manager.set_open_status(workspace.id, 1, 'BOGUS')
+
+    def test_unknown_tab_returns_zero(self, manager):
+        workspace = manager.add_workspace('w')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.set_open_status(workspace.id, 99, 'OPEN')
+
+        assert result == 0
+        assert changes == []
 
 
 class TestPinned:

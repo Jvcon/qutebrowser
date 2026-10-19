@@ -169,9 +169,31 @@ class TestWorkspaceTab:
             'tab_id', 'parent_id', 'group_id', 'title', 'url',
             'description', 'source', 'favicon', 'user_edited',
             'last_fetched', 'fetch_attempts', 'last_error',
+            'reading_status',
         } <= set(d)
         assert all(not isinstance(value, uuid.UUID)
                    for value in d.values())
+
+    def test_reading_status_defaults_to_fresh(self):
+        tab = model.WorkspaceTab(tab_id=1)
+        assert tab.reading_status == 'FRESH'
+
+    def test_from_dict_without_reading_status_defaults_fresh(self):
+        tab = model.WorkspaceTab.from_dict(
+            {'tab_id': 7, 'parent_id': None, 'group_id': None})
+        assert tab.reading_status == 'FRESH'
+
+    def test_from_dict_keeps_explicit_reading_status(self):
+        tab = model.WorkspaceTab.from_dict(
+            {'tab_id': 7, 'reading_status': 'DONE'})
+        assert tab.reading_status == 'DONE'
+
+    @pytest.mark.parametrize('status', ['FRESH', 'ACTIVE', 'DONE'])
+    def test_reading_status_roundtrip(self, status):
+        tab = model.WorkspaceTab(tab_id=1, reading_status=status)
+        d = tab.to_dict()
+        assert d['reading_status'] == status
+        assert model.WorkspaceTab.from_dict(d).reading_status == status
 
 
 class TestWorkspace:
