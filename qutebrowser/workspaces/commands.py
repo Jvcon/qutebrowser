@@ -583,7 +583,8 @@ def vp_group_close(target: str, win_id: int = 0) -> None:
 
 @cmdutils.register(name='vp-group-reopen')
 @cmdutils.argument('target', metavar='target')
-def vp_group_reopen(target: str) -> None:
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_group_reopen(target: str, win_id: int = 0) -> None:
     """Reopen every suspended tab in the group, reusing live tabs by URL.
 
     Already-open tabs are left untouched. An OPEN group is a no-op, and an
@@ -602,7 +603,7 @@ def vp_group_reopen(target: str) -> None:
         message.info(f"Group '{group.name}' is archived; restore it first.")
         return
     opened, reused, skipped = manager.reopen_group(
-        workspace.id, group.group_id)
+        workspace.id, group.group_id, win_id=win_id)
     if opened == 0 and reused == 0 and skipped == 0:
         message.info(f"Group '{group.name}' has no suspended tabs.")
         return
