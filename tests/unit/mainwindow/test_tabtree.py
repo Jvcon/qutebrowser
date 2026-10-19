@@ -49,6 +49,29 @@ class MockManager(QObject):
     def get_active(self):
         return self._workspace
 
+    def group_open_count(self, workspace_id, group_id):
+        return sum(
+            1 for tab in self._workspace.tabs
+            if tab.group_id == group_id and tab.open_status == 'OPEN'
+        )
+
+    def group_total_count(self, workspace_id, group_id):
+        return sum(
+            1 for tab in self._workspace.tabs
+            if tab.group_id == group_id
+        )
+
+    def group_state(self, workspace_id, group_id):
+        group = next(
+            group for group in self._workspace.groups
+            if group.group_id == group_id
+        )
+        if group.archived:
+            return 'ARCHIVED'
+        if self.group_open_count(workspace_id, group_id) > 0:
+            return 'OPEN'
+        return 'SUSPENDED'
+
 
 def _make_workspace():
     """Return a workspace with one group, two standalones and one parent tab."""
@@ -156,7 +179,7 @@ class TestTabTreeModel:
         assert group_index.data(Qt.ItemDataRole.DisplayRole) == 'client-A docs'
         assert group_index.data(tabtree.KindRole) == tabtree.Kind.Group
         assert group_index.data(tabtree.FoldedRole) is False
-        assert group_index.data(tabtree.BadgeRole) == 3
+        assert group_index.data(tabtree.BadgeRole) == '3/3'
         assert group_index.data(tabtree.StatusRole) == tabtree.Status.NONE
 
         root_tabs = {
@@ -218,13 +241,13 @@ class TestTabTreeModel:
         assert standalone.data(tabtree.StatusRole) & tabtree.Status.SUSPENDED
 
     def test_empty_group_badge_zero(self):
-        """Empty groups report a +0 badge."""
+        """Empty groups report a ``"0/0"`` badge."""
         group = Group(group_id=uuid.uuid4(), name='empty', folded=False)
         workspace = Workspace(
             id=uuid.uuid4(), name='test', groups=[group], tabs=[])
         model = tabtree.TabTreeModel(MockManager(workspace))
         group_index = model.index(0, 0, QModelIndex())
-        assert group_index.data(tabtree.BadgeRole) == 0
+        assert group_index.data(tabtree.BadgeRole) == '0/0'
 
     def test_active_tab_id_is_exposed_via_data(self, model):
         """ActiveRole is True only on the row for the active tab id."""
@@ -309,10 +332,144 @@ class TestTabTreeModel:
         assert names() == ['visible']
 
         model.set_show_archived(True)
-        assert names() == ['visible', 'archived']
+        # Both groups are non-OPEN, so they share the suspended band and
+        # sort by name ('archived' < 'visible').
+        assert names() == ['archived', 'visible']
 
         model.set_show_archived(False)
         assert names() == ['visible']
+
+    def test_badge_open_over_total(self):
+        """BadgeRole reports the OPEN/total tab counts as a string."""
+        group = Group(group_id=uuid.uuid4(), name='mix')
+        tabs = [
+            WorkspaceTab(tab_id=1, group_id=group.group_id,
+                         open_status='OPEN'),
+            WorkspaceTab(tab_id=2, group_id=group.group_id,
+                         open_status='SUSPENDED'),
+            WorkspaceTab(tab_id=3, group_id=group.group_id,
+                         open_status='OPEN'),
+        ]
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test', groups=[group], tabs=tabs)
+        model = tabtree.TabTreeModel(MockManager(workspace))
+
+        group_index = model.index(0, 0, QModelIndex())
+        assert group_index.data(tabtree.BadgeRole) == '2/3'
+
+    def test_group_state_role(self):
+        """GroupStateRole resolves empty / suspended / open groups."""
+        empty = Group(group_id=uuid.uuid4(), name='empty')
+        suspended = Group(group_id=uuid.uuid4(), name='suspended')
+        opened = Group(group_id=uuid.uuid4(), name='opened')
+        tabs = [
+            WorkspaceTab(tab_id=1, group_id=suspended.group_id,
+                         open_status='SUSPENDED'),
+            WorkspaceTab(tab_id=2, group_id=opened.group_id,
+                         open_status='OPEN'),
+        ]
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test',
+            groups=[empty, suspended, opened], tabs=tabs)
+        model = tabtree.TabTreeModel(MockManager(workspace))
+        root = QModelIndex()
+
+        states = {
+            model.index(row, 0, root).data(Qt.ItemDataRole.DisplayRole):
+                model.index(row, 0, root).data(tabtree.GroupStateRole)
+            for row in range(model.rowCount(root))
+        }
+        assert states == {
+            'empty': 'SUSPENDED',
+            'suspended': 'SUSPENDED',
+            'opened': 'OPEN',
+        }
+
+    def test_group_state_role_archived(self):
+        """Archived groups report ARCHIVED when shown."""
+        group = Group(group_id=uuid.uuid4(), name='archived', archived=True)
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test', groups=[group], tabs=[
+                WorkspaceTab(tab_id=1, group_id=group.group_id,
+                             open_status='OPEN')])
+        model = tabtree.TabTreeModel(MockManager(workspace))
+        model.set_show_archived(True)
+
+        group_index = model.index(0, 0, QModelIndex())
+        assert group_index.data(tabtree.GroupStateRole) == 'ARCHIVED'
+
+    def test_sort_open_groups_first(self, config_stub):
+        """OPEN groups sort before suspended ones; pinned still come first."""
+        config_stub.val.content.vertical_panel.sort_open_groups_first = True
+        suspended = Group(group_id=uuid.uuid4(), name='suspended')
+        opened = Group(group_id=uuid.uuid4(), name='opened')
+        pinned = Group(group_id=uuid.uuid4(), name='pinned', pinned=True)
+        tabs = [
+            WorkspaceTab(tab_id=1, group_id=suspended.group_id,
+                         open_status='SUSPENDED'),
+            WorkspaceTab(tab_id=2, group_id=opened.group_id,
+                         open_status='OPEN'),
+        ]
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test',
+            groups=[suspended, opened, pinned], tabs=tabs)
+        model = tabtree.TabTreeModel(MockManager(workspace))
+        root = QModelIndex()
+
+        names = [
+            model.index(row, 0, root).data(Qt.ItemDataRole.DisplayRole)
+            for row in range(model.rowCount(root))
+        ]
+        assert names == ['pinned', 'opened', 'suspended']
+
+    def test_sort_config_disabled_preserves_order(self, config_stub):
+        """With the setting off, groups keep their original sort order."""
+        config_stub.val.content.vertical_panel.sort_open_groups_first = False
+        suspended = Group(group_id=uuid.uuid4(), name='suspended')
+        opened = Group(group_id=uuid.uuid4(), name='opened')
+        tabs = [
+            WorkspaceTab(tab_id=1, group_id=suspended.group_id,
+                         open_status='SUSPENDED'),
+            WorkspaceTab(tab_id=2, group_id=opened.group_id,
+                         open_status='OPEN'),
+        ]
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test',
+            groups=[suspended, opened], tabs=tabs)
+        model = tabtree.TabTreeModel(MockManager(workspace))
+        root = QModelIndex()
+
+        names = [
+            model.index(row, 0, root).data(Qt.ItemDataRole.DisplayRole)
+            for row in range(model.rowCount(root))
+        ]
+        assert names == ['suspended', 'opened']
+
+    def test_archived_sorts_with_suspended_band(self, config_stub):
+        """Archived groups sort after OPEN ones, alongside suspended ones."""
+        config_stub.val.content.vertical_panel.sort_open_groups_first = True
+        suspended = Group(group_id=uuid.uuid4(), name='suspended')
+        opened = Group(group_id=uuid.uuid4(), name='opened')
+        archived = Group(
+            group_id=uuid.uuid4(), name='archived', archived=True)
+        tabs = [
+            WorkspaceTab(tab_id=1, group_id=suspended.group_id,
+                         open_status='SUSPENDED'),
+            WorkspaceTab(tab_id=2, group_id=opened.group_id,
+                         open_status='OPEN'),
+        ]
+        workspace = Workspace(
+            id=uuid.uuid4(), name='test',
+            groups=[suspended, opened, archived], tabs=tabs)
+        model = tabtree.TabTreeModel(MockManager(workspace))
+        model.set_show_archived(True)
+        root = QModelIndex()
+
+        names = [
+            model.index(row, 0, root).data(Qt.ItemDataRole.DisplayRole)
+            for row in range(model.rowCount(root))
+        ]
+        assert names == ['opened', 'archived', 'suspended']
 
 
 class TestTabTreeItemDelegate:

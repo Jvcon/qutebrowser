@@ -88,6 +88,7 @@ ActiveRole = Qt.ItemDataRole.UserRole + 6
 PinStateRole = Qt.ItemDataRole.UserRole + 7
 OpenStatusRole = Qt.ItemDataRole.UserRole + 8
 SelectionRole = Qt.ItemDataRole.UserRole + 9
+GroupStateRole = Qt.ItemDataRole.UserRole + 10
 
 
 class Kind(enum.IntEnum):
@@ -164,13 +165,17 @@ class TabTreeModel(QAbstractItemModel):
         KindRole: Role id for the row :class:`Kind`.
         FoldedRole: Role id for the collapsed state (bool).
         StatusRole: Role id for tab :class:`Status` flags.
-        BadgeRole: Role id for the group tab-count badge (int).
+        BadgeRole: Role id for the group ``"open/total"`` tab-count badge
+            (str), e.g. ``"2/5"``.  ``"0/0"`` for an empty group.
         UrlRole: Role id for the tab URL (str).
         ActiveRole: Role id for whether the row is the active tab (bool).
         PinStateRole: Role id for whether the tab row is pinned (bool).
         OpenStatusRole: Role id for the entry's OPEN/SUSPENDED state (str).
         SelectionRole: Role id for whether the tab row is multi-selected
             (bool).  Group rows always report ``False``.
+        GroupStateRole: Role id for the resolved group running state, one
+            of ``'OPEN'``, ``'SUSPENDED'`` or ``'ARCHIVED'`` (str).  Group
+            rows only; tab rows report ``None``.
     """
 
     KindRole = KindRole
@@ -182,6 +187,7 @@ class TabTreeModel(QAbstractItemModel):
     PinStateRole = PinStateRole
     OpenStatusRole = OpenStatusRole
     SelectionRole = SelectionRole
+    GroupStateRole = GroupStateRole
 
     def __init__(
             self,
@@ -479,9 +485,24 @@ class TabTreeModel(QAbstractItemModel):
             group for group in workspace.groups
             if self._show_archived or not group.archived
         ]
-        # Pinned groups sort first, preserving insertion order within each
-        # band (``sorted`` is stable). Pinning does not change list order.
-        groups = sorted(groups, key=lambda group: not group.pinned)
+        # Pinned groups sort first. Without the open-first setting,
+        # insertion order is preserved within each band (``sorted`` is
+        # stable); pinning itself never changes list order.
+        if self._sort_open_groups_first():
+            # Pinned first, then OPEN groups, then SUSPENDED/ARCHIVED (the
+            # archived band sorts with the suspended one; the archive UI
+            # already separates archived groups visually).
+            groups = sorted(
+                groups,
+                key=lambda group: (
+                    not group.pinned,
+                    self._manager.group_state(
+                        workspace.id, group.group_id) != 'OPEN',
+                    group.name,
+                ),
+            )
+        else:
+            groups = sorted(groups, key=lambda group: not group.pinned)
 
         group_nodes: dict[uuid.UUID, _Node] = {}
         for group in groups:
@@ -535,7 +556,9 @@ class TabTreeModel(QAbstractItemModel):
         if role == FoldedRole:
             return group.folded
         if role == BadgeRole:
-            return count
+            return self._group_badge(group)
+        if role == GroupStateRole:
+            return self._group_state(group)
         if role == StatusRole:
             return Status.NONE
         if role == OpenStatusRole:
@@ -545,6 +568,35 @@ class TabTreeModel(QAbstractItemModel):
         if role == SelectionRole:
             return False
         return None
+
+    def _group_badge(self, group: Group) -> str:
+        """Return the ``"open/total"`` badge text for *group*."""
+        if self._workspace is None:
+            return '0/0'
+        open_count = self._manager.group_open_count(
+            self._workspace.id, group.group_id)
+        total_count = self._manager.group_total_count(
+            self._workspace.id, group.group_id)
+        return f"{open_count}/{total_count}"
+
+    def _group_state(self, group: Group) -> str:
+        """Return the resolved running state for *group*."""
+        if self._workspace is None:
+            return 'SUSPENDED'
+        return self._manager.group_state(
+            self._workspace.id, group.group_id)
+
+    def _sort_open_groups_first(self) -> bool:
+        """Return whether OPEN groups should sort before suspended ones."""
+        # Imported lazily so importing this module never depends on the
+        # config being initialised (several unit tests build a model
+        # without a config stub).
+        from qutebrowser.config import config
+        try:
+            return bool(
+                config.val.content.vertical_panel.sort_open_groups_first)
+        except AttributeError:
+            return True
 
     def _tab_data(self, tab: WorkspaceTab, role: int, kind: Kind):
         info = self._tab_info.get(tab.tab_id, _TabInfo())
@@ -708,6 +760,21 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             if option.state & QStyle.StateFlag.State_Selected
             else option.palette.text().color()
         )
+        # Group running state (VP-D2): dim suspended groups and give
+        # archived groups a distinct muted hint.  OPEN groups are unchanged.
+        if kind == Kind.Group:
+            group_state = index.data(GroupStateRole)
+            if group_state == 'SUSPENDED':
+                dimmed = QColor(text_color)
+                dimmed.setAlpha(140)
+                text_color = dimmed
+            elif group_state == 'ARCHIVED':
+                archived = QColor(text_color)
+                archived.setAlpha(100)
+                text_color = archived
+                hint = QColor(option.palette.mid().color())
+                hint.setAlpha(40)
+                painter.fillRect(option.rect, hint)
         painter.setPen(text_color)
 
         rect = option.rect
@@ -724,7 +791,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             )
             empty_group = (
                 kind == Kind.Group
-                and int(index.data(BadgeRole) or 0) == 0
+                and index.data(BadgeRole) in (None, '', '0/0')
             )
             self._draw_chevron(
                 painter, chevron_rect, not folded, empty_group, text_color,
@@ -952,7 +1019,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         if kind == Kind.Group:
             badge = index.data(BadgeRole)
             if badge is not None:
-                badge_text = f"+{int(badge)}"
+                badge_text = str(badge)
 
         strip_width = (
             fm.horizontalAdvance(status_text) + self.GAP_STRIP
