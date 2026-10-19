@@ -550,6 +550,35 @@ def _make_group_delete_action(
     return delete
 
 
+@cmdutils.register(name='vp-group-close')
+@cmdutils.argument('target', metavar='target')
+def vp_group_close(target: str) -> None:
+    """Close every open tab in the group, leaving entries as SUSPENDED.
+
+    Args:
+        target: The name or UUID of the group.
+    """
+    manager = _manager()
+    workspace, group = _resolve_group_target(manager, target)
+    closed, skipped = manager.close_group(workspace.id, group.group_id)
+    if closed == 0 and skipped == 0:
+        # Could be an empty group, or all members already SUSPENDED.
+        state = manager.group_state(workspace.id, group.group_id)
+        if state == 'ARCHIVED':
+            message.info(f"Group '{group.name}' is archived.")
+            return
+        if state == 'SUSPENDED':
+            if manager.group_total_count(workspace.id, group.group_id) == 0:
+                message.info(f"Group '{group.name}' has no open tabs.")
+            else:
+                message.info(f"Group '{group.name}' is already suspended.")
+            return
+        message.info(f"Group '{group.name}' has no open tabs.")
+        return
+    message.info(
+        f"Closed {closed} tab(s) in '{group.name}'; skipped {skipped}.")
+
+
 # VP-F3 (vp/15): three-state reading status + auto-cleanup. The status
 # commands target a single tab within the active workspace; VP-F4 reuses
 # ``WorkspaceManager.set_reading_status`` for its multi-select UI.

@@ -1039,6 +1039,133 @@ class TestBatchOperations:
         assert browser.opened == []
 
 
+class TestCloseGroup:
+
+    """Tests for ``WorkspaceManager.close_group`` (VP-D3)."""
+
+    class _CloseSignal:
+
+        def __init__(self, fail=()):
+            self.calls = []
+            self.fail = set(fail)
+
+        def emit(self, idx):
+            if idx in self.fail:
+                raise RuntimeError('close handler failed')
+            self.calls.append(idx)
+
+    class _CloseWidget:
+
+        def __init__(self, live_tabs, fail=()):
+            self._live = list(live_tabs)
+            self.tabCloseRequested = TestCloseGroup._CloseSignal(fail)
+
+        def indexOf(self, widget):  # noqa: N802 - Qt naming
+            try:
+                return self._live.index(widget)
+            except ValueError:
+                return -1
+
+    class _CloseBrowser:
+
+        def __init__(self, live_tabs, fail=()):
+            self.widget = TestCloseGroup._CloseWidget(live_tabs, fail)
+
+    def _group(self, manager, statuses):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        for index, status in enumerate(statuses, start=1):
+            manager.add_tab(workspace.id, WorkspaceTab(
+                tab_id=index, group_id=group.group_id,
+                open_status=status))
+        return workspace, group
+
+    def _install(self, monkeypatch, browser, registry):
+        def fake_get(name, **_kwargs):
+            if name == 'tab-registry':
+                return registry
+            if name == 'tabbed-browser':
+                return browser
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+    def test_closes_only_open_members_and_emits_once(
+            self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, ['OPEN', 'SUSPENDED', 'OPEN'])
+        live = [object(), object(), object()]
+        registry = {1: live[0], 2: live[1], 3: live[2]}
+        browser = self._CloseBrowser(live)
+        self._install(monkeypatch, browser, registry)
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.close_group(workspace.id, group.group_id)
+
+        assert result == (2, 0)
+        # Only the OPEN tabs (indices 0 and 2) were closed.
+        assert browser.widget.tabCloseRequested.calls == [0, 2]
+        assert changes == [True]
+
+    def test_all_suspended_is_noop(self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, ['SUSPENDED', 'SUSPENDED'])
+        live = [object(), object()]
+        browser = self._CloseBrowser(live)
+        self._install(monkeypatch, browser, {1: live[0], 2: live[1]})
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.close_group(workspace.id, group.group_id)
+
+        assert result == (0, 0)
+        assert browser.widget.tabCloseRequested.calls == []
+        assert changes == []
+
+    def test_open_without_live_match_is_skipped(self, manager, monkeypatch):
+        workspace, group = self._group(manager, ['OPEN', 'OPEN'])
+        live = object()
+        browser = self._CloseBrowser([live])
+        self._install(monkeypatch, browser, {2: live})
+
+        result = manager.close_group(workspace.id, group.group_id)
+
+        assert result == (1, 1)
+        assert browser.widget.tabCloseRequested.calls == [0]
+
+    def test_handler_exception_skips_and_continues(
+            self, manager, monkeypatch):
+        workspace, group = self._group(manager, ['OPEN', 'OPEN'])
+        live = [object(), object()]
+        browser = self._CloseBrowser(live, fail={0})
+        self._install(monkeypatch, browser, {1: live[0], 2: live[1]})
+
+        result = manager.close_group(workspace.id, group.group_id)
+
+        assert result == (1, 1)
+        # The first close raised; the second one still ran.
+        assert browser.widget.tabCloseRequested.calls == [1]
+
+    def test_empty_group_is_noop(self, manager, monkeypatch):
+        workspace, group = self._group(manager, [])
+        browser = self._CloseBrowser([])
+        self._install(monkeypatch, browser, {})
+
+        result = manager.close_group(workspace.id, group.group_id)
+
+        assert result == (0, 0)
+        assert browser.widget.tabCloseRequested.calls == []
+
+    def test_unknown_group_raises(self, manager):
+        workspace = manager.add_workspace('w')
+        with pytest.raises(KeyError):
+            manager.close_group(workspace.id, uuid.uuid4())
+
+    def test_unknown_workspace_is_noop(self, manager):
+        assert manager.close_group(uuid.uuid4(), uuid.uuid4()) == (0, 0)
+
+
 class TestSaveLoad:
 
     def test_state_restored_on_new_manager(self, pers, qapp):
