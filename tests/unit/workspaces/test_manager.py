@@ -1166,6 +1166,189 @@ class TestCloseGroup:
         assert manager.close_group(uuid.uuid4(), uuid.uuid4()) == (0, 0)
 
 
+class TestReopenGroup:
+
+    """Tests for ``WorkspaceManager.reopen_group`` (VP-D4)."""
+
+    class _RaisingBrowser(_FakeBrowser):
+
+        """A browser whose ``tabopen`` raises for the given URLs."""
+
+        def __init__(self, fail_urls=()) -> None:
+            super().__init__()
+            self._fail = set(fail_urls)
+
+        def tabopen(self, url, newwindow: bool = False) -> None:
+            if url.toString() in self._fail:
+                raise RuntimeError('tabopen failed')
+            super().tabopen(url, newwindow)
+
+    class _RaisingWidget(_FakeWidget):
+
+        """A QTabWidget whose ``setCurrentWidget`` always raises."""
+
+        def setCurrentWidget(self, widget: object) -> None:  # noqa: N802
+            raise RuntimeError('setCurrentWidget failed')
+
+    class _RaisingBrowserWidget(_FakeBrowser):
+
+        """A browser whose widget raises on ``setCurrentWidget``."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.widget = TestReopenGroup._RaisingWidget()
+
+    def _group(self, manager, tabs):
+        """Create a workspace + group with ``(status, url)`` tab entries."""
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        for index, (status, url) in enumerate(tabs, start=1):
+            manager.add_tab(workspace.id, WorkspaceTab(
+                tab_id=index, group_id=group.group_id,
+                open_status=status, url=url))
+        return workspace, group
+
+    def _install(self, monkeypatch, resources):
+        """Install a fake objreg exposing ``win_id -> (registry, browser)``."""
+        monkeypatch.setattr(
+            manager_module.objreg, 'window_registry',
+            {win_id: object() for win_id in resources})
+
+        def fake_get(name, **_kwargs):
+            win_id = _kwargs.get('window')
+            if name == 'tab-registry':
+                return resources[win_id][0]
+            if name == 'tabbed-browser':
+                return resources[win_id][1]
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+    def test_opens_all_suspended_when_no_live_match(
+            self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://a.example/'),
+                      ('SUSPENDED', 'https://b.example/')])
+        browser = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser)})
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (2, 0, 0)
+        assert [url for url, _ in browser.opened] == [
+            'https://a.example/', 'https://b.example/']
+        # Only the single final batch emit fires when nothing was reused.
+        assert changes == [True]
+
+    def test_reuses_live_tab_in_other_window(self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://a.example/'),
+                      ('SUSPENDED', 'https://b.example/')])
+        live = _FakeLiveTab('https://a.example/')
+        browser0 = _FakeBrowser()
+        browser1 = _FakeBrowser()
+        self._install(monkeypatch, {
+            0: ({}, browser0),
+            1: ({7: live}, browser1),
+        })
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (1, 1, 0)
+        # The hit is focused in the window that owns it...
+        assert browser1.widget.set_calls == [live]
+        # ...and the miss is opened in the current (win_id 0) window.
+        assert [url for url, _ in browser0.opened] == ['https://b.example/']
+        # The reused entry was flipped to OPEN.
+        assert workspace.tabs[0].open_status == 'OPEN'
+
+    def test_only_suspended_members_processed(self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('OPEN', 'https://open.example/'),
+                      ('SUSPENDED', 'https://susp.example/')])
+        browser = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser)})
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (1, 0, 0)
+        assert [url for url, _ in browser.opened] == ['https://susp.example/']
+
+    def test_empty_url_is_skipped(self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', ''),
+                      ('SUSPENDED', 'https://b.example/')])
+        browser = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser)})
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (1, 0, 1)
+        assert [url for url, _ in browser.opened] == ['https://b.example/']
+
+    def test_tabopen_exception_skips_and_continues(
+            self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://bad.example/'),
+                      ('SUSPENDED', 'https://good.example/')])
+        browser = self._RaisingBrowser(fail_urls={'https://bad.example/'})
+        self._install(monkeypatch, {0: ({}, browser)})
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (1, 0, 1)
+        assert [url for url, _ in browser.opened] == ['https://good.example/']
+
+    def test_set_current_widget_exception_skips(
+            self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://a.example/')])
+        live = _FakeLiveTab('https://a.example/')
+        browser = self._RaisingBrowserWidget()
+        self._install(monkeypatch, {0: ({1: live}, browser)})
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (0, 0, 1)
+        assert browser.opened == []
+        assert workspace.tabs[0].open_status == 'SUSPENDED'
+
+    def test_no_suspended_tabs_emits_nothing(self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('OPEN', 'https://a.example/')])
+        browser = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser)})
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (0, 0, 0)
+        assert changes == []
+
+    def test_no_window_browser_skips(self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://a.example/')])
+        monkeypatch.setattr(
+            manager_module.objreg, 'window_registry', {})
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (0, 0, 1)
+
+    def test_unknown_group_raises(self, manager, monkeypatch):
+        workspace = manager.add_workspace('w')
+        self._install(monkeypatch, {0: ({}, _FakeBrowser())})
+        with pytest.raises(KeyError):
+            manager.reopen_group(workspace.id, uuid.uuid4())
+
+    def test_unknown_workspace_is_noop(self, manager, monkeypatch):
+        self._install(monkeypatch, {0: ({}, _FakeBrowser())})
+        assert manager.reopen_group(uuid.uuid4(), uuid.uuid4()) == (0, 0, 0)
+
+
 class TestSaveLoad:
 
     def test_state_restored_on_new_manager(self, pers, qapp):
