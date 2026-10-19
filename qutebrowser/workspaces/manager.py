@@ -283,6 +283,19 @@ class WorkspaceManager(QObject):
         """Return all groups in a workspace."""
         return list(self._workspaces[workspace_id].groups)
 
+    def get_or_create_inbox(self, workspace_id: uuid.UUID) -> Group:
+        """Return the Inbox group for *workspace_id*, creating it if needed.
+
+        Lookup is case-insensitive on the name ``'Inbox'``. The Inbox is a
+        regular group; users may rename or delete it freely. A subsequent
+        collect after a rename / delete creates a fresh group.
+        """
+        workspace = self._workspaces[workspace_id]
+        for group in workspace.groups:
+            if group.name.lower() == 'inbox':
+                return group
+        return self.create_group(workspace_id, 'Inbox')
+
     # --- group lifecycle (pin / archive / reorder / purge) ---
 
     def _find_group(self, workspace_id: uuid.UUID,
