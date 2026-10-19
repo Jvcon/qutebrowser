@@ -859,4 +859,3 @@ def vp_batch_open_tabs(win_id: int = 0) -> None:
     opened, reused = manager.open_tabs_as_new_tabs(
         workspace.id, selected, win_id=win_id)
     message.info(f"Opened {opened} tab(s); reused {reused}.")
-

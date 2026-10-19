@@ -49,9 +49,6 @@ def _host(url: str) -> str:
 # The three reading states of a WorkspaceTab (issue #15).
 READING_STATUSES = ('FRESH', 'ACTIVE', 'DONE')
 
-# The two open states used by the VP-D1 suspend/restore machinery.
-OPEN_STATUSES = ('OPEN', 'SUSPENDED')
-
 
 def _parse_timestamp(value: str) -> Optional[datetime.datetime]:
     """Parse an ISO 8601 *value* into an aware UTC datetime, or None.
@@ -436,8 +433,6 @@ class WorkspaceManager(QObject):
 
     # --- batched operations (VP-F4) ---
 
-    _READING_STATUSES = frozenset({'FRESH', 'ACTIVE', 'DONE'})
-
     def move_tabs(
             self,
             workspace_id: uuid.UUID,
@@ -465,45 +460,6 @@ class WorkspaceManager(QObject):
         if moved:
             self.changed.emit()
         return moved
-
-    def set_reading_status(
-            self,
-            workspace_id: uuid.UUID,
-            tab_ids: Iterable[int],
-            status: str,
-    ) -> int:
-        """Set the reading status of every known tab in *tab_ids*.
-
-        Args:
-            workspace_id: Workspace owning the tabs.
-            tab_ids: Tab ids to update; unknown ids are skipped silently.
-            status: One of ``FRESH``, ``ACTIVE`` or ``DONE``
-                (case-insensitive).
-
-        Raises:
-            ValueError: If *status* is not one of the allowed values.
-
-        Returns:
-            The number of tabs updated.
-        """
-        normalized = str(status).upper()
-        if normalized not in self._READING_STATUSES:
-            raise ValueError(f"Invalid reading status: {status!r}")
-        workspace = self._workspaces.get(workspace_id)
-        if workspace is None:
-            return 0
-        id_set = set(tab_ids)
-        updated = 0
-        for tab in workspace.tabs:
-            if tab.tab_id in id_set:
-                # ``reading_status`` is owned by the reading-status slice
-                # (VP-F3); ``setattr`` keeps this batch helper usable even
-                # before that field lands on ``WorkspaceTab``.
-                setattr(tab, 'reading_status', normalized)  # noqa: B010
-                updated += 1
-        if updated:
-            self.changed.emit()
-        return updated
 
     def delete_tabs(
             self,
