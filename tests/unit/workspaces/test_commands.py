@@ -7,6 +7,7 @@
 import pathlib
 import uuid
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Optional
 
 import pytest
@@ -37,6 +38,9 @@ class FakeManager:
         self.archived: list[uuid.UUID] = []
         self.deleted: list[uuid.UUID] = []
         self.purged: list[uuid.UUID] = []
+        self.reading_status_sets: list[tuple[list[int], str]] = []
+        self.cleanups: list[tuple[uuid.UUID, int]] = []
+        self.cleanup_result = 0
 
     def add_workspace(self, name: str) -> Workspace:
         workspace = Workspace(id=uuid.uuid4(), name=name,
@@ -137,6 +141,30 @@ class FakeManager:
                 return group
         return self.create_group(workspace_id, 'Inbox')
 
+    # --- reading status / cleanup ---
+
+    def find_tab_by_id(self, workspace_id: uuid.UUID,
+                       tab_id: int) -> Optional[WorkspaceTab]:
+        for tab in self._workspaces[workspace_id].tabs:
+            if tab.tab_id == tab_id:
+                return tab
+        return None
+
+    def set_reading_status(self, workspace_id: uuid.UUID,
+                           tab_ids: list[int], status: str) -> int:
+        wanted = list(tab_ids)
+        count = 0
+        for tab in self._workspaces[workspace_id].tabs:
+            if tab.tab_id in wanted:
+                tab.reading_status = status
+                count += 1
+        self.reading_status_sets.append((wanted, status))
+        return count
+
+    def cleanup_old_done(self, workspace_id: uuid.UUID, days: int) -> int:
+        self.cleanups.append((workspace_id, days))
+        return self.cleanup_result
+
 
 class FakeTab:
 
@@ -154,12 +182,30 @@ class FakeTab:
         return self._title
 
 
+
 @pytest.fixture
 def fake_manager(monkeypatch: pytest.MonkeyPatch) -> FakeManager:
     """A FakeManager wired into the commands module."""
     manager = FakeManager()
     monkeypatch.setattr(commands, '_manager', lambda: manager)
     return manager
+
+
+@pytest.fixture
+def auto_cleanup_days(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Patch ``commands.config`` with a mutable auto_cleanup_days value."""
+    holder = [30]
+
+    class _Val:
+
+        @property
+        def content(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                vertical_panel=SimpleNamespace(
+                    auto_cleanup_days=holder[0]))
+
+    monkeypatch.setattr(commands, 'config', SimpleNamespace(val=_Val()))
+    return holder
 
 
 @pytest.fixture
@@ -471,6 +517,123 @@ class TestGroupCommands:
         fake_manager.add_workspace('w')
         with pytest.raises(cmdutils.CommandError, match='No group'):
             commands.vp_group_delete('nope')
+
+
+class TestStatusCommands:
+
+    def _seed(self, fake_manager: FakeManager) -> tuple[Workspace, WorkspaceTab]:
+        workspace = fake_manager.add_workspace('w')
+        tab = WorkspaceTab(tab_id=1, url='https://example.com/')
+        workspace.tabs.append(tab)
+        return workspace, tab
+
+    def test_set_by_int_normalizes_case(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        _, tab = self._seed(fake_manager)
+
+        commands.vp_status_set('1', 'active')
+
+        assert tab.reading_status == 'ACTIVE'
+        assert fake_manager.reading_status_sets == [([1], 'ACTIVE')]
+
+    def test_set_by_url(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        _, tab = self._seed(fake_manager)
+
+        commands.vp_status_set('https://example.com/', 'done')
+
+        assert tab.reading_status == 'DONE'
+        assert fake_manager.reading_status_sets == [([1], 'DONE')]
+
+    def test_set_unknown_int_raises(self, fake_manager: FakeManager) -> None:
+        self._seed(fake_manager)
+        with pytest.raises(cmdutils.CommandError, match='No tab'):
+            commands.vp_status_set('99', 'DONE')
+
+    def test_set_unknown_url_raises(self, fake_manager: FakeManager) -> None:
+        self._seed(fake_manager)
+        with pytest.raises(cmdutils.CommandError, match='No tab'):
+            commands.vp_status_set('https://nope.example/', 'DONE')
+
+    def test_set_invalid_status_raises(
+            self, fake_manager: FakeManager) -> None:
+        self._seed(fake_manager)
+        with pytest.raises(cmdutils.CommandError, match='status'):
+            commands.vp_status_set('1', 'BOGUS')
+
+    def test_set_requires_active_workspace(
+            self, fake_manager: FakeManager) -> None:
+        with pytest.raises(cmdutils.CommandError, match='No active workspace'):
+            commands.vp_status_set('1', 'DONE')
+
+    def test_cycle_wraps_around(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        _, tab = self._seed(fake_manager)
+
+        commands.vp_status_cycle('1')
+        assert tab.reading_status == 'ACTIVE'
+        commands.vp_status_cycle('1')
+        assert tab.reading_status == 'DONE'
+        commands.vp_status_cycle('1')
+        assert tab.reading_status == 'FRESH'
+
+    def test_cycle_by_url(self, fake_manager: FakeManager) -> None:
+        _, tab = self._seed(fake_manager)
+        commands.vp_status_cycle('https://example.com/')
+        assert tab.reading_status == 'ACTIVE'
+
+
+class TestCleanupCommand:
+
+    def test_uses_configured_days_when_omitted(
+            self,
+            fake_manager: FakeManager,
+            auto_cleanup_days: list[int],
+            messages: list[str],
+    ) -> None:
+        auto_cleanup_days[0] = 45
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.cleanup_result = 2
+
+        commands.vp_cleanup_done()
+
+        assert fake_manager.cleanups == [(workspace.id, 45)]
+        assert messages == ['Removed 2 done tab(s).']
+
+    def test_explicit_days(
+            self,
+            fake_manager: FakeManager,
+            auto_cleanup_days: list[int],
+    ) -> None:
+        auto_cleanup_days[0] = 30
+        workspace = fake_manager.add_workspace('w')
+
+        commands.vp_cleanup_done(60)
+
+        assert fake_manager.cleanups == [(workspace.id, 60)]
+
+    def test_out_of_range_falls_back_to_config_default(
+            self,
+            fake_manager: FakeManager,
+            auto_cleanup_days: list[int],
+            messages: list[str],
+    ) -> None:
+        auto_cleanup_days[0] = 50
+        workspace = fake_manager.add_workspace('w')
+
+        commands.vp_cleanup_done(999)
+
+        assert fake_manager.cleanups == [(workspace.id, 50)]
+        assert any('range' in text for text in messages)
+
+    def test_requires_active_workspace(
+            self,
+            fake_manager: FakeManager,
+            auto_cleanup_days: list[int],
+    ) -> None:
+        auto_cleanup_days[0] = 30
+        with pytest.raises(cmdutils.CommandError, match='No active workspace'):
+            commands.vp_cleanup_done()
 
 
 @pytest.fixture

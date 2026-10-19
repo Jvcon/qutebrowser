@@ -1288,6 +1288,18 @@ content.user_stylesheets:
   default: []
   desc: List of user stylesheet filenames to use.
 
+content.vertical_panel.auto_cleanup_days:
+  default: 30
+  type:
+    name: Int
+    minval: 30
+    maxval: 180
+  desc: >-
+    Retention window (in days) used by `:vp-cleanup-done` for removing
+    `DONE` tab entries which have not been touched recently. Must be
+    between 30 and 180 days; out-of-range values passed to the command
+    fall back to this setting.
+
 content.webgl:
   default: true
   type: Bool

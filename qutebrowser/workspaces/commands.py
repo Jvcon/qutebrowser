@@ -17,10 +17,12 @@ from collections.abc import Callable
 from typing import Any, Optional
 
 from qutebrowser.api import cmdutils
+from qutebrowser.config import config
 from qutebrowser.utils import message, objreg
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
-from qutebrowser.workspaces.manager import TabMetadata, WorkspaceManager
-from qutebrowser.workspaces.model import Group, Workspace
+from qutebrowser.workspaces.manager import (READING_STATUSES, TabMetadata,
+                                            WorkspaceManager)
+from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
 
 #: Name of the default group collect commands land in when none is given.
 INBOX_GROUP_NAME = 'Inbox'
@@ -543,3 +545,123 @@ def _make_group_delete_action(
         message.info(f"Deleted group '{name}' ({removed} tabs).")
 
     return delete
+
+
+# VP-F3 (vp/15): three-state reading status + auto-cleanup. The status
+# commands target a single tab within the active workspace; VP-F4 reuses
+# ``WorkspaceManager.set_reading_status`` for its multi-select UI.
+_CYCLE_ORDER = {
+    'FRESH': 'ACTIVE',
+    'ACTIVE': 'DONE',
+    'DONE': 'FRESH',
+}
+
+_CLEANUP_MIN_DAYS = 30
+_CLEANUP_MAX_DAYS = 180
+
+
+def _resolve_status_target(
+    manager: WorkspaceManager,
+    workspace: Workspace,
+    target: str,
+) -> WorkspaceTab:
+    """Resolve *target* (an int tab id or a URL) to a workspace tab.
+
+    An integer is looked up by ``tab_id``; anything else is treated as a URL
+    and matched against the first tab whose ``url`` equals *target*.
+
+    Raises:
+        cmdutils.CommandError: If no tab matches.
+    """
+    try:
+        tab_id = int(target)
+    except ValueError:
+        tab_id = None
+
+    if tab_id is not None:
+        tab = manager.find_tab_by_id(workspace.id, tab_id)
+        if tab is None:
+            raise cmdutils.CommandError(f"No tab with id {tab_id}.")
+        return tab
+
+    for tab in workspace.tabs:
+        if tab.url == target:
+            return tab
+    raise cmdutils.CommandError(f"No tab matching URL '{target}'.")
+
+
+@cmdutils.register(name='vp-status-set')
+@cmdutils.argument('target', metavar='target')
+@cmdutils.argument('status', metavar='status')
+def vp_status_set(target: str, status: str) -> None:
+    """Set the reading status of a tab.
+
+    *target* is either a tab id (integer) or a URL. *status* is
+    case-insensitive and must be one of ``fresh``, ``active`` or ``done``.
+
+    Args:
+        target: Tab id or URL of the tab to update.
+        status: New reading status.
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+
+    normalized = status.upper()
+    if normalized not in READING_STATUSES:
+        raise cmdutils.CommandError(
+            f"Unknown reading status '{status}'; expected one of "
+            f"{', '.join(READING_STATUSES)}.")
+
+    tab = _resolve_status_target(manager, workspace, target)
+    manager.set_reading_status(workspace.id, [tab.tab_id], normalized)
+    message.info(f"Set tab {tab.tab_id} status to {normalized}.")
+
+
+@cmdutils.register(name='vp-status-cycle')
+@cmdutils.argument('target', metavar='target')
+def vp_status_cycle(target: str) -> None:
+    """Cycle a tab's reading status FRESH -> ACTIVE -> DONE -> FRESH.
+
+    Args:
+        target: Tab id or URL of the tab to update.
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+
+    tab = _resolve_status_target(manager, workspace, target)
+    current = getattr(tab, 'reading_status', 'FRESH')
+    next_status = _CYCLE_ORDER.get(current, 'FRESH')
+    manager.set_reading_status(workspace.id, [tab.tab_id], next_status)
+    message.info(f"Cycled tab {tab.tab_id} status to {next_status}.")
+
+
+@cmdutils.register(name='vp-cleanup-done')
+@cmdutils.argument('days', metavar='days')
+def vp_cleanup_done(days: int | None = None) -> None:
+    """Remove ``DONE`` tabs which have gone untouched for a while.
+
+    Only suspended tabs marked ``DONE`` older than the threshold are
+    removed; open tabs and groups are left alone. When *days* is omitted the
+    ``content.vertical_panel.auto_cleanup_days`` setting is used. A *days*
+    value outside ``[30, 180]`` is ignored in favour of the configured
+    default.
+
+    Args:
+        days: Optional retention window in days (30-180).
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+
+    configured = config.val.content.vertical_panel.auto_cleanup_days
+    if days is None:
+        effective = configured
+    elif _CLEANUP_MIN_DAYS <= days <= _CLEANUP_MAX_DAYS:
+        effective = days
+    else:
+        message.info(
+            f"Days {days} out of range "
+            f"({_CLEANUP_MIN_DAYS}-{_CLEANUP_MAX_DAYS}); using {configured}.")
+        effective = configured
+
+    removed = manager.cleanup_old_done(workspace.id, effective)
+    message.info(f"Removed {removed} done tab(s).")
