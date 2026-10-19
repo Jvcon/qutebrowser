@@ -362,6 +362,77 @@ class TestOpenStatus:
                 for tab in manager.suspended_tabs(workspace.id)] == [2]
 
 
+class TestGroupState:
+
+    """Group running-state queries (VP-D2)."""
+
+    def _group_with_tabs(self, manager, statuses):
+        """Create a group with one tab per entry in *statuses*."""
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        for index, status in enumerate(statuses, start=1):
+            manager.add_tab(workspace.id, WorkspaceTab(
+                tab_id=index, group_id=group.group_id, open_status=status))
+        return workspace, group
+
+    def test_empty_group_is_suspended(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        assert manager.group_state(workspace.id, group.group_id) == 'SUSPENDED'
+
+    def test_all_suspended_is_suspended(self, manager):
+        workspace, group = self._group_with_tabs(
+            manager, ['SUSPENDED', 'SUSPENDED'])
+        assert manager.group_state(workspace.id, group.group_id) == 'SUSPENDED'
+
+    def test_any_open_is_open(self, manager):
+        workspace, group = self._group_with_tabs(
+            manager, ['SUSPENDED', 'OPEN', 'SUSPENDED'])
+        assert manager.group_state(workspace.id, group.group_id) == 'OPEN'
+
+    def test_archived_wins_over_open(self, manager):
+        workspace, group = self._group_with_tabs(manager, ['OPEN'])
+        manager.archive_group(workspace.id, group.group_id)
+        assert manager.group_state(workspace.id, group.group_id) == 'ARCHIVED'
+
+    def test_open_and_total_count(self, manager):
+        workspace, group = self._group_with_tabs(
+            manager, ['OPEN', 'SUSPENDED', 'OPEN'])
+        # Standalone and other-group tabs do not count.
+        manager.add_tab(workspace.id, WorkspaceTab(
+            tab_id=90, open_status='OPEN'))
+        other = manager.create_group(workspace.id, 'other')
+        manager.add_tab(workspace.id, WorkspaceTab(
+            tab_id=91, group_id=other.group_id, open_status='OPEN'))
+
+        assert manager.group_open_count(workspace.id, group.group_id) == 2
+        assert manager.group_total_count(workspace.id, group.group_id) == 3
+        assert manager.group_open_count(workspace.id, other.group_id) == 1
+        assert manager.group_total_count(workspace.id, other.group_id) == 1
+
+    def test_empty_group_counts_are_zero(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        assert manager.group_open_count(workspace.id, group.group_id) == 0
+        assert manager.group_total_count(workspace.id, group.group_id) == 0
+
+    def test_unknown_group_raises_key_error(self, manager):
+        workspace = manager.add_workspace('w')
+        with pytest.raises(KeyError):
+            manager.group_state(workspace.id, uuid.uuid4())
+
+    def test_queries_do_not_emit_changed(self, manager):
+        workspace, group = self._group_with_tabs(manager, ['OPEN'])
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.group_open_count(workspace.id, group.group_id)
+        manager.group_total_count(workspace.id, group.group_id)
+        manager.group_state(workspace.id, group.group_id)
+
+        assert changes == []
+
+
 class TestCollect:
 
     def test_collect_fresh_url_captures_metadata(self, manager):

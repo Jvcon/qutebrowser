@@ -94,6 +94,19 @@ class Group:
             self.created_at = datetime.datetime.now(
                 datetime.timezone.utc).isoformat()
 
+    @property
+    def state(self) -> str:
+        """Return ``'ARCHIVED'`` if archived, else ``'UNKNOWN'``.
+
+        The OPEN vs SUSPENDED distinction is resolved by
+        :meth:`WorkspaceManager.group_state`, which has access to the
+        workspace's tab list.  This property is the local view: archived
+        wins, everything else is ``'UNKNOWN'`` until the manager
+        classifies it (``'UNKNOWN'`` means "the model layer should call
+        ``manager.group_state`` to resolve").
+        """
+        return 'ARCHIVED' if self.archived else 'UNKNOWN'
+
     def rename(self, new_name: str) -> None:
         """Rename this group."""
         self.name = new_name
