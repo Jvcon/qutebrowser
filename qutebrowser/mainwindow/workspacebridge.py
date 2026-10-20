@@ -66,7 +66,7 @@ from qutebrowser.qt.core import QModelIndex, QObject, QTimer, QUrl, Qt
 from qutebrowser.qt.widgets import QWidget
 
 from qutebrowser.mainwindow.tabtree import Status, TabTreeModel
-from qutebrowser.utils import objreg
+from qutebrowser.utils import objreg, qtutils
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import WorkspaceManager
 from qutebrowser.workspaces.model import Workspace, WorkspaceTab
@@ -304,17 +304,22 @@ class WorkspaceBridge(QObject):
         # auto-locate a dying tab.
         if tab.tab_id not in self._attached:
             return
-        url_str = self._live_url(tab)
-        if not url_str:
+        url = self._live_url(tab)
+        if not url:
             return
-        if QUrl(url_str).scheme().lower() in _INTERNAL_SCHEMES:
+        qurl = QUrl(url)
+        try:
+            qtutils.ensure_valid(qurl)
+        except qtutils.QtValueError:
+            return  # invalid URL — treat as no-op
+        if qurl.scheme() in _INTERNAL_SCHEMES:
             return
         workspace_id = self._active_workspace_id()
         if workspace_id is None:
             return
         entry = self._manager.find_tab_by_id(workspace_id, tab.tab_id)
         if entry is None:
-            entry = self._manager.find_tab_by_url(workspace_id, url_str)
+            entry = self._manager.find_tab_by_url(workspace_id, url)
         if entry is None:
             return
         self._tab_tree.group_focus_requested.emit(

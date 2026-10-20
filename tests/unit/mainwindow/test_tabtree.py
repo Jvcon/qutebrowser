@@ -518,7 +518,7 @@ class TestAutoLocate:
 
     def test_highlight_role_reflects(self, model, monkeypatch):
         """set_highlighted_tab_id flips HighlightRole for the tab row."""
-        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer())
+        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer)
         model.set_highlighted_tab_id(20)
         index = model.index(2, 0, QModelIndex())  # standalone tab id 20
         assert index.data(tabtree.HighlightRole) is True
@@ -527,25 +527,56 @@ class TestAutoLocate:
 
     def test_highlight_resets_after_timeout(self, model, monkeypatch):
         """The scheduled callback clears the highlight."""
-        calls = []
-
-        class FakeQTimer:
-            @staticmethod
-            def singleShot(ms, callback):  # noqa: N802 - Qt naming
-                calls.append((ms, callback))
-
-        monkeypatch.setattr(tabtree, 'QTimer', FakeQTimer)
+        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer)
         model.set_highlighted_tab_id(20, timeout_ms=1234)
 
-        assert len(calls) == 1
-        assert calls[0][0] == 1234
+        timer = model._highlight_timer
+        assert timer is not None
+        assert timer.single_shot is True
+        assert timer.interval == 1234
         assert model.index(2, 0, QModelIndex()).data(
             tabtree.HighlightRole) is True
 
-        calls[0][1]()  # fire the scheduled reset
+        timer.timeout.emit()  # fire the scheduled reset
 
         assert model.index(2, 0, QModelIndex()).data(
             tabtree.HighlightRole) is False
+
+    def test_stale_timer_cannot_clear_newer_highlight(
+            self, model, monkeypatch):
+        """A -> B -> A keeps only the latest timer, even for the same id.
+
+        The old implementation used independent ``QTimer.singleShot``
+        callbacks; the first A callback could still be pending and would
+        clear the freshly re-highlighted A prematurely.  The instance timer
+        cancels/replaces the previous one so only the latest stays live.
+        """
+        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer)
+
+        model.set_highlighted_tab_id(20)
+        first = model._highlight_timer
+        model.set_highlighted_tab_id(21)
+        second = model._highlight_timer
+        model.set_highlighted_tab_id(20)
+        latest = model._highlight_timer
+
+        assert first is not None and second is not None
+        assert latest is not None
+        assert first is not second
+        assert second is not latest
+        # The superseded timers were cancelled and scheduled for deletion.
+        assert first.active is False and first.deleted is True
+        assert second.active is False and second.deleted is True
+        assert latest.active is True
+        assert model._highlighted_tab_id == 20
+
+        # A cancelled timer never fires, so it cannot wipe the newer A.
+        first.timeout.emit()
+        assert model._highlighted_tab_id == 20
+
+        # Advancing the live timer clears the latest A once.
+        latest.timeout.emit()
+        assert model._highlighted_tab_id is None
 
     def test_focus_group_and_tab_expands_and_returns_index(self, model, group_id):
         """focus_group_and_tab expands the group and returns the tab index."""
@@ -570,13 +601,57 @@ class TestAutoLocate:
         assert not index.isValid()
 
 
+class _FakeTimeout:
+
+    """Minimal ``QTimer.timeout`` signal stand-in.
+
+    ``emit`` only fires while the owning timer is active, mirroring Qt's
+    behaviour for a stopped / deleted timer.
+    """
+
+    def __init__(self, owner: '_FakeQTimer') -> None:
+        self._owner = owner
+        self._callbacks = []
+
+    def connect(self, callback) -> None:
+        self._callbacks.append(callback)
+
+    def emit(self) -> None:
+        if not self._owner.active:
+            return
+        for callback in list(self._callbacks):
+            callback()
+
+
 class _FakeQTimer:
 
-    """No-op QTimer stand-in so scheduled resets never fire in tests."""
+    """``QTimer`` stand-in exposing start/stop and a fireable timeout.
 
-    @staticmethod
-    def singleShot(ms, callback):  # noqa: N802 - Qt naming
-        return None
+    The model now keeps a per-highlight ``QTimer`` instance, so this fake
+    supports instantiation (unlike the previous no-op stand-in) and lets
+    tests fire the timeout synchronously.
+    """
+
+    def __init__(self, parent=None) -> None:
+        self.parent = parent
+        self.timeout = _FakeTimeout(self)
+        self.interval = None
+        self.single_shot = False
+        self.active = False
+        self.deleted = False
+
+    def setSingleShot(self, value) -> None:  # noqa: N802 - Qt naming
+        self.single_shot = value
+
+    def start(self, ms) -> None:  # noqa: N802 - Qt naming
+        self.interval = ms
+        self.active = True
+
+    def stop(self) -> None:  # noqa: N802 - Qt naming
+        self.active = False
+
+    def deleteLater(self) -> None:  # noqa: N802 - Qt naming
+        self.deleted = True
 
 
 class TestTabTreeItemDelegate:
@@ -806,7 +881,7 @@ class TestTabTreeItemDelegate:
 
     def test_paint_highlight_and_active_group(self, model, option, monkeypatch):
         """HighlightRole and ActiveGroupRole paint without raising."""
-        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer())
+        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer)
         group_id = model._workspace.groups[0].group_id
         model.set_active_group_id(group_id)
         model.set_highlighted_tab_id(20)

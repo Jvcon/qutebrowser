@@ -602,6 +602,23 @@ class TestAutoLocate:
 
         assert emitted == []
 
+    def test_invalid_url_skipped_via_ensure_valid(
+            self, browser, manager, qtbot, monkeypatch):
+        """``_auto_locate`` validates the URL and bails on an invalid one."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2, url=QUrl('https://b.example/')))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        emitted = self._collect(tree)
+
+        def _raise(_qurl):
+            raise workspacebridge.qtutils.QtValueError(QUrl())
+
+        monkeypatch.setattr(workspacebridge.qtutils, 'ensure_valid', _raise)
+
+        browser.current_tab_changed.emit(tab_b)
+
+        assert emitted == []
+
     def test_empty_url_skipped(self, browser, manager, qtbot):
         """A switch to a tab without a URL does not emit."""
         _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
