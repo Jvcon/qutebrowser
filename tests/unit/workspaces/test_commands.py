@@ -1056,7 +1056,27 @@ class TestTabCollectCommand:
 
         assert workspace.tabs[0].group_id == group.group_id
         assert manager.list_groups(workspace.id) == [group]
-        assert messages == ["Collected tab into 'g'."]
+        assert messages == ["Collected tab into group 'g'."]
+
+    def test_same_url_entry_is_reused_and_rebound(
+            self,
+            pers: tuple[WorkspacePersistence, PinnedPersistence],
+            messages: list[str],
+            monkeypatch: pytest.MonkeyPatch,
+            qapp,
+    ) -> None:
+        """VP-D1: a same-URL entry is reused and rebound to the live tab."""
+        manager, workspace = _wire_manager(pers, monkeypatch)
+        workspace.tabs.append(
+            WorkspaceTab(tab_id=1, url='https://example.com/'))
+        tab = FakeTab(9, url='https://example.com/')
+
+        commands.tab_collect(tab)
+
+        assert [t.tab_id for t in workspace.tabs] == [9]
+        groups = manager.list_groups(workspace.id)
+        assert workspace.tabs[0].group_id == groups[0].group_id
+        assert messages == ["Collected tab into 'Inbox'."]
 
 
 class TestCollectAllInbox:
@@ -1078,7 +1098,7 @@ class TestCollectAllInbox:
         groups = manager.list_groups(workspace.id)
         assert [group.name for group in groups] == ['Inbox']
         assert workspace.tabs[0].group_id == groups[0].group_id
-        assert messages == ["Collected 1 tab(s) into 'Inbox'; skipped 0."]
+        assert messages == ["Collected 1 tab(s) into 'Inbox'."]
 
     def test_empty_window_without_group_is_message(
             self,

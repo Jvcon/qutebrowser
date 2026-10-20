@@ -276,32 +276,22 @@ def tab_collect(tab: Any, group_id: str = '') -> None:
 
     metadata = _metadata_from_tab(tab)
 
-    # D1: a tab whose URL already has a registered entry (e.g. one created
-    # by WorkspaceBridge when the tab was opened) is only "associated" with
-    # that entry.  The bridge already fired ``_on_new_tab`` for it, so mark
-    # the existing entry OPEN and skip collecting/fetching again to avoid
-    # creating a duplicate entry or a redundant ``tabentry_fetch``.
-    if metadata.url:
-        existing = next(
-            (entry for entry in workspace.tabs
-             if entry.url == metadata.url),
-            None,
-        )
-        if existing is not None:
-            manager.set_open_status(workspace.id, existing.tab_id, 'OPEN')
-            if existing.tab_id != tab.tab_id:
-                # VP-D1: bind the live tab's id to the retained entry so the
-                # bridge tracks *this* tab for the same-URL workspace row.
-                manager.update_tab_metadata(
-                    workspace.id, existing.tab_id, new_tab_id=tab.tab_id)
-            message.info("Collected tab.")
-            return
-
+    # VP-F5: an explicit group collects into that group; no group collects
+    # into the workspace Inbox.  VP-D1: the entry may already exist for this
+    # URL (created by the bridge when the tab opened); ``collect_tab`` upserts
+    # by URL so no duplicate is created, and the entry is rebound to the
+    # live tab's id below so the bridge tracks this tab for the same-URL row.
     collected = manager.collect_tab(
         workspace.id, tab.tab_id, group, metadata=metadata)
-    _persist_description(manager, workspace.id, collected.tab_id, tab)
+    if collected.tab_id != tab.tab_id:
+        manager.update_tab_metadata(
+            workspace.id, collected.tab_id, new_tab_id=tab.tab_id)
+    _persist_description(manager, workspace.id, tab.tab_id, tab)
 
-    message.info(f"Collected tab into '{target_name}'.")
+    if group_id:
+        message.info(f"Collected tab into group '{target_name}'.")
+    else:
+        message.info(f"Collected tab into '{target_name}'.")
 
 
 @cmdutils.register(name='vp-collect-all')
@@ -350,9 +340,12 @@ def vp_collect_all(group_id: str = '', win_id: int = 0) -> None:
         if tab.tab_id in collected:
             _persist_description(manager, workspace.id, tab.tab_id, tab)
 
-    message.info(
-        f"Collected {len(collected)} tab(s) into '{target_name}'; "
-        f"skipped {len(skipped)}.")
+    if group_id:
+        message.info(
+            f"Collected {len(collected)} tab(s) into group '{target_name}'.")
+    else:
+        message.info(
+            f"Collected {len(collected)} tab(s) into '{target_name}'.")
 
 
 # VP-F2 (vp/14): group management commands. The resolver is renamed to
