@@ -1082,6 +1082,22 @@ class TestBatchOperations:
         assert browser.opened == []
 
 
+class _PinData:
+
+    """Minimal ``data`` stand-in carrying a ``pinned`` flag."""
+
+    def __init__(self, pinned: bool = False) -> None:
+        self.pinned = pinned
+
+
+class _LiveWithPin:
+
+    """Live-tab stand-in exposing ``data.pinned`` for close_group tests."""
+
+    def __init__(self, pinned: bool = False) -> None:
+        self.data = _PinData(pinned)
+
+
 class TestCloseGroup:
 
     """Tests for ``WorkspaceManager.close_group`` (VP-D3)."""
@@ -1207,6 +1223,60 @@ class TestCloseGroup:
 
     def test_unknown_workspace_is_noop(self, manager):
         assert manager.close_group(uuid.uuid4(), uuid.uuid4()) == (0, 0)
+
+    def test_pinned_tab_is_skipped(self, manager, monkeypatch):
+        workspace, group = self._group(manager, ['OPEN'])
+        pinned = _LiveWithPin(pinned=True)
+        browser = self._CloseBrowser([pinned])
+        self._install(monkeypatch, browser, {1: pinned})
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.close_group(workspace.id, group.group_id)
+
+        assert result == (0, 1)
+        assert browser.widget.tabCloseRequested.calls == []
+        assert changes == []
+
+    def test_archived_group_is_noop(self, manager, monkeypatch):
+        workspace, group = self._group(manager, ['OPEN'])
+        manager.archive_group(workspace.id, group.group_id)
+        live = object()
+        browser = self._CloseBrowser([live])
+        self._install(monkeypatch, browser, {1: live})
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.close_group(workspace.id, group.group_id)
+
+        assert result == (0, 0)
+        assert browser.widget.tabCloseRequested.calls == []
+        assert changes == []
+
+    def test_win_id_used_for_objreg_lookups(self, manager, monkeypatch):
+        workspace, group = self._group(manager, ['OPEN'])
+        live = object()
+        browser = self._CloseBrowser([live])
+        seen = []
+
+        def fake_get(name, **kwargs):
+            seen.append((name, kwargs.get('window')))
+            if name == 'tab-registry':
+                return {1: live}
+            if name == 'tabbed-browser':
+                return browser
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+        result = manager.close_group(workspace.id, group.group_id, win_id=1)
+
+        assert result == (1, 0)
+        assert seen == [
+            ('tab-registry', 1),
+            ('tabbed-browser', 1),
+        ]
+        assert browser.widget.tabCloseRequested.calls == [0]
 
 
 class TestReopenGroup:
