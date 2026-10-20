@@ -6,6 +6,7 @@
 
 import datetime
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -698,6 +699,228 @@ class TestReadingStatus:
         manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
         assert workspace.tabs[0].reading_status == 'FRESH'
         assert manager.tabs_by_status(workspace.id, 'FRESH')
+
+
+def _patch_auto_suspend_config(monkeypatch, *, enabled=True, days=30):
+    """Patch the manager module's config accessor for auto-suspend tests."""
+    panel = SimpleNamespace(
+        auto_suspend_enabled=enabled,
+        auto_suspend_done_days=days,
+    )
+    monkeypatch.setattr(
+        manager_module, 'config',
+        SimpleNamespace(
+            val=SimpleNamespace(
+                content=SimpleNamespace(vertical_panel=panel))))
+
+
+class TestDoneAt:
+
+    def test_done_stamps_done_at(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        manager.set_reading_status(workspace.id, [1], 'DONE')
+
+        done_at = workspace.tabs[0].done_at
+        assert done_at is not None
+        assert done_at.endswith('+00:00')
+
+    def test_done_to_active_clears_done_at(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        manager.set_reading_status(workspace.id, [1], 'DONE')
+
+        manager.set_reading_status(workspace.id, [1], 'ACTIVE')
+
+        assert workspace.tabs[0].done_at is None
+
+    def test_active_to_done_stamps_fresh_done_at(self, manager):
+        workspace = manager.add_workspace('w')
+        tab = WorkspaceTab(tab_id=1, done_at='2000-01-01T00:00:00+00:00')
+        manager.add_tab(workspace.id, tab)
+        manager.set_reading_status(workspace.id, [1], 'ACTIVE')
+
+        manager.set_reading_status(workspace.id, [1], 'DONE')
+
+        assert tab.done_at is not None
+        assert tab.done_at != '2000-01-01T00:00:00+00:00'
+
+    @pytest.mark.parametrize('status', ['FRESH', 'ACTIVE'])
+    def test_non_done_clears_done_at(self, manager, status):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        manager.set_reading_status(workspace.id, [1], status)
+
+        assert workspace.tabs[0].done_at is None
+
+
+class TestAutoSuspendDueTabs:
+
+    def _add(self, manager, workspace, tab_id, *, open_status='OPEN',
+             reading_status='DONE', done_at='2000-01-01T00:00:00+00:00',
+             group_id=None):
+        tab = WorkspaceTab(
+            tab_id=tab_id,
+            open_status=open_status,
+            reading_status=reading_status,
+            done_at=done_at,
+        )
+        if group_id is not None:
+            tab.assign_group(group_id)
+        manager.add_tab(workspace.id, tab)
+        return tab
+
+    def test_suspends_all_open_done_stale(self, manager):
+        workspace = manager.add_workspace('w')
+        for tab_id in (1, 2, 3):
+            self._add(manager, workspace, tab_id)
+
+        suspended = manager.auto_suspend_due_tabs(workspace.id, 30)
+
+        assert suspended == 3
+        assert [tab.open_status for tab in workspace.tabs] == [
+            'SUSPENDED', 'SUSPENDED', 'SUSPENDED']
+
+    def test_emits_changed_once_for_batch(self, manager):
+        workspace = manager.add_workspace('w')
+        for tab_id in (1, 2, 3):
+            self._add(manager, workspace, tab_id)
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.auto_suspend_due_tabs(workspace.id, 30)
+
+        assert len(changes) == 1
+
+    def test_skips_fresh_and_suspended(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, reading_status='FRESH')
+        self._add(manager, workspace, 2, open_status='SUSPENDED')
+
+        assert manager.auto_suspend_due_tabs(workspace.id, 30) == 0
+        assert [tab.open_status for tab in workspace.tabs] == [
+            'OPEN', 'SUSPENDED']
+
+    def test_skips_missing_done_at(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1, done_at=None)
+
+        assert manager.auto_suspend_due_tabs(workspace.id, 30) == 0
+        assert workspace.tabs[0].open_status == 'OPEN'
+
+    def test_skips_archived_group_members(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'archived')
+        manager.archive_group(workspace.id, group.group_id)
+        self._add(manager, workspace, 1, group_id=group.group_id)
+
+        assert manager.auto_suspend_due_tabs(workspace.id, 30) == 0
+        assert workspace.tabs[0].open_status == 'OPEN'
+
+    def test_threshold_boundary(self, manager, monkeypatch):
+        fixed_now = datetime.datetime.now(
+            datetime.timezone.utc).replace(microsecond=0)
+        frozen = SimpleNamespace(
+            datetime=type(
+                'FrozenDatetime', (datetime.datetime,),
+                {'now': classmethod(lambda cls, tz=None: fixed_now)}),
+            timedelta=datetime.timedelta,
+            timezone=datetime.timezone,
+        )
+        monkeypatch.setattr(manager_module, 'datetime', frozen)
+        workspace = manager.add_workspace('w')
+        exactly_30 = (fixed_now - datetime.timedelta(days=30)).isoformat()
+        older_31 = (fixed_now - datetime.timedelta(days=31)).isoformat()
+        self._add(manager, workspace, 1, done_at=exactly_30)
+        self._add(manager, workspace, 2, done_at=older_31)
+
+        suspended = manager.auto_suspend_due_tabs(workspace.id, 30)
+
+        assert suspended == 1
+        assert workspace.tabs[0].open_status == 'OPEN'
+        assert workspace.tabs[1].open_status == 'SUSPENDED'
+
+    def test_uses_configured_days_when_omitted(self, manager, monkeypatch):
+        _patch_auto_suspend_config(monkeypatch, days=30)
+        workspace = manager.add_workspace('w')
+        self._add(
+            manager, workspace, 1,
+            done_at=(datetime.datetime.now(datetime.timezone.utc)
+                     - datetime.timedelta(days=40)).isoformat())
+
+        assert manager.auto_suspend_due_tabs(workspace.id) == 1
+
+    def test_scan_skips_when_disabled(self, manager, monkeypatch):
+        _patch_auto_suspend_config(monkeypatch, enabled=False)
+        workspace = manager.add_workspace('w')
+        self._add(manager, workspace, 1)
+        scans = []
+        monkeypatch.setattr(
+            manager, 'auto_suspend_due_tabs',
+            lambda workspace_id: scans.append(workspace_id) or 0)
+
+        assert manager._scan_all_workspaces_for_stale() == 0
+        assert scans == []
+
+    def test_scan_suspends_across_workspaces(self, manager, monkeypatch):
+        _patch_auto_suspend_config(monkeypatch, enabled=True)
+        first = manager.add_workspace('a')
+        second = manager.add_workspace('b')
+        self._add(manager, first, 1)
+        self._add(manager, second, 2)
+
+        assert manager._scan_all_workspaces_for_stale() == 2
+
+    def test_start_scheduler_arms_repeating_timer(self, manager, monkeypatch):
+        scans = []
+        monkeypatch.setattr(
+            manager, '_scan_all_workspaces_for_stale',
+            lambda: scans.append(True) or 0)
+        seen = {}
+
+        class FakeSignal:
+
+            def connect(self, callback):
+                seen['timeout'] = callback
+
+        class FakeTimer:
+
+            def __init__(self, parent=None):
+                self.parent = parent
+                self.interval = None
+                self.started = False
+                self.timeout = FakeSignal()
+
+            def setInterval(self, interval):
+                self.interval = interval
+
+            def start(self):
+                self.started = True
+
+        class FakeQTimer:
+
+            def __new__(cls, parent=None):
+                return FakeTimer(parent)
+
+            @staticmethod
+            def singleShot(msec, callback):
+                seen['single_shot'] = (msec, callback)
+
+        monkeypatch.setattr(manager_module, 'QTimer', FakeQTimer)
+
+        manager.start_auto_suspend_scheduler(parent=object())
+
+        msec, deferred = seen['single_shot']
+        assert msec == 0
+        deferred()
+        assert scans == [True]
+        timer = manager._auto_suspend_timer
+        assert timer.interval == 12 * 3600 * 1000
+        assert timer.started
+        timer.timeout.connect  # noqa: B018 - connected in the scheduler
+        assert callable(seen['timeout'])
 
 
 class TestCleanupOldDone:

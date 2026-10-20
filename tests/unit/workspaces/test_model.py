@@ -225,6 +225,22 @@ class TestWorkspaceTab:
         assert d['reading_status'] == status
         assert model.WorkspaceTab.from_dict(d).reading_status == status
 
+    def test_done_at_defaults_to_none(self):
+        assert model.WorkspaceTab(tab_id=1).done_at is None
+
+    def test_done_at_roundtrip(self):
+        tab = model.WorkspaceTab(
+            tab_id=1, done_at='2026-01-01T00:00:00+00:00')
+        d = tab.to_dict()
+        assert d['done_at'] == '2026-01-01T00:00:00+00:00'
+        restored = model.WorkspaceTab.from_dict(d)
+        assert restored.done_at == '2026-01-01T00:00:00+00:00'
+        assert restored == tab
+
+    def test_from_dict_without_done_at_defaults_none(self):
+        tab = model.WorkspaceTab.from_dict({'tab_id': 7})
+        assert tab.done_at is None
+
 
 class TestWorkspace:
 

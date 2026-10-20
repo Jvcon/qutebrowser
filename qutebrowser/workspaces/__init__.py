@@ -44,6 +44,7 @@ def init(
     pinned_persistence = PinnedPersistence(profile_name=profile_name)
     manager = WorkspaceManager(persistence, pinned_persistence)
     manager.load()
+    manager.start_auto_suspend_scheduler(parent=manager)
     save_manager.add_saveable('workspace-manager', manager.save,
                               manager.changed)
     objreg.register('workspace-manager', manager, update=True)

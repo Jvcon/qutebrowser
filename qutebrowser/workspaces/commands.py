@@ -772,6 +772,39 @@ def vp_cleanup_done(days: int | None = None) -> None:
     if removed > 0:
         message.info(f"Removed {removed} done tab(s).")
 
+
+@cmdutils.register(name='vp-suspend-stale')
+@cmdutils.argument('days', metavar='days')
+def vp_suspend_stale(days: int | None = None) -> None:
+    """Suspend ``DONE`` tabs which have gone untouched for a while.
+
+    Only open tabs marked ``DONE`` older than the threshold are flipped to
+    ``SUSPENDED``; the live browser tab is left alone. When *days* is omitted
+    the ``content.vertical_panel.auto_suspend_done_days`` setting is used. A
+    *days* value outside ``[30, 180]`` is ignored in favour of the configured
+    default.
+
+    Args:
+        days: Optional retention window in days (30-180).
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+
+    configured = config.val.content.vertical_panel.auto_suspend_done_days
+    if days is None:
+        effective = configured
+    elif _CLEANUP_MIN_DAYS <= days <= _CLEANUP_MAX_DAYS:
+        effective = days
+    else:
+        message.info(
+            f"Days {days} out of range "
+            f"({_CLEANUP_MIN_DAYS}-{_CLEANUP_MAX_DAYS}); using {configured}.")
+        effective = configured
+
+    suspended = manager.auto_suspend_due_tabs(workspace.id, effective)
+    if suspended:
+        message.info(f"Suspended {suspended} stale tab(s).")
+
 # VP-F4 (vp/16): multi-select + batch operations. The selection itself lives
 # in the window's TabTree model; these commands drive it and hand the selected
 # tab ids to the batched WorkspaceManager APIs.

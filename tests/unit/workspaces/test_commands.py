@@ -41,6 +41,8 @@ class FakeManager:
         self.reading_status_sets: list[tuple[set[int], str]] = []
         self.cleanups: list[tuple[uuid.UUID, int]] = []
         self.cleanup_result = 0
+        self.auto_suspends: list[tuple[uuid.UUID, Optional[int]]] = []
+        self.auto_suspend_result = 0
         self.moved: list[tuple[set[int], Optional[uuid.UUID]]] = []
         self.statuses: list[tuple[set[int], str]] = []
         self.deleted_tabs: list[int] = []
@@ -228,6 +230,11 @@ class FakeManager:
         self.cleanups.append((workspace_id, days))
         return self.cleanup_result
 
+    def auto_suspend_due_tabs(
+            self, workspace_id: uuid.UUID, days: Optional[int] = None) -> int:
+        self.auto_suspends.append((workspace_id, days))
+        return self.auto_suspend_result
+
     # --- batched operations (VP-F4) ---
 
     def add_tab(self, workspace_id: uuid.UUID, tab: WorkspaceTab) -> None:
@@ -345,6 +352,24 @@ def auto_cleanup_days(monkeypatch: pytest.MonkeyPatch) -> list[int]:
             return SimpleNamespace(
                 vertical_panel=SimpleNamespace(
                     auto_cleanup_days=holder[0]))
+
+    monkeypatch.setattr(commands, 'config', SimpleNamespace(val=_Val()))
+    return holder
+
+
+@pytest.fixture
+def auto_suspend_days(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Patch ``commands.config`` with a mutable auto-suspend days value."""
+    holder = [30]
+
+    class _Val:
+
+        @property
+        def content(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                vertical_panel=SimpleNamespace(
+                    auto_suspend_done_days=holder[0],
+                    auto_cleanup_days=30))
 
     monkeypatch.setattr(commands, 'config', SimpleNamespace(val=_Val()))
     return holder
@@ -1023,6 +1048,73 @@ class TestCleanupCommand:
         auto_cleanup_days[0] = 30
         with pytest.raises(cmdutils.CommandError, match='No active workspace'):
             commands.vp_cleanup_done()
+
+
+class TestSuspendStaleCommand:
+
+    def test_uses_configured_days_when_omitted(
+            self,
+            fake_manager: FakeManager,
+            auto_suspend_days: list[int],
+            messages: list[str],
+    ) -> None:
+        auto_suspend_days[0] = 45
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.auto_suspend_result = 2
+
+        commands.vp_suspend_stale()
+
+        assert fake_manager.auto_suspends == [(workspace.id, 45)]
+        assert messages == ['Suspended 2 stale tab(s).']
+
+    def test_explicit_days(
+            self,
+            fake_manager: FakeManager,
+            auto_suspend_days: list[int],
+    ) -> None:
+        auto_suspend_days[0] = 30
+        workspace = fake_manager.add_workspace('w')
+
+        commands.vp_suspend_stale(60)
+
+        assert fake_manager.auto_suspends == [(workspace.id, 60)]
+
+    def test_out_of_range_falls_back_to_config_default(
+            self,
+            fake_manager: FakeManager,
+            auto_suspend_days: list[int],
+            messages: list[str],
+    ) -> None:
+        auto_suspend_days[0] = 50
+        workspace = fake_manager.add_workspace('w')
+
+        commands.vp_suspend_stale(999)
+
+        assert fake_manager.auto_suspends == [(workspace.id, 50)]
+        assert any('range' in text for text in messages)
+
+    def test_silent_when_nothing_suspended(
+            self,
+            fake_manager: FakeManager,
+            auto_suspend_days: list[int],
+            messages: list[str],
+    ) -> None:
+        auto_suspend_days[0] = 30
+        fake_manager.add_workspace('w')
+        fake_manager.auto_suspend_result = 0
+
+        commands.vp_suspend_stale()
+
+        assert messages == []
+
+    def test_requires_active_workspace(
+            self,
+            fake_manager: FakeManager,
+            auto_suspend_days: list[int],
+    ) -> None:
+        auto_suspend_days[0] = 30
+        with pytest.raises(cmdutils.CommandError, match='No active workspace'):
+            commands.vp_suspend_stale()
 
 
 @pytest.fixture

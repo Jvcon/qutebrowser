@@ -19,8 +19,9 @@ from typing import Any, Callable, Optional
 
 import yaml
 
-from qutebrowser.qt.core import QObject, QUrl, pyqtSignal
+from qutebrowser.qt.core import QObject, QTimer, QUrl, pyqtSignal
 
+from qutebrowser.config import config
 from qutebrowser.utils import log, objreg, qtutils
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
@@ -116,6 +117,7 @@ class WorkspaceManager(QObject):
         self._workspaces: dict[uuid.UUID, Workspace] = {}
         self._active_id: Optional[uuid.UUID] = None
         self._pinned: list[PinnedTab] = []
+        self._auto_suspend_timer: Optional[QTimer] = None
 
     # --- load/save ---
 
@@ -1289,6 +1291,18 @@ class WorkspaceManager(QObject):
 
     # --- reading status / auto-cleanup (VP-F3) ---
 
+    def _record_done_at(
+            self,
+            workspace_id: uuid.UUID,
+            tab_id: int,
+            status: str,
+    ) -> None:
+        """Stamp ``done_at`` when *status* is ``DONE``, else clear it."""
+        tab = self.find_tab_by_id(workspace_id, tab_id)
+        if tab is None:
+            return
+        tab.done_at = _now_seconds() if status == 'DONE' else None
+
     def set_reading_status(
             self,
             workspace_id: uuid.UUID,
@@ -1324,6 +1338,7 @@ class WorkspaceManager(QObject):
         for tab in workspace.tabs:
             if tab.tab_id in wanted:
                 tab.reading_status = status
+                self._record_done_at(workspace_id, tab.tab_id, status)
                 count += 1
         if count > 0:
             log.workspaces.debug(
@@ -1331,6 +1346,101 @@ class WorkspaceManager(QObject):
                 workspace_id, status, count)
             self.changed.emit()
         return count
+
+    def auto_suspend_due_tabs(
+            self,
+            workspace_id: uuid.UUID,
+            days: Optional[int] = None,
+    ) -> int:
+        """Suspend ``OPEN`` ``DONE`` tab entries older than *days*.
+
+        A tab is suspended only when *all* of the following hold:
+
+        * its ``open_status`` is ``'OPEN'``;
+        * its ``reading_status`` is ``'DONE'``;
+        * it has a ``done_at`` timestamp older than the cutoff;
+        * its group (if any) is not archived.
+
+        Only the workspace entry's ``open_status`` is flipped; live browser
+        tabs are never closed here. :attr:`changed` is emitted once when at
+        least one entry was suspended.
+
+        Args:
+            workspace_id: Workspace whose tabs are scanned.
+            days: Age in days; defaults to
+                ``content.vertical_panel.auto_suspend_done_days``.
+
+        Returns:
+            The number of tab entries that were suspended.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return 0
+        if days is None:
+            days = config.val.content.vertical_panel.auto_suspend_done_days
+        cutoff = (datetime.datetime.now(datetime.timezone.utc)
+                  - datetime.timedelta(days=days))
+        archived_groups = {group.group_id for group in workspace.groups
+                           if group.archived}
+
+        due: list[int] = []
+        for tab in workspace.tabs:
+            if tab.open_status != 'OPEN' or tab.reading_status != 'DONE':
+                continue
+            if tab.done_at is None:
+                continue
+            if tab.group_id is not None and tab.group_id in archived_groups:
+                continue
+            parsed = _parse_timestamp(tab.done_at)
+            if parsed is not None and parsed < cutoff:
+                due.append(tab.tab_id)
+
+        if not due:
+            return 0
+
+        # ``set_open_status`` emits ``changed`` per mutation; suppress those
+        # and emit a single signal for the whole batch.
+        was_blocked = self.blockSignals(True)
+        try:
+            for tab_id in due:
+                self.set_open_status(workspace_id, tab_id, 'SUSPENDED')
+        finally:
+            self.blockSignals(was_blocked)
+        self.changed.emit()
+        log.workspaces.debug(
+            "auto_suspend_due_tabs: workspace %s suspended %d tab(s)",
+            workspace_id, len(due))
+        return len(due)
+
+    def start_auto_suspend_scheduler(self, parent: QObject) -> None:
+        """Run a stale-tab scan now (deferred) and every 12 hours thereafter.
+
+        The periodic timer stays active even when
+        ``auto_suspend_enabled`` is false; each scan checks the setting and
+        becomes a no-op, so re-enabling it takes effect without restarting
+        qutebrowser.
+        """
+        QTimer.singleShot(0, self._scan_all_workspaces_for_stale)
+        try:
+            timer = QTimer(parent)
+        except TypeError:
+            # Test doubles (and non-QObject parents) cannot own the timer;
+            # keep it alive through ``self._auto_suspend_timer`` instead.
+            timer = QTimer()
+        timer.setInterval(12 * 3600 * 1000)
+        timer.timeout.connect(self._scan_all_workspaces_for_stale)
+        timer.start()
+        self._auto_suspend_timer = timer
+
+    def _scan_all_workspaces_for_stale(self) -> int:
+        """Suspend stale ``DONE`` tabs across every loaded workspace."""
+        value = config.val
+        if value is None or not value.content.vertical_panel.auto_suspend_enabled:
+            return 0
+        total = 0
+        for workspace_id in list(self._workspaces.keys()):
+            total += self.auto_suspend_due_tabs(workspace_id)
+        return total
 
     def tabs_by_status(
             self,

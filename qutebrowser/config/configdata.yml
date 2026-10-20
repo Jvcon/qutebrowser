@@ -1300,6 +1300,26 @@ content.vertical_panel.auto_cleanup_days:
     between 30 and 180 days; out-of-range values passed to the command
     fall back to this setting.
 
+content.vertical_panel.auto_suspend_done_days:
+  default: 30
+  type:
+    name: Int
+    minval: 30
+    maxval: 180
+  desc: >-
+    Age (in days) after which an OPEN tab marked `DONE` is automatically
+    flipped to `SUSPENDED` by the vertical panel. The live browser tab is
+    left open. Must be between 30 and 180 days; out-of-range values passed
+    to `:vp-suspend-stale` fall back to this setting.
+
+content.vertical_panel.auto_suspend_enabled:
+  default: true
+  type: Bool
+  desc: >-
+    Automatically suspend OPEN tab entries marked `DONE` once they are older
+    than `content.vertical_panel.auto_suspend_done_days`. The periodic scan
+    runs every 12 hours and on startup.
+
 content.vertical_panel.sort_open_groups_first:
   default: true
   type: Bool

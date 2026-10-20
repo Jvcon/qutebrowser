@@ -169,6 +169,9 @@ class WorkspaceTab:
         created_at: ISO 8601 UTC timestamp of when the entry was created.
             Populated automatically when left as ``None``; used as the final
             fallback by the auto-cleanup age heuristic.
+        done_at: ISO 8601 UTC timestamp of when the entry was marked
+            ``'DONE'``, or ``None`` when it is not done. Used by the
+            auto-suspend heuristic to age completed tabs.
     """
 
     tab_id: int
@@ -186,6 +189,7 @@ class WorkspaceTab:
     open_status: str = 'SUSPENDED'
     reading_status: str = 'FRESH'
     created_at: Optional[str] = None
+    done_at: Optional[str] = None
 
     def __post_init__(self) -> None:
         """Ensure every user-editable field has an explicit flag."""
@@ -232,6 +236,7 @@ class WorkspaceTab:
             'open_status': self.open_status,
             'reading_status': self.reading_status,
             'created_at': self.created_at,
+            'done_at': self.done_at,
         }
 
     @classmethod
@@ -266,6 +271,7 @@ class WorkspaceTab:
             open_status=d.get('open_status', 'SUSPENDED') or 'SUSPENDED',
             reading_status=d.get('reading_status', 'FRESH') or 'FRESH',
             created_at=d.get('created_at'),
+            done_at=d.get('done_at', None),
         )
 
 
