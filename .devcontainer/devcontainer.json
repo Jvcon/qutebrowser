@@ -27,7 +27,7 @@
     "portsAttributes": {
         "6080": {
             "label": "noVNC web client",
-            "onAutoForward": "openBrowser"
+            "onAutoForward": "ignore"
         },
         "5901": {
             "label": "VNC (direct)",
