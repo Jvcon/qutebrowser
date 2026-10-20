@@ -418,11 +418,13 @@ class PINPanel(QWidget):
     def _refresh_from_manager(self) -> None:
         pinned = self._manager.list_pinned()
         self._model.set_pinned(pinned)
-        # Empty pinned list -> collapse to 0 px (ADR § "1. PIN
-        # panel"). The QVBoxLayout above this list view will give
-        # the list zero vertical space when it's hidden, which is
-        # what we want.
-        self._list.setVisible(len(pinned) > 0)
+        # Empty pinned list -> collapse the whole section to 0 px so it
+        # takes no layout space at all (ADR § "1. PIN panel" / § Decisions
+        # "Pin panel collapse on empty").
+        has_pinned = bool(pinned)
+        self._list.setVisible(has_pinned)
+        self.setMaximumHeight(16777215 if has_pinned else 0)
+        self.setVisible(has_pinned)
 
     # --- interaction ---
 

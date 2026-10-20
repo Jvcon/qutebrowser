@@ -39,6 +39,24 @@ def panel(qtbot, config_stub):
     return widget, manager
 
 
+class TestPinPanelEmptyState:
+
+    def test_empty_list_collapses_section(self, panel):
+        widget, _manager = panel
+
+        assert widget.isHidden()
+        assert widget.maximumHeight() == 0
+
+    def test_pinned_entry_expands_section(self, panel):
+        widget, manager = panel
+
+        manager.set_pinned([
+            PinnedTab(tab_id=1, title='One', url='https://example.com/')])
+
+        assert not widget.isHidden()
+        assert widget.maximumHeight() > 0
+
+
 class TestPinPanelDrag:
 
     def test_model_exposes_drag_payload(self, panel):
