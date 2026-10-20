@@ -730,9 +730,22 @@ class TestGroupReopen:
         commands.vp_group_reopen('g')
 
         assert fake_manager.reopened_groups == [
-            (workspace.id, group.group_id)]
+            (workspace.id, group.group_id, 0)]
         assert messages == [
             "Reopened group 'g': opened 2, reused 1, skipped 0."]
+
+    def test_passes_win_id_through(
+            self, fake_manager: FakeManager) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        workspace.tabs.append(WorkspaceTab(
+            tab_id=1, group_id=group.group_id, open_status='SUSPENDED'))
+        fake_manager.reopen_group_result = (1, 0, 0)
+
+        commands.vp_group_reopen('g', win_id=4)
+
+        assert fake_manager.reopened_groups == [
+            (workspace.id, group.group_id, 4)]
 
     def test_already_open(
             self, fake_manager: FakeManager, messages: list[str]) -> None:

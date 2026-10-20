@@ -879,13 +879,18 @@ class _FakeBrowser:
 
     def __init__(self) -> None:
         self.widget = _FakeWidget()
-        self.opened: list[tuple[str, bool]] = []
+        # ``(url, background)`` in call order, for quick assertions.
+        self.opened: list[tuple[str, object]] = []
+        # Full ``tabopen`` kwargs per call, so tests can assert background.
+        self.tabopen_calls: list[dict[str, object]] = []
         # VP-F4's new-window flow constructs a fresh ``MainWindow`` and
         # reads the source browser's ``is_private`` flag to mirror it.
         self.is_private = False
 
-    def tabopen(self, url: QUrl, newwindow: bool = False) -> None:
-        self.opened.append((url.toString(), newwindow))
+    def tabopen(self, url: QUrl, background: object = None, **kwargs) -> None:
+        self.opened.append((url.toString(), background))
+        self.tabopen_calls.append(
+            {'url': url.toString(), 'background': background, **kwargs})
 
 
 class TestBatchOperations:
@@ -1032,7 +1037,7 @@ class TestBatchOperations:
 
         assert (opened, reused) == (1, 1)
         assert browser.widget.set_calls == [live]
-        assert new_browser.opened == [('https://b.example/', False)]
+        assert new_browser.opened == [('https://b.example/', None)]
 
     def test_open_tabs_as_new_tabs_reuses_and_opens(
             self, manager, monkeypatch):
@@ -1058,8 +1063,8 @@ class TestBatchOperations:
 
         assert (opened, reused) == (2, 0)
         assert browser.opened == [
-            ('https://a.example/', False),
-            ('https://b.example/', False),
+            ('https://a.example/', None),
+            ('https://b.example/', None),
         ]
 
     def test_open_tabs_skips_unknown_and_missing_url(
@@ -1291,10 +1296,10 @@ class TestReopenGroup:
             super().__init__()
             self._fail = set(fail_urls)
 
-        def tabopen(self, url, newwindow: bool = False) -> None:
+        def tabopen(self, url, background=None, **kwargs) -> None:
             if url.toString() in self._fail:
                 raise RuntimeError('tabopen failed')
-            super().tabopen(url, newwindow)
+            super().tabopen(url, background, **kwargs)
 
     class _RaisingWidget(_FakeWidget):
 
@@ -1352,6 +1357,12 @@ class TestReopenGroup:
         assert result == (2, 0, 0)
         assert [url for url, _ in browser.opened] == [
             'https://a.example/', 'https://b.example/']
+        # The reopened miss path must force foreground (background=False),
+        # not defer to the tabs.background setting.
+        assert browser.tabopen_calls == [
+            {'url': 'https://a.example/', 'background': False},
+            {'url': 'https://b.example/', 'background': False},
+        ]
         # Only the single final batch emit fires when nothing was reused.
         assert changes == [True]
 
@@ -1376,6 +1387,51 @@ class TestReopenGroup:
         assert [url for url, _ in browser0.opened] == ['https://b.example/']
         # The reused entry was flipped to OPEN.
         assert workspace.tabs[0].open_status == 'OPEN'
+
+    def test_cross_window_reuse_raises_owning_window(
+            self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://a.example/')])
+        live = _FakeLiveTab('https://a.example/')
+        browser0 = _FakeBrowser()
+        browser1 = _FakeBrowser()
+        resources = {0: ({}, browser0), 1: ({7: live}, browser1)}
+
+        class _FakeWindow:
+
+            def __init__(self) -> None:
+                self.raised = False
+                self.activated = False
+
+            def raise_(self) -> None:  # noqa: N802 - Qt naming
+                self.raised = True
+
+            def activateWindow(self) -> None:  # noqa: N802 - Qt naming
+                self.activated = True
+
+        window1 = _FakeWindow()
+        monkeypatch.setattr(
+            manager_module.objreg, 'window_registry',
+            {win_id: object() for win_id in resources})
+
+        def fake_get(name, **_kwargs):
+            win_id = _kwargs.get('window')
+            if name == 'main-window':
+                return window1 if win_id == 1 else None
+            if name == 'tab-registry':
+                return resources[win_id][0]
+            if name == 'tabbed-browser':
+                return resources[win_id][1]
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+        result = manager.reopen_group(workspace.id, group.group_id)
+
+        assert result == (0, 1, 0)
+        assert browser1.widget.set_calls == [live]
+        assert window1.raised is True
+        assert window1.activated is True
 
     def test_only_suspended_members_processed(self, manager, monkeypatch):
         workspace, group = self._group(

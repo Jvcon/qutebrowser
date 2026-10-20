@@ -682,13 +682,17 @@ class WorkspaceManager(QObject):
     def _find_live_tab_in_windows(
             self,
             windows: Iterable[tuple[int, Mapping[int, Any], Any]],
-            url: str,
-    ) -> Optional[tuple[Any, Any]]:
-        """Return ``(browser, live_tab)`` for the first live URL match."""
-        for _win_id, registry, browser in windows:
-            live = self._live_tab_for_url(registry, url)
+            urlstr: str,
+    ) -> Optional[tuple[Any, Any, int]]:
+        """Return ``(browser, live_tab, win_id)`` for the first URL match.
+
+        This method takes a URL **string**, not a `QUrl`. For `QUrl` input,
+        read `.toString()` first.
+        """
+        for win_id, registry, browser in windows:
+            live = self._live_tab_for_url(registry, urlstr)
             if live is not None:
-                return browser, live
+                return browser, live, win_id
         return None
 
     def _focus_live_tab(
@@ -697,28 +701,46 @@ class WorkspaceManager(QObject):
             tab: WorkspaceTab,
             browser: Any,
             live: Any,
+            win_id: int,
     ) -> bool:
-        """Focus *live* and flip *tab* to OPEN; return True on success."""
+        """Focus *live*, raise its window and flip *tab* to OPEN.
+
+        Returns True on success.  The window identified by *win_id* (the one
+        owning the reused tab) is raised / activated so a cross-window reuse
+        brings the hit into view.
+        """
         try:
             browser.widget.setCurrentWidget(live)
             self.set_open_status(workspace_id, tab.tab_id, 'OPEN')
-            return True
         except Exception as e:  # noqa: BLE001 - reopening is best-effort
             log.workspaces.debug(
                 f"reopen_group: setCurrentWidget failed for {tab.tab_id}: {e}")
             return False
+        try:
+            window = objreg.get(
+                'main-window', scope='window', window=win_id)
+            if window is not None:
+                window.raise_()
+                window.activateWindow()
+        except (KeyError, objreg.RegistryUnavailableError):
+            pass
+        return True
 
     @staticmethod
-    def _open_url_in_browser(browser: Any, url: str) -> bool:
-        """Open *url* via ``tabopen``; return True on success."""
+    def _open_url_in_browser(browser: Any, urlstr: str) -> bool:
+        """Open *urlstr* via ``tabopen``; return True on success.
+
+        This method takes a URL **string**, not a `QUrl`. For `QUrl` input,
+        read `.toString()` first.
+        """
         try:
-            qurl = QUrl(url)
+            qurl = QUrl(urlstr)
             qtutils.ensure_valid(qurl)
-            browser.tabopen(qurl)
+            browser.tabopen(qurl, background=False)
             return True
         except Exception as e:  # noqa: BLE001 - reopening is best-effort
             log.workspaces.debug(
-                f"reopen_group: tabopen failed for url={url!r}: {e}")
+                f"reopen_group: tabopen failed for url={urlstr!r}: {e}")
             return False
 
     def reopen_group(
@@ -734,7 +756,8 @@ class WorkspaceManager(QObject):
 
         * A live tab in *any* window whose URL matches is focused via
           ``setCurrentWidget`` and the entry is flipped to OPEN through
-          :meth:`set_open_status`; this is counted as *reused*.
+          :meth:`set_open_status`; the owning window is raised. This is
+          counted as *reused*.
         * Otherwise the URL is opened via ``tabopen`` in the *win_id* window;
           the bridge's ``_register_tab`` (VP-D1) auto-rebinds the entry and
           flips it to OPEN. This is counted as *opened*.
@@ -746,9 +769,6 @@ class WorkspaceManager(QObject):
 
         Returns:
             ``(opened, reused, skipped)``.
-
-        Raises:
-            KeyError: When *group_id* does not exist in *workspace_id*.
         """
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
@@ -770,8 +790,9 @@ class WorkspaceManager(QObject):
                 continue
             hit = self._find_live_tab_in_windows(windows, tab.url)
             if hit is not None:
-                browser, live = hit
-                if self._focus_live_tab(workspace_id, tab, browser, live):
+                browser, live, hit_win_id = hit
+                if self._focus_live_tab(
+                        workspace_id, tab, browser, live, hit_win_id):
                     reused += 1
                 else:
                     skipped += 1
