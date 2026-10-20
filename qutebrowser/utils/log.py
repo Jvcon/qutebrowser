@@ -132,6 +132,7 @@ network = logging.getLogger('network')
 sql = logging.getLogger('sql')
 greasemonkey = logging.getLogger('greasemonkey')
 extensions = logging.getLogger('extensions')
+workspaces = logging.getLogger('workspaces')
 
 LOGGER_NAMES = [
     'statusbar', 'completion', 'init', 'url',

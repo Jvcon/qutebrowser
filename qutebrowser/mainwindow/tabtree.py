@@ -1301,21 +1301,6 @@ class TabTree(QWidget):
                 lambda d=delta: self._move_selection(d))
             self._shortcuts.append(shortcut)
 
-        # Multi-select shortcuts (VP-F4): Ctrl+Space toggles the mode;
-        # Shift+J / Shift+K extend the selection while it is active.
-        toggle_shortcut = QShortcut(QKeySequence('Ctrl+Space'), self._view)
-        toggle_shortcut.setContext(
-            Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        toggle_shortcut.activated.connect(self._toggle_selection_mode)
-        self._shortcuts.append(toggle_shortcut)
-        for keyseq, delta in (('J', +1), ('K', -1)):
-            ext_shortcut = QShortcut(QKeySequence(keyseq), self._view)
-            ext_shortcut.setContext(
-                Qt.ShortcutContext.WidgetWithChildrenShortcut)
-            ext_shortcut.activated.connect(
-                lambda d=delta: self._extend_selection(d))
-            self._shortcuts.append(ext_shortcut)
-
         # Refresh when the manager signals a mutation.
         # TODO(v0.2): Replace wholesale rebuild with fine-grained inserts/removes.
         self._manager.changed.connect(self._on_manager_changed)

@@ -4044,6 +4044,13 @@ bindings.default:
       <Escape>: mode-leave
     workspace_panel:
       <Escape>: mode-leave
+      <Ctrl-Space>: vp-select-mode
+      <Ctrl-A>: vp-select-all
+      <Ctrl-N>: vp-select-none
+      <Ctrl-D>: vp-batch-delete
+      <Ctrl-Return>: vp-batch-open-tabs
+      <Ctrl-Shift-Return>: vp-batch-open-window
+      <Ctrl-C>: vp-collect-all
   type:
     name: Dict
     none_ok: true

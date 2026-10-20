@@ -360,10 +360,6 @@ def _resolve_group_target(
     Group names are matched case-insensitively across every workspace.
     Archived groups are included so they can be restored or permanently
     deleted.
-
-    Raises:
-        cmdutils.CommandError: If no group matches, or if a name matches
-            groups in more than one workspace.
     """
     target_lower = target.lower()
     try:
@@ -576,9 +572,6 @@ def _resolve_status_target(
 
     An integer is looked up by ``tab_id``; anything else is treated as a URL
     and matched against the first tab whose ``url`` equals *target*.
-
-    Raises:
-        cmdutils.CommandError: If no tab matches.
     """
     try:
         tab_id = int(target)
