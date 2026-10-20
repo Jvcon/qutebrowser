@@ -259,9 +259,24 @@ class TestWorkspaceBridge:
         tab.shutting_down.emit()
 
         assert model._tab_info[1].status & tabtree.Status.SUSPENDED
-        # The live display data was cleared before the status bit was pushed.
-        assert model._tab_info[1].title == ''
+        # VP-D1: the retained entry keeps its last known display data so the
+        # suspended row is still readable instead of rendering blank.
+        assert model._tab_info[1].title == 'Gone'
         assert model.active_tab_id() is None
+
+    def test_reused_url_entry_is_rebound_to_new_tab(
+            self, browser, manager, model, bridge):
+        """VP-D1: a new tab id matching a retained URL reuses its entry."""
+        first = _open_tab(browser, MockTab(1, url=QUrl('https://example.com/')))
+        first.shutting_down.emit()
+        assert [t.tab_id for t in manager.get_active().tabs] == [1]
+
+        _open_tab(browser, MockTab(5, url=QUrl('https://example.com/')))
+
+        tabs = manager.get_active().tabs
+        assert [t.tab_id for t in tabs] == [5]
+        assert tabs[0].open_status == 'OPEN'
+        assert model._tab_info[5].url == 'https://example.com/'
 
     def test_title_changed_updates_model(self, browser, model, bridge):
         tab = _open_tab(browser, MockTab(1))
@@ -316,9 +331,9 @@ class TestWorkspaceBridge:
         tab.title_changed.emit('Gone')
         assert model._tab_info[1].title == 'Gone'
         tab.shutting_down.emit()
-        # Metadata is cleared, but the SUSPENDED status bit is retained so
-        # the tree can paint the "zZ" badge.
-        assert model._tab_info[1].title == ''
+        # VP-D1: the entry is retained, so the row keeps its last known
+        # metadata while the SUSPENDED status bit paints the "zZ" badge.
+        assert model._tab_info[1].title == 'Gone'
         assert model._tab_info[1].status & tabtree.Status.SUSPENDED
 
     def test_noop_when_manager_none(self, browser, model):
