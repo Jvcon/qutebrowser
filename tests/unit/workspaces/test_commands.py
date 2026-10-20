@@ -157,13 +157,20 @@ class FakeManager:
 
     def set_reading_status(self, workspace_id: uuid.UUID,
                            tab_ids: 'set[int] | list[int]', status: str) -> int:
-        wanted = set(tab_ids)
+        if status not in ('FRESH', 'ACTIVE', 'DONE'):
+            raise ValueError(status)
+        id_set = set(tab_ids)
+        id_list = list(tab_ids)
         count = 0
         for tab in self._workspaces[workspace_id].tabs:
-            if tab.tab_id in wanted:
+            if tab.tab_id in id_set:
                 tab.reading_status = status
                 count += 1
-        self.reading_status_sets.append((wanted, status))
+        # F3 tests assert on reading_status_sets with list[int] tuples;
+        # F4 tests assert on statuses with set[int] tuples.  Write both so
+        # neither side regresses after the merge.
+        self.reading_status_sets.append((id_list, status))
+        self.statuses.append((id_set, status))
         return count
 
     def cleanup_old_done(self, workspace_id: uuid.UUID, days: int) -> int:
