@@ -13,6 +13,7 @@ from qutebrowser.qt.gui import QIcon, QPixmap
 
 from qutebrowser.mainwindow import tabtree, workspacebridge
 from qutebrowser.workspaces.manager import WorkspaceManager
+from qutebrowser.workspaces.model import WorkspaceTab
 
 
 class MockAudio(QObject):
@@ -659,3 +660,171 @@ class TestAutoLocate:
         tab_b = _open_tab(browser, MockTab(2, url=QUrl('https://b.example/')))
         browser.current_tab_changed.emit(tab_b)
         assert model.active_tab_id() == 2
+
+
+class TestMaybeSnapshotWindow:
+
+    """VP-P4: snapshot OPEN workspace tabs once a window is empty."""
+
+    @staticmethod
+    def _install_objreg(monkeypatch, browser, registry):
+        def fake_get(name, **_kwargs):
+            if name == 'tabbed-browser':
+                return browser
+            if name == 'tab-registry':
+                return registry
+            raise KeyError(name)
+
+        monkeypatch.setattr(workspacebridge.objreg, 'get', fake_get)
+
+    @staticmethod
+    def _workspace_with_open_tab(manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(
+            tab_id=1,
+            url='https://a.example/',
+            title='From entry',
+            open_status='OPEN',
+        ))
+        return workspace
+
+    def test_nonempty_window_skips(
+            self, browser, manager, bridge, monkeypatch, config_stub):
+        config_stub.val.content.vertical_panel.snapshot_min_tabs = 1
+        self._workspace_with_open_tab(manager)
+        self._install_objreg(
+            monkeypatch, browser,
+            {1: MockTab(1, title='Live', url=QUrl('https://a.example/'))})
+        browser.widget.insert(MockTab(9), 0)
+        calls = []
+        monkeypatch.setattr(
+            manager, 'create_window_snapshot',
+            lambda *a, **k: calls.append((a, k)))
+
+        bridge._maybe_snapshot_window(0)
+
+        assert calls == []
+
+    def test_empty_window_creates_snapshot(
+            self, browser, manager, bridge, monkeypatch, config_stub):
+        config_stub.val.content.vertical_panel.snapshot_min_tabs = 1
+        workspace = self._workspace_with_open_tab(manager)
+        self._install_objreg(
+            monkeypatch, browser,
+            {1: MockTab(1, title='Live', url=QUrl('https://a.example/'))})
+        calls = []
+
+        def fake_create(workspace_id, snapshots, *, min_tabs=1):
+            calls.append((workspace_id, snapshots, min_tabs))
+            return object()
+
+        monkeypatch.setattr(manager, 'create_window_snapshot', fake_create)
+
+        bridge._maybe_snapshot_window(0)
+
+        assert calls == [(
+            workspace.id,
+            [{'url': 'https://a.example/', 'title': 'Live'}],
+            1,
+        )]
+
+    def test_user_initiated_close_skips_and_clears_flag(
+            self, browser, manager, bridge, monkeypatch, config_stub):
+        config_stub.val.content.vertical_panel.snapshot_min_tabs = 1
+        self._workspace_with_open_tab(manager)
+        self._install_objreg(
+            monkeypatch, browser,
+            {1: MockTab(1, title='Live', url=QUrl('https://a.example/'))})
+        calls = []
+        monkeypatch.setattr(
+            manager, 'create_window_snapshot',
+            lambda *a, **k: calls.append((a, k)))
+        bridge._user_initiated_close_flags[0] = True
+
+        bridge._maybe_snapshot_window(0)
+
+        assert calls == []
+        assert bridge._user_initiated_close_flags[0] is False
+
+    def test_flag_cleared_snapshots_on_next_call(
+            self, browser, manager, bridge, monkeypatch, config_stub):
+        config_stub.val.content.vertical_panel.snapshot_min_tabs = 1
+        self._workspace_with_open_tab(manager)
+        self._install_objreg(
+            monkeypatch, browser,
+            {1: MockTab(1, title='Live', url=QUrl('https://a.example/'))})
+        calls = []
+        monkeypatch.setattr(
+            manager, 'create_window_snapshot',
+            lambda *a, **k: calls.append((a, k)))
+        bridge._user_initiated_close_flags[0] = True
+
+        bridge._maybe_snapshot_window(0)
+        bridge._maybe_snapshot_window(0)
+
+        assert len(calls) == 1
+
+    def test_min_tabs_from_config_is_forwarded(
+            self, browser, manager, bridge, monkeypatch, config_stub):
+        config_stub.val.content.vertical_panel.snapshot_min_tabs = 4
+        self._workspace_with_open_tab(manager)
+        self._install_objreg(
+            monkeypatch, browser,
+            {1: MockTab(1, title='Live', url=QUrl('https://a.example/'))})
+        calls = []
+        monkeypatch.setattr(
+            manager, 'create_window_snapshot',
+            lambda *a, **k: calls.append((a, k)))
+
+        bridge._maybe_snapshot_window(0)
+
+        assert calls[0][1]['min_tabs'] == 4
+
+
+class TestDelayedHook:
+
+    """VP-P4: tab removal schedules the delayed snapshot check."""
+
+    def test_tab_shutdown_schedules_check(
+            self, browser, manager, bridge, monkeypatch, config_stub):
+        config_stub.val.content.vertical_panel.snapshot_delay_seconds = 7
+        tab = _open_tab(browser, MockTab(1))
+        seen = []
+
+        def fake_single_shot(msec, callback):
+            seen.append(msec)
+            callback()
+
+        monkeypatch.setattr(
+            workspacebridge.QTimer, 'singleShot', fake_single_shot)
+        checks = []
+        monkeypatch.setattr(
+            bridge, '_maybe_snapshot_window',
+            lambda wid: checks.append(wid))
+
+        tab.shutting_down.emit()
+
+        assert seen == [7000]
+        assert checks == [0]
+
+    def test_tab_removed_schedules_check(
+            self, browser, manager, bridge, monkeypatch, config_stub):
+        config_stub.val.content.vertical_panel.snapshot_delay_seconds = 5
+        _open_tab(browser, MockTab(1))
+        seen = []
+
+        def fake_single_shot(msec, callback):
+            seen.append(msec)
+            callback()
+
+        monkeypatch.setattr(
+            workspacebridge.QTimer, 'singleShot', fake_single_shot)
+        checks = []
+        monkeypatch.setattr(
+            bridge, '_maybe_snapshot_window',
+            lambda wid: checks.append(wid))
+
+        browser.widget.remove(0)
+
+        assert seen == [5000]
+        assert checks == [0]

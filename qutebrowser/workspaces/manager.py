@@ -13,6 +13,7 @@ objects and pinned tabs, exposes CRUD operations over them, and emits
 
 import dataclasses
 import datetime
+import time
 import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any, Callable, Optional
@@ -45,6 +46,11 @@ def _host(url: str) -> str:
     if not url:
         return ''
     return QUrl(url).host().lower()
+
+
+def _snapshot_group_name() -> str:
+    """Return the base name for a window-close snapshot group."""
+    return "快照退出"
 
 
 # The three reading states of a WorkspaceTab (issue #15).
@@ -394,6 +400,52 @@ class WorkspaceManager(QObject):
             "get_or_create_inbox: workspace %s created Inbox (1 group)",
             workspace_id)
         return group
+
+    def create_window_snapshot(
+            self, workspace_id: uuid.UUID, tab_snapshots: list[dict],
+            *, min_tabs: int = 1,
+    ) -> Optional[Group]:
+        """Store *tab_snapshots* as a sub-group of the Inbox (VP-P4).
+
+        Returns ``None`` when fewer than *min_tabs* snapshots were captured
+        or the workspace is unknown.  The whole operation emits
+        :attr:`changed` exactly once.
+        """
+        if len(tab_snapshots) < min_tabs:
+            log.workspaces.info(
+                "快照跳过:少于 %d 条 (%d)", min_tabs, len(tab_snapshots))
+            return None
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return None
+
+        # Suppress the intermediate emits from get_or_create_inbox /
+        # create_group / add_tab so consumers see a single change.
+        self.blockSignals(True)
+        try:
+            inbox = self.get_or_create_inbox(workspace_id)
+            sub = self.create_group(workspace_id, _snapshot_group_name())
+            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+            sub.name = f"快照退出 — {timestamp}"
+            sub.snapshot_parent_id = inbox.group_id  # type: ignore[attr-defined]
+            base_id = -int(time.time() * 1000)
+            for i, snap in enumerate(tab_snapshots):
+                tab = WorkspaceTab(
+                    tab_id=base_id - i,
+                    url=snap.get('url', ''),
+                    title=snap.get('title', ''),
+                    description=snap.get('description', ''),
+                    source=snap.get('source', ''),
+                    favicon=snap.get('favicon'),
+                    group_id=sub.group_id,
+                    open_status='SUSPENDED',
+                    reading_status='FRESH',
+                )
+                self.add_tab(workspace_id, tab)
+        finally:
+            self.blockSignals(False)
+        self.changed.emit()
+        return sub
 
     # --- group lifecycle (pin / archive / reorder / purge) ---
 

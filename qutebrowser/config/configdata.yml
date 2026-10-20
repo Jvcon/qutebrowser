@@ -1328,6 +1328,27 @@ content.vertical_panel.sort_open_groups_first:
     SUSPENDED/ARCHIVED groups. Pinned groups always sort first regardless
     of this setting.
 
+content.vertical_panel.snapshot_min_tabs:
+  default: 1
+  type:
+    name: Int
+    minval: 1
+  desc: >-
+    Minimum number of OPEN vertical-panel tab entries a window must have
+    when it closes unexpectedly for a snapshot group to be created in the
+    Inbox. Set to a higher value to ignore windows with only a few tabs.
+
+content.vertical_panel.snapshot_delay_seconds:
+  default: 5
+  type:
+    name: Int
+    minval: 1
+    maxval: 30
+  desc: >-
+    Delay in seconds before confirming that a window with no tabs left was
+    really closed. If a new tab is opened within this delay, no snapshot is
+    created.
+
 content.webgl:
   default: true
   type: Bool

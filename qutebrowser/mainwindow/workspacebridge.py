@@ -65,6 +65,7 @@ from qutebrowser.qt import sip
 from qutebrowser.qt.core import QModelIndex, QObject, QTimer, QUrl, Qt
 from qutebrowser.qt.widgets import QWidget
 
+from qutebrowser.config import config
 from qutebrowser.mainwindow.tabtree import Status, TabTreeModel
 from qutebrowser.utils import objreg, qtutils
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
@@ -76,6 +77,19 @@ if TYPE_CHECKING:
     from qutebrowser.mainwindow.tabbedbrowser import TabbedBrowser
     from qutebrowser.mainwindow.tabtree import TabTree
     from qutebrowser.qt.gui import QIcon
+
+
+def _panel_setting(name: str, default: object) -> object:
+    """Read a ``content.vertical_panel`` setting safely.
+
+    Returns *default* when the config has not been initialized yet (for
+    example in headless unit tests), so callers can stay inert.
+    """
+    panel = getattr(
+        getattr(config.val, 'content', None), 'vertical_panel', None)
+    if panel is None:
+        return default
+    return getattr(panel, name, default)
 
 
 #: URL schemes which never map to a workspace entry; a switch to one of
@@ -146,6 +160,7 @@ class WorkspaceBridge(QObject):
         self._tab_index: dict[int, int] = {}
         self._tab_state: dict[int, _TabState] = {}
         self._attached: set[int] = set()
+        self._user_initiated_close_flags: dict[int, bool] = {}
         self._description_fetcher = (
             description_fetcher or tabentry_fetch.fetch_description)
 
@@ -599,6 +614,7 @@ class WorkspaceBridge(QObject):
             for key, value in self._tab_index.items()
         }
         self._remove_tab_id(tab_id)
+        self._schedule_snapshot_check()
 
     def _on_tab_shutting_down(self, tab: AbstractTab) -> None:
         """Handle a tab's ``shutting_down`` signal (real removal hook)."""
@@ -609,6 +625,77 @@ class WorkspaceBridge(QObject):
             if value != tab_id
         }
         self._remove_tab_id(tab_id)
+        self._schedule_snapshot_check()
+
+    def _schedule_snapshot_check(self) -> None:
+        """Schedule a delayed window-cleared snapshot check (VP-P4)."""
+        delay = _panel_setting('snapshot_delay_seconds', None)
+        if delay is None:
+            # No initialized config (headless tests): stay inert.
+            return
+        QTimer.singleShot(
+            int(delay) * 1000,
+            lambda wid=self._win_id: self._maybe_snapshot_window(wid),
+        )
+
+    def _window_registry(self, win_id: int) -> dict[int, AbstractTab]:
+        """Return the live tab registry for *win_id* (empty on failure)."""
+        try:
+            return objreg.get(
+                'tab-registry', scope='window', window=win_id)
+        except (KeyError, objreg.RegistryUnavailableError):
+            return {}
+
+    @staticmethod
+    def _collect_snapshots(
+            workspace: Workspace,
+            registry: dict[int, AbstractTab],
+    ) -> list[dict]:
+        """Turn still-OPEN workspace entries into snapshot dicts."""
+        snapshots = []
+        for tab in workspace.tabs:
+            if tab.open_status != 'OPEN':
+                continue
+            live = registry.get(tab.tab_id)
+            if live is None:
+                continue
+            snapshots.append({
+                'url': WorkspaceBridge._live_url(live),
+                'title': live.title() or tab.title,
+            })
+        return snapshots
+
+    def _maybe_snapshot_window(self, win_id: int) -> None:
+        """Snapshot OPEN workspace tabs when *win_id* has no tabs left.
+
+        A ``:tab-close --window`` marks the window as user-initiated via
+        :attr:`_user_initiated_close_flags`; in that case no snapshot is
+        taken and the flag is cleared for the next close.
+        """
+        if self._user_initiated_close_flags.get(win_id, False):
+            self._user_initiated_close_flags[win_id] = False
+            return
+        if self._manager is None:
+            return
+        try:
+            tabbed_browser = objreg.get(
+                'tabbed-browser', scope='window', window=win_id)
+        except (KeyError, objreg.RegistryUnavailableError):
+            return
+        if tabbed_browser.widget.count() > 0:
+            return
+        workspace_id = self._active_workspace_id()
+        if workspace_id is None:
+            return
+        workspace = self._manager.get_workspace(workspace_id)
+        if workspace is None:
+            return
+        snapshots = self._collect_snapshots(
+            workspace, self._window_registry(win_id))
+        self._manager.create_window_snapshot(
+            workspace_id, snapshots,
+            min_tabs=int(_panel_setting('snapshot_min_tabs', 1)),
+        )
 
     def _push_suspended(self, tab_id: int) -> None:
         """Mark *tab_id* as SUSPENDED in the model so the badge paints."""

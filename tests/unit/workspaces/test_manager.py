@@ -262,6 +262,115 @@ class TestInbox:
         assert manager.list_groups(workspace.id) == [fresh]
 
 
+class TestCreateWindowSnapshot:
+
+    """VP-P4: unexpected window close snapshots into the Inbox."""
+
+    @staticmethod
+    def _snap(**overrides):
+        data = {
+            'url': 'https://example.com/',
+            'title': 'Example',
+        }
+        data.update(overrides)
+        return data
+
+    def test_empty_returns_none_without_changed(self, manager):
+        workspace = manager.add_workspace('w')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.create_window_snapshot(
+            workspace.id, [], min_tabs=1)
+
+        assert result is None
+        assert changes == []
+
+    def test_single_tab_with_min_one_creates_subgroup(self, manager):
+        workspace = manager.add_workspace('w')
+
+        sub = manager.create_window_snapshot(
+            workspace.id, [self._snap()], min_tabs=1)
+
+        assert sub is not None
+        assert sub in manager.list_groups(workspace.id)
+        assert sub.name.startswith("快照退出 — ")
+        inbox = manager.get_or_create_inbox(workspace.id)
+        assert sub.snapshot_parent_id == inbox.group_id
+
+    def test_below_min_returns_none(self, manager):
+        workspace = manager.add_workspace('w')
+        snapshots = [
+            self._snap(url=f'https://e{i}.example/') for i in range(3)
+        ]
+
+        assert manager.create_window_snapshot(
+            workspace.id, snapshots, min_tabs=5) is None
+
+    def test_unknown_workspace_returns_none(self, manager):
+        assert manager.create_window_snapshot(
+            uuid.uuid4(), [self._snap()], min_tabs=1) is None
+
+    def test_snapshot_tab_fields(self, manager):
+        workspace = manager.add_workspace('w')
+
+        sub = manager.create_window_snapshot(workspace.id, [self._snap(
+            description='A description',
+            source='example.com',
+        )], min_tabs=1)
+
+        assert len(workspace.tabs) == 1
+        tab = workspace.tabs[0]
+        assert tab.url == 'https://example.com/'
+        assert tab.title == 'Example'
+        assert tab.description == 'A description'
+        assert tab.source == 'example.com'
+        assert tab.group_id == sub.group_id
+        assert tab.open_status == 'SUSPENDED'
+        assert tab.reading_status == 'FRESH'
+        assert tab.tab_id < 0
+        assert tab.created_at is not None
+
+    def test_changed_emitted_once(self, manager):
+        workspace = manager.add_workspace('w')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.create_window_snapshot(
+            workspace.id, [self._snap()], min_tabs=1)
+
+        assert changes == [True]
+
+    def test_inbox_is_reused_across_snapshots(self, manager):
+        workspace = manager.add_workspace('w')
+        inbox = manager.get_or_create_inbox(workspace.id)
+
+        manager.create_window_snapshot(
+            workspace.id, [self._snap()], min_tabs=1)
+        manager.create_window_snapshot(
+            workspace.id, [self._snap()], min_tabs=1)
+
+        inboxes = [
+            group for group in manager.list_groups(workspace.id)
+            if group.name.lower() == 'inbox'
+        ]
+        assert inboxes == [inbox]
+        assert len(manager.list_groups(workspace.id)) == 3
+
+
+class TestSnapshotSubGroupName:
+
+    def test_contains_label_and_timestamp(self, manager):
+        workspace = manager.add_workspace('w')
+
+        sub = manager.create_window_snapshot(
+            workspace.id, [{'url': 'https://example.com/'}], min_tabs=1)
+
+        assert "快照退出" in sub.name
+        assert datetime.datetime.now().strftime('%Y-%m-%d') in sub.name
+        assert sub.name.split("— ")[-1].count(':') == 1
+
+
 class TestTabMembership:
 
     def test_add_and_remove_tab(self, manager):
