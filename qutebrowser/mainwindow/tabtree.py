@@ -35,6 +35,7 @@ These remaining items are tracked for the next sub-slice and marked with
 
 from __future__ import annotations
 
+import base64
 import enum
 import uuid
 from collections.abc import Iterable
@@ -49,6 +50,7 @@ from qutebrowser.qt.core import (
     QSize,
     Qt,
     QTimer,
+    QUrl,
     pyqtSignal,
 )
 from qutebrowser.qt.gui import (
@@ -78,9 +80,11 @@ from qutebrowser.qt.widgets import (
     QWidget,
 )
 
+from qutebrowser.mainwindow.pinpanel import PINNED_TAB_MIME
 from qutebrowser.workspaces import search
 from qutebrowser.workspaces.manager import WorkspaceManager
-from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
+from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
+                                          WorkspaceTab)
 
 
 # Role ids shared between model and delegate.
@@ -96,6 +100,8 @@ SelectionRole = Qt.ItemDataRole.UserRole + 9
 GroupStateRole = Qt.ItemDataRole.UserRole + 10
 ActiveGroupRole = Qt.ItemDataRole.UserRole + 11
 HighlightRole = Qt.ItemDataRole.UserRole + 12
+GroupIdRole = Qt.ItemDataRole.UserRole + 13
+DropTargetRole = Qt.ItemDataRole.UserRole + 14
 
 
 class Kind(enum.IntEnum):
@@ -206,6 +212,10 @@ class TabTreeModel(QAbstractItemModel):
         HighlightRole: Role id for the transient auto-locate highlight
             (bool).  ``True`` on the single tab row highlighted after a
             browser tab switch; every other row reports ``False``.
+        GroupIdRole: Role id for the row's owning group id (``uuid.UUID``
+            or ``None``).  Used by the pinned-tab drop handler.
+        DropTargetRole: Role id for the row currently highlighted as a
+            valid pinned-tab drop target (bool).
     """
 
     KindRole = KindRole
@@ -220,6 +230,8 @@ class TabTreeModel(QAbstractItemModel):
     GroupStateRole = GroupStateRole
     ActiveGroupRole = ActiveGroupRole
     HighlightRole = HighlightRole
+    GroupIdRole = GroupIdRole
+    DropTargetRole = DropTargetRole
 
     def __init__(
             self,
@@ -250,6 +262,10 @@ class TabTreeModel(QAbstractItemModel):
         self._selected: set[int] = set()
         self._selection_mode: bool = False
         self._filter_text = ''
+        # Pinned-tab drag-and-drop: ``(kind, key)`` of the highlighted row,
+        # where key is a tab id or group id.  ``None`` when no valid target
+        # is under the cursor.
+        self._drop_target: Optional[tuple[str, object]] = None
         self._placeholder_pixmap = self._create_placeholder_pixmap()
         self.set_workspace(manager.get_active())
 
@@ -258,6 +274,7 @@ class TabTreeModel(QAbstractItemModel):
         self.beginResetModel()
         self._workspace = workspace
         self._search_hits = None
+        self._drop_target = None
         self._root.children.clear()
         self._tab_nodes.clear()
         if workspace is not None:
@@ -277,6 +294,7 @@ class TabTreeModel(QAbstractItemModel):
         """
         self.beginResetModel()
         self._search_hits = None if hits is None else list(hits)
+        self._drop_target = None
         self._root.children.clear()
         self._tab_nodes.clear()
         if self._workspace is not None:
@@ -598,6 +616,13 @@ class TabTreeModel(QAbstractItemModel):
             return None
         return tab.tab_id
 
+    def index_for_tab_id(self, tab_id: int) -> QModelIndex:
+        """Return the index for *tab_id*, or an invalid index when absent."""
+        node = self._tab_nodes.get(tab_id)
+        if node is None:
+            return QModelIndex()
+        return self._index_for_node(node)
+
     def group_for_index(self, index: QModelIndex) -> Optional[Group]:
         """Return the group behind *index*, or ``None`` for non-group rows."""
         if not index.isValid():
@@ -681,8 +706,176 @@ class TabTreeModel(QAbstractItemModel):
             index: QModelIndex,
     ) -> Qt.ItemFlag:
         if not index.isValid():
-            return Qt.ItemFlag.NoItemFlags
-        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            # The root must accept drops so a pinned entry can land as a
+            # top-level standalone row.
+            return Qt.ItemFlag.ItemIsDropEnabled
+        return (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsDropEnabled)
+
+    # --- pinned-tab drag & drop ---
+
+    def set_drop_target(self, index: QModelIndex) -> None:
+        """Highlight *index* as the pinned-tab drop target.
+
+        Passing an invalid index clears the highlight.  Only the row itself
+        is repainted, so dragging over a long tree stays cheap.
+        """
+        target = self._drop_target_for_index(index)
+        if target == self._drop_target:
+            return
+        previous = self._drop_target
+        self._drop_target = target
+        for key in (previous, target):
+            if key is None:
+                continue
+            idx = self._index_for_drop_key(key)
+            if idx.isValid():
+                self.dataChanged.emit(idx, idx, [DropTargetRole])
+
+    def _drop_target_for_index(
+            self,
+            index: QModelIndex,
+    ) -> Optional[tuple[str, object]]:
+        if not index.isValid():
+            return None
+        node = index.internalPointer()
+        if node.kind == Kind.Group:
+            group = node.obj
+            assert isinstance(group, Group)
+            return ('group', group.group_id)
+        tab = node.obj
+        if not isinstance(tab, WorkspaceTab):
+            return None
+        return ('tab', tab.tab_id)
+
+    def _index_for_drop_key(self, key: tuple[str, object]) -> QModelIndex:
+        kind, value = key
+        if kind == 'group':
+            assert isinstance(value, uuid.UUID)
+            return self._index_for_group_id(value)
+        assert isinstance(value, int)
+        return self.index_for_tab_id(value)
+
+    def _pinned_for_mime(self, mime_data) -> Optional[PinnedTab]:
+        """Decode the pinned entry carried by *mime_data*."""
+        if not mime_data.hasFormat(PINNED_TAB_MIME):
+            return None
+        raw = bytes(mime_data.data(PINNED_TAB_MIME))
+        try:
+            tab_id = int(raw.decode('ascii'))
+        except ValueError:
+            return None
+        return next(
+            (entry for entry in self._manager.list_pinned()
+             if entry.tab_id == tab_id),
+            None,
+        )
+
+    def _drop_target_group(
+            self,
+            index: QModelIndex,
+    ) -> tuple[Optional[uuid.UUID], Optional[int]]:
+        """Return ``(group_id, parent_tab_id)`` for a drop on *index*.
+
+        A group row yields its group and no parent.  A tab row inside a
+        group yields that group and the tab as parent (ADR 0008 § "Pinned-
+        tab drop target").  A standalone tab row or the root yields a
+        top-level standalone entry.
+        """
+        group = self.group_for_index(index)
+        if group is not None:
+            return (group.group_id, None)
+        tab = self._workspace_tab_for_index(index)
+        if tab is None:
+            return (None, None)
+        if tab.group_id is None:
+            return (None, None)
+        return (tab.group_id, tab.tab_id)
+
+    def _workspace_tab_for_index(
+            self,
+            index: QModelIndex,
+    ) -> Optional[WorkspaceTab]:
+        if not index.isValid():
+            return None
+        node = index.internalPointer()
+        if node.kind == Kind.Group:
+            return None
+        tab = node.obj
+        return tab if isinstance(tab, WorkspaceTab) else None
+
+    def mimeTypes(self) -> list[str]:  # noqa: N802 - Qt naming
+        return [PINNED_TAB_MIME]
+
+    def supportedDropActions(self) -> Qt.DropAction:  # noqa: N802
+        return Qt.DropAction.CopyAction
+
+    def canDropMimeData(  # noqa: N802 - Qt naming
+            self,
+            data,
+            action: Qt.DropAction,
+            row: int,
+            column: int,
+            parent: QModelIndex,
+    ) -> bool:
+        del row, column  # the hovered row identifies the target
+        if action != Qt.DropAction.CopyAction:
+            return False
+        if self._workspace is None:
+            return False
+        pinned = self._pinned_for_mime(data)
+        if pinned is None:
+            return False
+
+        group = self.group_for_index(parent)
+        if group is not None:
+            return not group.archived
+
+        tab = self._workspace_tab_for_index(parent)
+        if tab is not None and tab.group_id is not None:
+            for candidate in self._workspace.groups:
+                if candidate.group_id == tab.group_id:
+                    return not candidate.archived
+        # Root / standalone tab: a top-level drop is always valid.
+        return True
+
+    def dropMimeData(  # noqa: N802 - Qt naming
+            self,
+            data,
+            action: Qt.DropAction,
+            row: int,
+            column: int,
+            parent: QModelIndex,
+    ) -> bool:
+        del row, column
+        if not self.canDropMimeData(data, action, -1, -1, parent):
+            return False
+        pinned = self._pinned_for_mime(data)
+        assert pinned is not None
+        assert self._workspace is not None
+
+        group_id, parent_tab_id = self._drop_target_group(parent)
+        workspace = self._workspace
+        favicon = (
+            base64.b64encode(pinned.favicon).decode('ascii')
+            if pinned.favicon else None
+        )
+        entry = WorkspaceTab(
+            tab_id=pinned.tab_id,
+            parent_id=parent_tab_id,
+            group_id=group_id,
+            title=pinned.title,
+            url=pinned.url,
+            source=QUrl(pinned.url).host().lower(),
+            favicon=favicon,
+            open_status='OPEN',
+        )
+        # Unpin first, then add the regular entry.  Both calls emit
+        # ``changed``; the target ids above survive the intermediate reset.
+        self._manager.remove_pinned(pinned.tab_id)
+        self._manager.add_tab(workspace.id, entry)
+        self._drop_target = None
+        return True
 
     # --- private helpers ---
 
@@ -840,6 +1033,10 @@ class TabTreeModel(QAbstractItemModel):
             return self._group_state(group)
         if role == ActiveGroupRole:
             return group.group_id == self._active_group_id
+        if role == GroupIdRole:
+            return group.group_id
+        if role == DropTargetRole:
+            return self._drop_target == ('group', group.group_id)
         return _GROUP_STATIC_ROLES.get(role)
 
     def _group_badge(self, group: Group) -> str:
@@ -899,7 +1096,15 @@ class TabTreeModel(QAbstractItemModel):
             return tab.tab_id in self._selected
         if role == HighlightRole:
             return self._highlighted_tab_id == tab.tab_id
+        if role in (GroupIdRole, DropTargetRole):
+            return self._tab_relation_role(tab, role)
         return _TAB_STATIC_ROLES.get(role)
+
+    def _tab_relation_role(self, tab: WorkspaceTab, role: int):
+        """Return the group id / drop-target roles for *tab*."""
+        if role == GroupIdRole:
+            return tab.group_id
+        return self._drop_target == ('tab', tab.tab_id)
 
     def _tab_visible_data(self, info: _TabInfo, role: int):
         if role == Qt.ItemDataRole.DisplayRole:
@@ -1022,11 +1227,11 @@ class TabTreeItemDelegate(QStyledItemDelegate):
 
         painter.save()
 
-        # Transient auto-locate highlight (VP-D5): a faint wash painted
-        # beneath the selection / hover pass so those still win when both
-        # apply.
-        if bool(index.data(HighlightRole)):
-            painter.fillRect(option.rect, self._highlight_color(option))
+        # Transient auto-locate / drop-target washes are painted beneath
+        # the selection / hover pass so those still win when both apply.
+        if (bool(index.data(HighlightRole))
+                or bool(index.data(DropTargetRole))):
+            self._draw_transient_highlight(painter, option, index)
 
         # Background / selection.
         if option.state & QStyle.StateFlag.State_Selected:
@@ -1526,6 +1731,20 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             painter.fillPath(path, color)
         painter.restore()
 
+    def _draw_transient_highlight(
+            self,
+            painter: QPainter,
+            option: QStyleOptionViewItem,
+            index: QModelIndex,
+    ) -> None:
+        """Paint the auto-locate / drop-target row washes."""
+        if bool(index.data(HighlightRole)):
+            painter.fillRect(option.rect, self._highlight_color(option))
+        if bool(index.data(DropTargetRole)):
+            target = QColor(option.palette.highlight().color())
+            target.setAlpha(70)
+            painter.fillRect(option.rect, target)
+
     @staticmethod
     def _highlight_color(option: QStyleOptionViewItem) -> QColor:
         """Return the faint auto-locate wash for *option*'s palette."""
@@ -1550,6 +1769,66 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         # PINNED is rendered as its own affordance column (the P glyph),
         # not as part of the status strip.
         return ''.join(parts)
+
+
+class _TabTreeView(QTreeView):
+
+    """QTreeView which accepts pinned-entry drags from the PIN panel.
+
+    The view drives the model's ``canDropMimeData`` / ``dropMimeData``
+    itself so it can reject invalid rows *before* Qt paints a drop
+    indicator, and so the hovered row can carry :data:`DropTargetRole`
+    while the drag is in progress.
+    """
+
+    @staticmethod
+    def _event_pos(event) -> QPoint:
+        """Return the event position as a QPoint (Qt5/Qt6 compatible)."""
+        try:
+            return event.position().toPoint()
+        except AttributeError:  # Qt5
+            return event.pos()
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if event.mimeData().hasFormat(PINNED_TAB_MIME):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if not event.mimeData().hasFormat(PINNED_TAB_MIME):
+            super().dragMoveEvent(event)
+            return
+        index = self.indexAt(self._event_pos(event))
+        model = self.model()
+        if model.canDropMimeData(
+                event.mimeData(), Qt.DropAction.CopyAction,
+                -1, -1, index):
+            model.set_drop_target(index)
+            event.acceptProposedAction()
+        else:
+            model.set_drop_target(QModelIndex())
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        model = self.model()
+        if model is not None:
+            model.set_drop_target(QModelIndex())
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if not event.mimeData().hasFormat(PINNED_TAB_MIME):
+            super().dropEvent(event)
+            return
+        index = self.indexAt(self._event_pos(event))
+        model = self.model()
+        dropped = model.dropMimeData(
+            event.mimeData(), Qt.DropAction.CopyAction, -1, -1, index)
+        model.set_drop_target(QModelIndex())
+        if dropped:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
 
 class TabTree(QWidget):
@@ -1610,10 +1889,15 @@ class TabTree(QWidget):
 
         self._model = TabTreeModel(manager, parent=self)
         self._delegate = TabTreeItemDelegate(self)
-        self._view = QTreeView(self)
+        self._view = _TabTreeView(self)
         self._view.setObjectName('tab-tree-view')
         self._view.setModel(self._model)
         self._view.setItemDelegate(self._delegate)
+        # Pinned-tab drops (ADR 0008 § "Pinned-tab drop target").
+        self._view.setAcceptDrops(True)
+        self._view.setDragDropMode(
+            QAbstractItemView.DragDropMode.DropOnly)
+        self._view.setDropIndicatorShown(False)
 
         self._view.setHeaderHidden(True)
         self._view.setIndentation(18)

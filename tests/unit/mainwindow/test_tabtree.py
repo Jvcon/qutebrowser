@@ -10,6 +10,7 @@ import pytest
 
 from qutebrowser.qt.core import (
     QEvent,
+    QMimeData,
     QModelIndex,
     QObject,
     QPoint,
@@ -33,7 +34,9 @@ from qutebrowser.qt.widgets import (
 )
 
 from qutebrowser.mainwindow import tabtree
-from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
+from qutebrowser.mainwindow.pinpanel import PINNED_TAB_MIME
+from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
+                                          WorkspaceTab)
 
 
 class MockManager(QObject):
@@ -45,9 +48,23 @@ class MockManager(QObject):
     def __init__(self, workspace=None):
         super().__init__()
         self._workspace = workspace
+        self._pinned = []
 
     def get_active(self):
         return self._workspace
+
+    def add_tab(self, workspace_id, tab):
+        self._workspace.tabs.append(tab)
+
+    def add_pinned(self, tab):
+        self._pinned.append(tab)
+
+    def remove_pinned(self, tab_id):
+        self._pinned = [tab for tab in self._pinned
+                        if tab.tab_id != tab_id]
+
+    def list_pinned(self):
+        return list(self._pinned)
 
     def group_open_count(self, workspace_id, group_id):
         return sum(
@@ -1177,6 +1194,90 @@ class TestTabTree:
         assert len(scrolled) == 2
         assert highlighted == [30]
         assert tree.model().active_group_id() == group_id
+
+
+class TestPinnedDrop:
+
+    """Pinned-entry drag-and-drop into the tab tree (issue #34)."""
+
+    @pytest.fixture
+    def drop_setup(self, qtbot):
+        workspace = _make_workspace()
+        manager = MockManager(workspace)
+        manager.add_pinned(PinnedTab(
+            tab_id=99, title='Pinned', url='https://example.com/'))
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        return tree, manager, workspace
+
+    @staticmethod
+    def _mime(tab_id=99):
+        mime = QMimeData()
+        mime.setData(PINNED_TAB_MIME, str(tab_id).encode('ascii'))
+        return mime
+
+    def test_drop_into_group_unpins_and_sets_group(self, drop_setup):
+        tree, manager, workspace = drop_setup
+        group_index = tree.model().index(0, 0)
+
+        assert tree.model().canDropMimeData(
+            self._mime(), Qt.DropAction.CopyAction, -1, -1, group_index)
+        assert tree.model().dropMimeData(
+            self._mime(), Qt.DropAction.CopyAction, -1, -1, group_index)
+
+        entry = next(tab for tab in workspace.tabs if tab.tab_id == 99)
+        assert entry.group_id == workspace.groups[0].group_id
+        assert entry.parent_id is None
+        assert manager.list_pinned() == []
+
+    def test_drop_on_group_tab_sets_parent(self, drop_setup):
+        tree, _manager, workspace = drop_setup
+        model = tree.model()
+        # Index of group tab 30 (row 0 under the first group).
+        group_index = model.index(0, 0)
+        tab_index = model.index(0, 0, group_index)
+
+        assert model.dropMimeData(
+            self._mime(), Qt.DropAction.CopyAction, -1, -1, tab_index)
+
+        entry = next(tab for tab in workspace.tabs if tab.tab_id == 99)
+        assert entry.group_id == workspace.groups[0].group_id
+        assert entry.parent_id == 30
+
+    def test_drop_on_standalone_tab_is_top_level(self, drop_setup):
+        tree, _manager, workspace = drop_setup
+        model = tree.model()
+        # Standalone tabs follow the parent chain at the root.
+        standalone = next(
+            model.index(row, 0) for row in range(model.rowCount())
+            if model.tab_id_for_index(model.index(row, 0)) == 20
+        )
+
+        assert model.dropMimeData(
+            self._mime(), Qt.DropAction.CopyAction, -1, -1, standalone)
+
+        entry = next(tab for tab in workspace.tabs if tab.tab_id == 99)
+        assert entry.group_id is None
+        assert entry.parent_id is None
+
+    def test_foreign_mime_is_rejected(self, drop_setup):
+        tree, _manager, _workspace = drop_setup
+        mime = QMimeData()
+        mime.setText('nope')
+
+        assert not tree.model().canDropMimeData(
+            mime, Qt.DropAction.CopyAction, -1, -1, QModelIndex())
+
+    def test_drop_target_role_highlights_row(self, drop_setup):
+        tree, _manager, _workspace = drop_setup
+        model = tree.model()
+        group_index = model.index(0, 0)
+
+        model.set_drop_target(group_index)
+
+        assert model.data(group_index, model.DropTargetRole) is True
+        model.set_drop_target(QModelIndex())
+        assert model.data(group_index, model.DropTargetRole) is False
 
 
 class TestTabTreeSearch:

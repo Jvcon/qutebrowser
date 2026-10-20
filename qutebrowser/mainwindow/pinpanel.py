@@ -37,6 +37,7 @@ intended.
 from qutebrowser.qt.core import (
     QAbstractItemModel,
     QEvent,
+    QMimeData,
     QModelIndex,
     QObject,
     QPoint,
@@ -56,6 +57,7 @@ from qutebrowser.qt.widgets import (
     QAbstractItemView,
     QListView,
     QMenu,
+    QStyle,
     QStyleOptionViewItem,
     QStyledItemDelegate,
     QVBoxLayout,
@@ -71,6 +73,10 @@ from qutebrowser.workspaces.model import PinnedTab
 TitleRole = Qt.ItemDataRole.UserRole + 1
 UrlRole = Qt.ItemDataRole.UserRole + 2
 FaviconRole = Qt.ItemDataRole.UserRole + 3
+
+#: MIME type carried when a pinned entry is dragged into the TabTree.  The
+#: payload is the entry's decimal tab id (ASCII).
+PINNED_TAB_MIME = 'application/x-qutebrowser-pinned-tab'
 
 
 def _pinned_tab_data(tab: PinnedTab, role: int):
@@ -151,6 +157,28 @@ class PinnedTabModel(QAbstractItemModel):
             return self._visible[row]
         return None
 
+    def mimeTypes(self) -> list[str]:  # noqa: N802 - Qt naming
+        """Advertise the pinned-entry drag payload."""
+        return [PINNED_TAB_MIME]
+
+    def mimeData(self, indexes):  # noqa: N802 - Qt naming
+        """Encode the dragged pinned entry's tab id for the TabTree."""
+        data = QMimeData()
+        if indexes:
+            tab = self._visible[indexes[0].row()]
+            data.setData(PINNED_TAB_MIME, str(tab.tab_id).encode('ascii'))
+        return data
+
+    def supportedDragActions(self) -> Qt.DropAction:  # noqa: N802 - Qt naming
+        """Pinned entries are copied into the tree, not removed by drag."""
+        return Qt.DropAction.CopyAction
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:  # noqa: N802
+        base = super().flags(index)
+        if index.isValid():
+            return base | Qt.ItemFlag.ItemIsDragEnabled
+        return base
+
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
             # We are a list, not a tree.
@@ -217,7 +245,7 @@ class PinnedTabDelegate(QStyledItemDelegate):
             index: QModelIndex,
     ) -> None:
         painter.save()
-        if option.state & QStyleOptionViewItem.State.State_Selected:
+        if option.state & QStyle.StateFlag.State_Selected:
             painter.fillRect(
                 option.rect,
                 option.palette.highlight(),
@@ -328,6 +356,10 @@ class PINPanel(QWidget):
         self._list.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._list.setDragEnabled(True)
+        self._list.setDragDropMode(
+            QAbstractItemView.DragDropMode.DragOnly)
+        self._list.setDefaultDropAction(Qt.DropAction.CopyAction)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
