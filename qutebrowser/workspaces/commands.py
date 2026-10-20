@@ -19,6 +19,7 @@ from typing import Any, Optional
 from qutebrowser.api import cmdutils
 from qutebrowser.config import config
 from qutebrowser.utils import message, objreg
+from qutebrowser.utils.utils import format_size
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import (READING_STATUSES, TabMetadata,
                                             WorkspaceManager)
@@ -552,33 +553,63 @@ def _make_group_delete_action(
 
 @cmdutils.register(name='vp-group-close')
 @cmdutils.argument('target', metavar='target')
+@cmdutils.argument('force', flag='!')
 @cmdutils.argument('win_id', value=cmdutils.Value.win_id)
-def vp_group_close(target: str, win_id: int = 0) -> None:
+def vp_group_close(target: str, force: bool = False, win_id: int = 0) -> None:
     """Close every open tab in the group, leaving entries as SUSPENDED.
+
+    Asks for confirmation (including an estimate of the memory which will be
+    freed) unless ``-!`` is given. Cancelling leaves the group untouched.
 
     Args:
         target: The name or UUID of the group.
     """
     manager = _manager()
     workspace, group = _resolve_group_target(manager, target)
+    group_id = group.group_id
+    name = group.name
+
+    state = manager.group_state(workspace.id, group_id)
+    if state == 'ARCHIVED':
+        message.info(f"Group '{name}' is archived.")
+        return
+    if manager.group_total_count(workspace.id, group_id) == 0:
+        message.info(f"Group '{name}' has no open tabs.")
+        return
+    if state == 'SUSPENDED':
+        message.info(f"Group '{name}' is already suspended.")
+        return
+
+    bytes_estimate = manager.estimate_group_memory_bytes(
+        workspace.id, group_id)
+    fmt = format_size(bytes_estimate, suffix='B')
+    if force:
+        _close_group_and_message(manager, workspace, group, fmt, win_id)
+        return
+    message.confirm_async(
+        title=f"Close group '{name}'?",
+        text=(f"This will close {manager.group_open_count(workspace.id, group_id)} "
+              f"tab(s), freeing ~{fmt}."),
+        default=False,
+        yes_action=lambda: _close_group_and_message(
+            manager, workspace, group, fmt, win_id),
+        no_action=lambda: message.info("Cancelled."),
+    )
+
+
+def _close_group_and_message(
+    manager: WorkspaceManager,
+    workspace: Workspace,
+    group: Group,
+    fmt: str,
+    win_id: int,
+) -> None:
+    """Close *group* and report how many tabs were closed / skipped."""
     closed, skipped = manager.close_group(
         workspace.id, group.group_id, win_id=win_id)
-    if closed == 0 and skipped == 0:
-        # Could be an empty group, or all members already SUSPENDED.
-        state = manager.group_state(workspace.id, group.group_id)
-        if state == 'ARCHIVED':
-            message.info(f"Group '{group.name}' is archived.")
-            return
-        if state == 'SUSPENDED':
-            if manager.group_total_count(workspace.id, group.group_id) == 0:
-                message.info(f"Group '{group.name}' has no open tabs.")
-            else:
-                message.info(f"Group '{group.name}' is already suspended.")
-            return
-        message.info(f"Group '{group.name}' has no open tabs.")
-        return
     message.info(
-        f"Closed {closed} tab(s) in '{group.name}'; skipped {skipped}.")
+        f"Closed {closed} tab(s) in '{group.name}', freed ~{fmt}; "
+        f"skipped {skipped}.")
 
 
 @cmdutils.register(name='vp-group-reopen')

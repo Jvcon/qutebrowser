@@ -49,6 +49,10 @@ def _host(url: str) -> str:
 # The three reading states of a WorkspaceTab (issue #15).
 READING_STATUSES = ('FRESH', 'ACTIVE', 'DONE')
 
+#: Rough memory estimate per OPEN tab (VP-P1).
+# TODO(vp-p1-followup): switch to chrome.processes for real values.
+BYTES_PER_TAB = 50 * 1024 * 1024  # 50 MB heuristic; MVP estimate.
+
 
 def _parse_timestamp(value: str) -> Optional[datetime.datetime]:
     """Parse an ISO 8601 *value* into an aware UTC datetime, or None.
@@ -326,6 +330,17 @@ class WorkspaceManager(QObject):
         return sum(
             1 for tab in workspace.tabs if tab.group_id == group_id
         )
+
+    def estimate_group_memory_bytes(self, workspace_id: uuid.UUID,
+                                    group_id: uuid.UUID) -> int:
+        """Return a rough byte estimate for the group's OPEN tabs.
+
+        The MVP heuristic assumes :data:`BYTES_PER_TAB` per OPEN tab;
+        SUSPENDED tabs are already released. This is a pure query: no
+        :attr:`changed` is emitted.
+        """
+        return (self.group_open_count(workspace_id, group_id)
+                * BYTES_PER_TAB)
 
     def group_state(self, workspace_id: uuid.UUID,
                     group_id: uuid.UUID) -> str:

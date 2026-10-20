@@ -433,6 +433,40 @@ class TestGroupState:
         assert changes == []
 
 
+class TestEstimateGroupMemoryBytes:
+
+    """Memory estimate for a group's OPEN tabs (VP-P1)."""
+
+    def _group_with_statuses(self, manager, statuses):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        for index, status in enumerate(statuses, start=1):
+            manager.add_tab(workspace.id, WorkspaceTab(
+                tab_id=index, group_id=group.group_id, open_status=status))
+        return workspace, group
+
+    def test_empty_group_estimates_zero(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        assert manager.estimate_group_memory_bytes(
+            workspace.id, group.group_id) == 0
+
+    def test_open_tabs_use_constant_per_tab(self, manager):
+        workspace, group = self._group_with_statuses(
+            manager, ['OPEN', 'SUSPENDED', 'OPEN', 'OPEN'])
+        assert manager.estimate_group_memory_bytes(
+            workspace.id, group.group_id) == 3 * manager_module.BYTES_PER_TAB
+
+    def test_query_does_not_emit_changed(self, manager):
+        workspace, group = self._group_with_statuses(manager, ['OPEN'])
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.estimate_group_memory_bytes(workspace.id, group.group_id)
+
+        assert changes == []
+
+
 class TestFindTabByUrl:
 
     """Pure URL lookup used by the VP-D5 auto-locate (no create, no emit)."""

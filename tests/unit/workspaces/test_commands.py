@@ -15,7 +15,7 @@ import pytest
 from qutebrowser.api import cmdutils
 from qutebrowser.qt.core import QUrl
 from qutebrowser.workspaces import commands
-from qutebrowser.workspaces.manager import WorkspaceManager
+from qutebrowser.workspaces.manager import BYTES_PER_TAB, WorkspaceManager
 from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
 from qutebrowser.workspaces.persistence import (PinnedPersistence,
                                                 WorkspacePersistence)
@@ -148,6 +148,17 @@ class FakeManager:
                           group_id: uuid.UUID) -> int:
         return sum(1 for tab in self._workspaces[workspace_id].tabs
                    if tab.group_id == group_id)
+
+    def group_open_count(self, workspace_id: uuid.UUID,
+                         group_id: uuid.UUID) -> int:
+        return sum(1 for tab in self._workspaces[workspace_id].tabs
+                   if tab.group_id == group_id
+                   and tab.open_status == 'OPEN')
+
+    def estimate_group_memory_bytes(self, workspace_id: uuid.UUID,
+                                    group_id: uuid.UUID) -> int:
+        return self.group_open_count(
+            workspace_id, group_id) * BYTES_PER_TAB
 
     def group_state(self, workspace_id: uuid.UUID,
                     group_id: uuid.UUID) -> str:
@@ -349,6 +360,22 @@ def confirmations(monkeypatch: pytest.MonkeyPatch) -> list[Callable[[], None]]:
     def confirm_async(*, yes_action: Callable[[], None],
                       **_kwargs: object) -> None:
         pending.append(yes_action)
+
+    monkeypatch.setattr(commands.message, 'confirm_async', confirm_async)
+    return pending
+
+
+@pytest.fixture
+def confirm_cancels(
+        monkeypatch: pytest.MonkeyPatch) -> list[Callable[[], None]]:
+    """Capture confirm_async() no_action callbacks, storing the pending one."""
+    pending: list[Callable[[], None]] = []
+
+    def confirm_async(*, yes_action: Callable[[], None],
+                      no_action: Optional[Callable[[], None]] = None,
+                      **_kwargs: object) -> None:
+        if no_action is not None:
+            pending.append(no_action)
 
     monkeypatch.setattr(commands.message, 'confirm_async', confirm_async)
     return pending
@@ -656,27 +683,91 @@ class TestGroupCommands:
 
 class TestGroupClose:
 
-    """Tests for ``:vp-group-close`` (VP-D3)."""
+    """Tests for ``:vp-group-close`` (VP-D3 / VP-P1)."""
 
-    def test_reports_closed_and_skipped(
-            self, fake_manager: FakeManager, messages: list[str]) -> None:
+    def _open_group(self, fake_manager: FakeManager, count: int = 2):
         workspace = fake_manager.add_workspace('w')
         group = fake_manager.create_group(workspace.id, 'g')
-        fake_manager.close_group_result = (2, 1)
+        for tab_id in range(1, count + 1):
+            workspace.tabs.append(WorkspaceTab(
+                tab_id=tab_id, group_id=group.group_id, open_status='OPEN'))
+        return workspace, group
+
+    def test_confirms_before_closing(
+            self, fake_manager: FakeManager,
+            confirmations: list[Callable[[], None]],
+            messages: list[str]) -> None:
+        workspace, group = self._open_group(fake_manager)
+        fake_manager.close_group_result = (2, 0)
 
         commands.vp_group_close('g')
 
+        # Nothing is closed until the user confirms.
+        assert len(confirmations) == 1
+        assert fake_manager.closed_groups == []
+        assert messages == []
+
+        confirmations[0]()
+
         assert fake_manager.closed_groups == [
             (workspace.id, group.group_id, 0)]
-        assert messages == ["Closed 2 tab(s) in 'g'; skipped 1."]
+        assert messages == [
+            "Closed 2 tab(s) in 'g', freed ~100.00MB; skipped 0."]
+
+    def test_confirm_mentions_count_and_memory(
+            self, fake_manager: FakeManager,
+            monkeypatch: pytest.MonkeyPatch) -> None:
+        self._open_group(fake_manager, count=3)
+        captured: dict[str, object] = {}
+
+        def confirm_async(**kwargs: object) -> None:
+            captured.update(kwargs)
+
+        monkeypatch.setattr(commands.message, 'confirm_async', confirm_async)
+
+        commands.vp_group_close('g')
+
+        assert captured['title'] == "Close group 'g'?"
+        assert captured['text'] == (
+            "This will close 3 tab(s), freeing ~150.00MB.")
+        assert captured['default'] is False
+
+    def test_force_skips_confirmation(
+            self, fake_manager: FakeManager,
+            confirmations: list[Callable[[], None]],
+            messages: list[str]) -> None:
+        workspace, group = self._open_group(fake_manager)
+        fake_manager.close_group_result = (2, 1)
+
+        commands.vp_group_close('g', force=True)
+
+        assert confirmations == []
+        assert fake_manager.closed_groups == [
+            (workspace.id, group.group_id, 0)]
+        assert messages == [
+            "Closed 2 tab(s) in 'g', freed ~100.00MB; skipped 1."]
+
+    def test_cancel_leaves_group_untouched(
+            self, fake_manager: FakeManager,
+            confirm_cancels: list[Callable[[], None]],
+            messages: list[str]) -> None:
+        self._open_group(fake_manager)
+
+        commands.vp_group_close('g')
+        assert fake_manager.closed_groups == []
+        assert len(confirm_cancels) == 1
+
+        confirm_cancels[0]()
+
+        assert fake_manager.closed_groups == []
+        assert messages == ["Cancelled."]
 
     def test_passes_win_id_through(
             self, fake_manager: FakeManager) -> None:
-        workspace = fake_manager.add_workspace('w')
-        group = fake_manager.create_group(workspace.id, 'g')
+        workspace, group = self._open_group(fake_manager, count=1)
         fake_manager.close_group_result = (1, 0)
 
-        commands.vp_group_close('g', win_id=3)
+        commands.vp_group_close('g', force=True, win_id=3)
 
         assert fake_manager.closed_groups == [
             (workspace.id, group.group_id, 3)]
