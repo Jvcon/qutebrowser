@@ -1300,6 +1300,14 @@ content.vertical_panel.auto_cleanup_days:
     between 30 and 180 days; out-of-range values passed to the command
     fall back to this setting.
 
+content.vertical_panel.sort_open_groups_first:
+  default: true
+  type: Bool
+  desc: >-
+    When true, the vertical panel sorts groups with OPEN state before
+    SUSPENDED/ARCHIVED groups. Pinned groups always sort first regardless
+    of this setting.
+
 content.webgl:
   default: true
   type: Bool

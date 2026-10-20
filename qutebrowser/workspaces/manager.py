@@ -302,6 +302,65 @@ class WorkspaceManager(QObject):
         """Return all groups in a workspace."""
         return list(self._workspaces[workspace_id].groups)
 
+    # --- group running state (VP-D2) ---
+
+    def group_open_count(self, workspace_id: uuid.UUID,
+                         group_id: uuid.UUID) -> int:
+        """Return the number of OPEN tabs belonging to *group_id*.
+
+        This is a pure query: no :attr:`changed` is emitted.
+        """
+        workspace = self._workspaces[workspace_id]
+        return sum(
+            1 for tab in workspace.tabs
+            if tab.group_id == group_id and tab.open_status == 'OPEN'
+        )
+
+    def group_total_count(self, workspace_id: uuid.UUID,
+                          group_id: uuid.UUID) -> int:
+        """Return the total number of tabs belonging to *group_id*.
+
+        This is a pure query: no :attr:`changed` is emitted.
+        """
+        workspace = self._workspaces[workspace_id]
+        return sum(
+            1 for tab in workspace.tabs if tab.group_id == group_id
+        )
+
+    def group_state(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> str:
+        """Return the derived running state of *group_id*.
+
+        The result is one of:
+
+        * ``'ARCHIVED'`` — the group's archive flag is set (it wins over
+          the runtime state of its members);
+        * ``'OPEN'`` — at least one member tab is OPEN;
+        * ``'SUSPENDED'`` — the group is empty or every member is
+          SUSPENDED.
+
+        This is a pure query: no :attr:`changed` is emitted.
+
+        Downstream contract (VP-D3 / VP-D4 / VP-D5)::
+
+            WorkspaceManager.group_state(workspace_id, group_id) -> str
+            WorkspaceManager.group_open_count(workspace_id, group_id) -> int
+            WorkspaceManager.group_total_count(workspace_id, group_id) -> int
+
+        ``Group.state`` is the local view (``'ARCHIVED' | 'UNKNOWN'``); the
+        model layer calls this method to resolve ``'UNKNOWN'`` into
+        ``'OPEN'`` / ``'SUSPENDED'``.
+
+        Raises:
+            KeyError: When *group_id* does not exist in *workspace_id*.
+        """
+        group = self._find_group(workspace_id, group_id)
+        if group.archived:
+            return 'ARCHIVED'
+        if self.group_open_count(workspace_id, group_id) > 0:
+            return 'OPEN'
+        return 'SUSPENDED'
+
     def get_or_create_inbox(self, workspace_id: uuid.UUID) -> Group:
         """Return the Inbox group for *workspace_id*, creating it if needed.
 
