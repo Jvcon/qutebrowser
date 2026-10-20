@@ -633,8 +633,20 @@ def vp_group_reopen(target: str, win_id: int = 0) -> None:
     if state == 'ARCHIVED':
         message.info(f"Group '{group.name}' is archived; restore it first.")
         return
+    total = sum(1 for tab in workspace.tabs
+                if tab.group_id == group.group_id
+                and tab.open_status == 'SUSPENDED')
+    if total == 0:
+        message.info(f"Group '{group.name}' has no suspended tabs.")
+        return
+
+    def _progress(done: int, total_count: int, skipped: int) -> None:
+        message.info(
+            f"恢复中 {done}/{total_count} ({group.name})", replace=True)
+
     opened, reused, skipped = manager.reopen_group(
-        workspace.id, group.group_id, win_id=win_id)
+        workspace.id, group.group_id, win_id=win_id,
+        on_progress=_progress)
     if opened == 0 and reused == 0 and skipped == 0:
         message.info(f"Group '{group.name}' has no suspended tabs.")
         return

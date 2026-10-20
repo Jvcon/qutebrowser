@@ -177,8 +177,18 @@ class FakeManager:
         return self.close_group_result
 
     def reopen_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID,
-                     *, win_id: int = 0) -> tuple[int, int, int]:
+                     *, win_id: int = 0,
+                     on_progress: Optional[
+                         Callable[[int, int, int], None]] = None,
+                     ) -> tuple[int, int, int]:
         self.reopened_groups.append((workspace_id, group_id, win_id))
+        if on_progress is not None:
+            total = sum(
+                1 for tab in self._workspaces[workspace_id].tabs
+                if tab.group_id == group_id
+                and tab.open_status == 'SUSPENDED')
+            for done in range(1, total + 1):
+                on_progress(done, total, 0)
         return self.reopen_group_result
 
     def get_or_create_inbox(self, workspace_id: uuid.UUID) -> Group:
@@ -816,6 +826,10 @@ class TestGroupReopen:
             self, fake_manager: FakeManager, messages: list[str]) -> None:
         workspace = fake_manager.add_workspace('w')
         group = fake_manager.create_group(workspace.id, 'g')
+        for tab_id in range(1, 4):
+            workspace.tabs.append(WorkspaceTab(
+                tab_id=tab_id, group_id=group.group_id,
+                open_status='SUSPENDED'))
         fake_manager.reopen_group_result = (2, 1, 0)
 
         commands.vp_group_reopen('g')
@@ -823,6 +837,9 @@ class TestGroupReopen:
         assert fake_manager.reopened_groups == [
             (workspace.id, group.group_id, 0)]
         assert messages == [
+            "恢复中 1/3 (g)",
+            "恢复中 2/3 (g)",
+            "恢复中 3/3 (g)",
             "Reopened group 'g': opened 2, reused 1, skipped 0."]
 
     def test_passes_win_id_through(

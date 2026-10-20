@@ -758,12 +758,28 @@ class WorkspaceManager(QObject):
                 f"reopen_group: tabopen failed for url={urlstr!r}: {e}")
             return False
 
+    @staticmethod
+    def _notify_reopen_progress(
+            on_progress: Optional[Callable[[int, int, int], None]],
+            done: int,
+            total: int,
+            skipped: int,
+    ) -> None:
+        """Call *on_progress*, swallowing any exception it raises."""
+        if on_progress is None:
+            return
+        try:
+            on_progress(done, total, skipped)
+        except Exception:  # noqa: BLE001 - progress is best-effort
+            pass
+
     def reopen_group(
             self,
             workspace_id: uuid.UUID,
             group_id: uuid.UUID,
             *,
             win_id: int = 0,
+            on_progress: Optional[Callable[[int, int, int], None]] = None,
     ) -> tuple[int, int, int]:
         """Reopen every SUSPENDED tab in *group_id*.
 
@@ -782,6 +798,11 @@ class WorkspaceManager(QObject):
 
         :attr:`changed` is emitted when at least one tab was opened or reused.
 
+        *on_progress*, when given, is called after every processed
+        SUSPENDED entry with ``(done, total, skipped)``, where *done* is the
+        number of tabs reused or opened so far and *total* is the number of
+        SUSPENDED members. Exceptions raised by the callback are swallowed.
+
         Returns:
             ``(opened, reused, skipped)``.
         """
@@ -790,6 +811,10 @@ class WorkspaceManager(QObject):
             return (0, 0, 0)
         # Verify the group exists before touching any tab.
         self._find_group(workspace_id, group_id)
+
+        total = sum(1 for tab in workspace.tabs
+                    if tab.group_id == group_id
+                    and tab.open_status == 'SUSPENDED')
 
         windows = self._all_window_resources()
         by_win = {w_win_id: w_browser
@@ -802,24 +827,24 @@ class WorkspaceManager(QObject):
                 continue
             if not tab.url:
                 skipped += 1
-                continue
-            hit = self._find_live_tab_in_windows(windows, tab.url)
-            if hit is not None:
-                browser, live, hit_win_id = hit
-                if self._focus_live_tab(
-                        workspace_id, tab, browser, live, hit_win_id):
-                    reused += 1
+            else:
+                hit = self._find_live_tab_in_windows(windows, tab.url)
+                if hit is not None:
+                    browser, live, hit_win_id = hit
+                    if self._focus_live_tab(
+                            workspace_id, tab, browser, live, hit_win_id):
+                        reused += 1
+                    else:
+                        skipped += 1
+                elif cur_browser is None:
+                    skipped += 1
+                elif self._open_url_in_browser(cur_browser, tab.url):
+                    # The bridge auto-flips the entry to OPEN via _register_tab.
+                    opened += 1
                 else:
                     skipped += 1
-                continue
-            if cur_browser is None:
-                skipped += 1
-                continue
-            if self._open_url_in_browser(cur_browser, tab.url):
-                # The bridge auto-flips the entry to OPEN via _register_tab.
-                opened += 1
-            else:
-                skipped += 1
+            self._notify_reopen_progress(
+                on_progress, opened + reused, total, skipped)
 
         if opened + reused:
             self.changed.emit()

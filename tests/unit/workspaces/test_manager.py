@@ -1551,6 +1551,57 @@ class TestReopenGroup:
         self._install(monkeypatch, {0: ({}, _FakeBrowser())})
         assert manager.reopen_group(uuid.uuid4(), uuid.uuid4()) == (0, 0, 0)
 
+    def test_progress_reported_for_opens(self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://a.example/'),
+                      ('SUSPENDED', 'https://b.example/'),
+                      ('SUSPENDED', 'https://c.example/')])
+        browser = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser)})
+        events = []
+
+        result = manager.reopen_group(
+            workspace.id, group.group_id,
+            on_progress=lambda *args: events.append(args))
+
+        assert result == (3, 0, 0)
+        assert events == [(1, 3, 0), (2, 3, 0), (3, 3, 0)]
+
+    def test_progress_reported_skip_interleaved(
+            self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://a.example/'),
+                      ('SUSPENDED', ''),
+                      ('SUSPENDED', 'https://b.example/')])
+        browser = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser)})
+        events = []
+
+        result = manager.reopen_group(
+            workspace.id, group.group_id,
+            on_progress=lambda *args: events.append(args))
+
+        assert result == (2, 0, 1)
+        assert events == [(1, 3, 0), (1, 3, 1), (2, 3, 1)]
+
+    def test_progress_exception_is_swallowed(self, manager, monkeypatch):
+        workspace, group = self._group(
+            manager, [('SUSPENDED', 'https://a.example/'),
+                      ('SUSPENDED', 'https://b.example/'),
+                      ('SUSPENDED', 'https://c.example/')])
+        browser = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser)})
+
+        def fail(_done, _total, _skipped):
+            raise RuntimeError('progress failed')
+
+        result = manager.reopen_group(
+            workspace.id, group.group_id, on_progress=fail)
+
+        assert result == (3, 0, 0)
+        assert [url for url, _ in browser.opened] == [
+            'https://a.example/', 'https://b.example/', 'https://c.example/']
+
 
 class TestSaveLoad:
 
