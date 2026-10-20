@@ -250,6 +250,12 @@ class MainWindow(QWidget):
         objreg.register('vertical-panel', self.vertical_panel,
                         scope='window', window=self.win_id,
                         command_only=True)
+        # The TabTree is exposed to commands only (e.g. :vp-select-* and
+        # :vp-batch-*) which need to drive its multi-select state.
+        if self.vertical_panel.tab_tree is not None:
+            objreg.register('tab-tree', self.vertical_panel.tab_tree,
+                            scope='window', window=self.win_id,
+                            command_only=True)
         # Bridge TabbedBrowser signals into the WorkspaceManager + TabTree
         # so the vertical panel reflects real tabs instead of showing the
         # "No tabs in this workspace" placeholder (see workspacebridge).
