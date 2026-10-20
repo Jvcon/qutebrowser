@@ -1108,3 +1108,71 @@ def _cycle_workspace(step: int) -> None:
     target = workspaces[(index + step) % len(workspaces)]
     manager.set_active(target.id)
     message.info(f"Switched to workspace '{target.name}'.")
+
+
+# Group management / tab placement (ADR 0008 § "Commands" and § 5).
+
+
+@cmdutils.register(name='group-list')
+def group_list() -> None:
+    """List all groups in the active workspace."""
+    manager = _manager()
+    workspace = _active_workspace(manager)
+    groups = manager.list_groups(workspace.id)
+    if not groups:
+        message.info('No groups in this workspace.')
+        return
+    lines = []
+    for group in groups:
+        markers = []
+        if group.pinned:
+            markers.append('pinned')
+        if group.archived:
+            markers.append('archived')
+        suffix = f" ({', '.join(markers)})" if markers else ''
+        lines.append(f"{group.name}{suffix}")
+    message.info('\n'.join(lines))
+
+
+@cmdutils.register(name='tab-move-to-group')
+@cmdutils.argument('group_name', metavar='group')
+def tab_move_to_group(tab_id: int, group_name: str = 'root') -> None:
+    """Move a tab entry into a group, or back to the root level.
+
+    Args:
+        tab_id: The workspace tab's integer id to move.
+        group_name: Target group name or UUID, or ``root`` for standalone.
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+    if group_name == 'root' or not group_name:
+        group_id: uuid.UUID | None = None
+    else:
+        group_id = _resolve_group(manager, workspace, group_name)
+    manager.move_tab_to_group(workspace.id, tab_id, group_id)
+    target = group_name if group_id is not None else 'root'
+    message.info(f"Moved tab {tab_id} to {target}.")
+
+
+@cmdutils.register(name='pintab-style-toggle')
+def pintab_style_toggle() -> None:
+    """Toggle the pinned-tab panel between ``icon`` and ``line`` style."""
+    new = 'line' if config.val.pinned_tabs.style == 'icon' else 'icon'
+    config.instance.set_obj('pinned_tabs.style', new)
+    message.info(f"Pinned-tab style: {new}.")
+
+
+@cmdutils.register(name='workspace-unarchive')
+def workspace_unarchive(name: str) -> None:
+    """Restore an archived workspace to normal use.
+
+    Args:
+        name: The name of the workspace to unarchive.
+    """
+    manager = _manager()
+    workspace = _lookup(name, manager)
+    if not workspace.archived:
+        message.info(f"Workspace '{name}' is not archived.")
+        return
+    manager.unarchive_workspace(workspace.id)
+    message.info(f"Unarchived workspace '{name}'.")

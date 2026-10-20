@@ -316,6 +316,11 @@ class WorkspaceManager(QObject):
         self._workspaces[workspace_id].archived = True
         self.changed.emit()
 
+    def unarchive_workspace(self, workspace_id: uuid.UUID) -> None:
+        """Clear a workspace's archived flag, restoring it to normal use."""
+        self._workspaces[workspace_id].archived = False
+        self.changed.emit()
+
     # --- groups ---
 
     def create_group(self, workspace_id: uuid.UUID, name: str) -> Group:

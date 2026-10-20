@@ -64,6 +64,15 @@ class TestWorkspaceCrud:
         manager.rename_workspace(workspace.id, 'new')
         assert manager.list_workspaces()[0].name == 'new'
 
+    def test_archive_and_unarchive_workspace(self, manager):
+        workspace = manager.add_workspace('w')
+
+        manager.archive_workspace(workspace.id)
+        assert workspace.archived is True
+
+        manager.unarchive_workspace(workspace.id)
+        assert workspace.archived is False
+
     def test_set_active_updates_get_active(self, manager):
         first = manager.add_workspace('a')
         second = manager.add_workspace('b')

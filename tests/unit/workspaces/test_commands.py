@@ -91,6 +91,9 @@ class FakeManager:
         self._workspaces[workspace_id].archived = True
         self.archived.append(workspace_id)
 
+    def unarchive_workspace(self, workspace_id: uuid.UUID) -> None:
+        self._workspaces[workspace_id].archived = False
+
     def delete_workspace(self, workspace_id: uuid.UUID) -> None:
         del self._workspaces[workspace_id]
         self.deleted.append(workspace_id)
@@ -111,6 +114,16 @@ class FakeManager:
             if group.group_id == group_id:
                 return group
         raise KeyError(group_id)
+
+    def list_groups(self, workspace_id: uuid.UUID) -> list[Group]:
+        return list(self._workspaces[workspace_id].groups)
+
+    def move_tab_to_group(self, workspace_id: uuid.UUID, tab_id: int,
+                          group_id: Optional[uuid.UUID]) -> None:
+        for tab in self._workspaces[workspace_id].tabs:
+            if tab.tab_id == tab_id:
+                tab.group_id = group_id
+                return
 
     def rename_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID,
                      new_name: str) -> None:
@@ -669,6 +682,111 @@ class TestWorkspaceCycle:
         commands.workspace_next()
 
         assert messages == ["No other workspace to switch to."]
+
+
+class TestWorkspaceUnarchive:
+
+    def test_unarchive_restores(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('old')
+        fake_manager.archive_workspace(workspace.id)
+
+        commands.workspace_unarchive('old')
+
+        assert workspace.archived is False
+        assert messages == ["Unarchived workspace 'old'."]
+
+    def test_unarchive_not_archived_is_noop(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        fake_manager.add_workspace('old')
+
+        commands.workspace_unarchive('old')
+
+        assert messages == ["Workspace 'old' is not archived."]
+
+    def test_unarchive_missing_raises(self, fake_manager: FakeManager) -> None:
+        fake_manager.add_workspace('old')
+        with pytest.raises(cmdutils.CommandError, match='No workspace'):
+            commands.workspace_unarchive('nope')
+
+
+class TestGroupList:
+
+    def test_lists_groups(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.create_group(workspace.id, 'github')
+        fake_manager.create_group(workspace.id, 'docs')
+
+        commands.group_list()
+
+        assert messages == ['github\ndocs']
+
+    def test_no_groups(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        fake_manager.add_workspace('w')
+
+        commands.group_list()
+
+        assert messages == ['No groups in this workspace.']
+
+
+class TestTabMoveToGroup:
+
+    def test_move_into_group(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'github')
+        tab = WorkspaceTab(tab_id=1, url='https://github.com/x')
+        workspace.tabs.append(tab)
+
+        commands.tab_move_to_group(1, 'github')
+
+        assert tab.group_id == group.group_id
+        assert messages == ["Moved tab 1 to github."]
+
+    def test_move_to_root(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'github')
+        tab = WorkspaceTab(tab_id=1, url='https://github.com/x',
+                           group_id=group.group_id)
+        workspace.tabs.append(tab)
+
+        commands.tab_move_to_group(1, 'root')
+
+        assert tab.group_id is None
+        assert messages == ["Moved tab 1 to root."]
+
+    def test_move_missing_group_raises(
+            self, fake_manager: FakeManager) -> None:
+        workspace = fake_manager.add_workspace('w')
+        tab = WorkspaceTab(tab_id=1, url='https://github.com/x')
+        workspace.tabs.append(tab)
+
+        with pytest.raises(cmdutils.CommandError, match='No group'):
+            commands.tab_move_to_group(1, 'nope')
+
+
+class TestPintabStyleToggle:
+
+    def test_toggle_icon_to_line(self, monkeypatch, messages) -> None:
+        val = type('Val', (), {
+            'pinned_tabs': type('Pinned', (), {'style': 'icon'})(),
+        })()
+        calls = []
+
+        class FakeInstance:
+            def set_obj(self, option: str, value: str) -> None:
+                calls.append((option, value))
+
+        monkeypatch.setattr(commands.config, 'val', val)
+        monkeypatch.setattr(commands.config, 'instance', FakeInstance())
+
+        commands.pintab_style_toggle()
+
+        assert calls == [('pinned_tabs.style', 'line')]
+        assert messages == ['Pinned-tab style: line.']
 
 
 class TestGroupCommands:
