@@ -244,6 +244,32 @@ class TestWorkspaceBridge:
         assert tabs[0].open_status == 'SUSPENDED'
         assert tabs[1].open_status == 'OPEN'
 
+    def test_tab_close_request_suspends_entry_and_keeps_children(
+            self, browser, manager, bridge):
+        """VP-D3: closing through ``tabCloseRequested`` suspends the entry.
+
+        D1 keeps the entry in the workspace instead of deleting it, so a
+        child tab remains linked to its now-suspended parent; the link is
+        only cleared when the entry is explicitly removed.
+        """
+        _open_tab(browser, MockTab(1, title='Parent'))
+        _open_tab(browser, MockTab(2, title='Child'))
+        workspace = manager.get_active()
+        workspace.tabs[1].parent_id = 1
+
+        def close(idx):
+            browser.widget.remove(idx)
+
+        browser.widget.tabCloseRequested.connect(close)
+
+        browser.widget.tabCloseRequested.emit(0)
+
+        tabs = workspace.tabs
+        assert [t.tab_id for t in tabs] == [1, 2]
+        assert tabs[0].open_status == 'SUSPENDED'
+        assert tabs[1].open_status == 'OPEN'
+        assert tabs[1].parent_id == 1
+
     def test_shutting_down_suspends_entry(self, browser, manager, bridge):
         tab = _open_tab(browser, MockTab(1))
         tab.shutting_down.emit()

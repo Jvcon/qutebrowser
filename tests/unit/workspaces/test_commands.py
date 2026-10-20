@@ -46,6 +46,8 @@ class FakeManager:
         self.deleted_tabs: list[int] = []
         self.opened_windows: list[tuple[uuid.UUID, set[int]]] = []
         self.opened_tabs: list[tuple[uuid.UUID, set[int]]] = []
+        self.closed_groups: list[tuple[uuid.UUID, uuid.UUID]] = []
+        self.close_group_result = (0, 0)
 
     def add_workspace(self, name: str) -> Workspace:
         workspace = Workspace(id=uuid.uuid4(), name=name,
@@ -139,6 +141,26 @@ class FakeManager:
                             if group.group_id != group_id]
         self.purged.append(group_id)
         return len(removed)
+
+    def group_total_count(self, workspace_id: uuid.UUID,
+                          group_id: uuid.UUID) -> int:
+        return sum(1 for tab in self._workspaces[workspace_id].tabs
+                   if tab.group_id == group_id)
+
+    def group_state(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> str:
+        group = self._find_group(workspace_id, group_id)
+        if group.archived:
+            return 'ARCHIVED'
+        if any(tab.group_id == group_id and tab.open_status == 'OPEN'
+               for tab in self._workspaces[workspace_id].tabs):
+            return 'OPEN'
+        return 'SUSPENDED'
+
+    def close_group(self, workspace_id: uuid.UUID,
+                    group_id: uuid.UUID) -> tuple[int, int]:
+        self.closed_groups.append((workspace_id, group_id))
+        return self.close_group_result
 
     def get_or_create_inbox(self, workspace_id: uuid.UUID) -> Group:
         for group in self._workspaces[workspace_id].groups:
@@ -622,6 +644,58 @@ class TestGroupCommands:
         fake_manager.add_workspace('w')
         with pytest.raises(cmdutils.CommandError, match='No group'):
             commands.vp_group_delete('nope')
+
+
+class TestGroupClose:
+
+    """Tests for ``:vp-group-close`` (VP-D3)."""
+
+    def test_reports_closed_and_skipped(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        fake_manager.close_group_result = (2, 1)
+
+        commands.vp_group_close('g')
+
+        assert fake_manager.closed_groups == [
+            (workspace.id, group.group_id)]
+        assert messages == ["Closed 2 tab(s) in 'g'; skipped 1."]
+
+    def test_already_suspended(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        workspace.tabs.append(WorkspaceTab(
+            tab_id=1, group_id=group.group_id, open_status='SUSPENDED'))
+
+        commands.vp_group_close('g')
+
+        assert messages == ["Group 'g' is already suspended."]
+
+    def test_empty_group(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.create_group(workspace.id, 'g')
+
+        commands.vp_group_close('g')
+
+        assert messages == ["Group 'g' has no open tabs."]
+
+    def test_archived_group(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        group.archived = True
+
+        commands.vp_group_close('g')
+
+        assert messages == ["Group 'g' is archived."]
+
+    def test_missing_group_raises(self, fake_manager: FakeManager) -> None:
+        fake_manager.add_workspace('w')
+        with pytest.raises(cmdutils.CommandError, match='No group'):
+            commands.vp_group_close('nope')
 
 
 class TestStatusCommands:
