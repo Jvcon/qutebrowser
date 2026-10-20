@@ -12,6 +12,7 @@ from typing import Optional
 import pytest
 
 from qutebrowser.api import cmdutils
+from qutebrowser.qt.core import QUrl
 from qutebrowser.workspaces import commands
 from qutebrowser.workspaces.manager import WorkspaceManager
 from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
@@ -129,6 +130,28 @@ class FakeManager:
                             if group.group_id != group_id]
         self.purged.append(group_id)
         return len(removed)
+
+    def get_or_create_inbox(self, workspace_id: uuid.UUID) -> Group:
+        for group in self._workspaces[workspace_id].groups:
+            if group.name.lower() == 'inbox':
+                return group
+        return self.create_group(workspace_id, 'Inbox')
+
+
+class FakeTab:
+
+    """A minimal live-tab stand-in exposing the accessors ``_metadata_from_tab`` uses."""
+
+    def __init__(self, tab_id: int, url: str = '', title: str = '') -> None:
+        self.tab_id = tab_id
+        self._url = url
+        self._title = title
+
+    def url(self) -> QUrl:
+        return QUrl(self._url)
+
+    def title(self) -> str:
+        return self._title
 
 
 @pytest.fixture
@@ -564,3 +587,90 @@ class TestCollectAllCommand:
 
         with pytest.raises(cmdutils.CommandError, match='No group named'):
             commands.vp_collect_all('missing', win_id=0)
+
+
+def _wire_manager(
+    pers: tuple[WorkspacePersistence, PinnedPersistence],
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[WorkspaceManager, Workspace]:
+    """Wire a real manager into the commands module for collect tests."""
+    manager = WorkspaceManager(*pers)
+    workspace = manager.add_workspace('w')
+    manager.set_active(workspace.id)
+    monkeypatch.setattr(commands, '_manager', lambda: manager)
+    monkeypatch.setattr(commands, '_persist_description', lambda *_a, **_k: None)
+    return manager, workspace
+
+
+class TestTabCollectCommand:
+    """VP-F5: ``:tab-collect`` defaults to the Inbox group."""
+
+    def test_no_group_collects_into_inbox(
+            self,
+            pers: tuple[WorkspacePersistence, PinnedPersistence],
+            messages: list[str],
+            monkeypatch: pytest.MonkeyPatch,
+            qapp,
+    ) -> None:
+        manager, workspace = _wire_manager(pers, monkeypatch)
+        tab = FakeTab(1, url='https://example.com/')
+
+        commands.tab_collect(tab)
+
+        groups = manager.list_groups(workspace.id)
+        assert [group.name for group in groups] == ['Inbox']
+        assert workspace.tabs[0].group_id == groups[0].group_id
+        assert messages == ["Collected tab into 'Inbox'."]
+
+    def test_explicit_group_is_used(
+            self,
+            pers: tuple[WorkspacePersistence, PinnedPersistence],
+            messages: list[str],
+            monkeypatch: pytest.MonkeyPatch,
+            qapp,
+    ) -> None:
+        manager, workspace = _wire_manager(pers, monkeypatch)
+        group = manager.create_group(workspace.id, 'g')
+        tab = FakeTab(1, url='https://example.com/')
+
+        commands.tab_collect(tab, 'g')
+
+        assert workspace.tabs[0].group_id == group.group_id
+        assert manager.list_groups(workspace.id) == [group]
+        assert messages == ["Collected tab into 'g'."]
+
+
+class TestCollectAllInbox:
+    """VP-F5: ``:vp-collect-all`` defaults to the Inbox group."""
+
+    def test_no_group_fills_inbox(
+            self,
+            pers: tuple[WorkspacePersistence, PinnedPersistence],
+            messages: list[str],
+            monkeypatch: pytest.MonkeyPatch,
+            qapp,
+    ) -> None:
+        manager, workspace = _wire_manager(pers, monkeypatch)
+        tab = FakeTab(1, url='https://example.com/')
+        monkeypatch.setattr(commands.objreg, 'get', lambda *_a, **_k: {1: tab})
+
+        commands.vp_collect_all()
+
+        groups = manager.list_groups(workspace.id)
+        assert [group.name for group in groups] == ['Inbox']
+        assert workspace.tabs[0].group_id == groups[0].group_id
+        assert messages == ["Collected 1 tab(s) into 'Inbox'; skipped 0."]
+
+    def test_empty_window_without_group_is_message(
+            self,
+            pers: tuple[WorkspacePersistence, PinnedPersistence],
+            messages: list[str],
+            monkeypatch: pytest.MonkeyPatch,
+            qapp,
+    ) -> None:
+        _wire_manager(pers, monkeypatch)
+        monkeypatch.setattr(commands.objreg, 'get', lambda *_a, **_k: {})
+
+        commands.vp_collect_all()
+
+        assert messages == ['No collectable tabs in this window.']

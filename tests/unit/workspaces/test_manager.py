@@ -208,6 +208,55 @@ class TestGroupLifecycle:
         assert workspace.tabs[0].group_id is None
 
 
+class TestInbox:
+    """VP-F5: the on-demand Inbox group used as the default collect target."""
+
+    def test_get_or_create_inbox_creates_named_group(self, manager):
+        workspace = manager.add_workspace('w')
+
+        inbox = manager.get_or_create_inbox(workspace.id)
+
+        assert inbox.name == 'Inbox'
+        assert manager.list_groups(workspace.id) == [inbox]
+
+    def test_get_or_create_inbox_reuses_existing(self, manager):
+        workspace = manager.add_workspace('w')
+
+        first = manager.get_or_create_inbox(workspace.id)
+        second = manager.get_or_create_inbox(workspace.id)
+
+        assert second is first
+        assert manager.list_groups(workspace.id) == [first]
+
+    def test_renamed_inbox_gets_recreated(self, manager):
+        workspace = manager.add_workspace('w')
+        inbox = manager.get_or_create_inbox(workspace.id)
+        manager.rename_group(workspace.id, inbox.group_id, 'Other')
+
+        fresh = manager.get_or_create_inbox(workspace.id)
+
+        assert fresh is not inbox
+        assert fresh.name == 'Inbox'
+        assert len(manager.list_groups(workspace.id)) == 2
+
+    def test_lookup_is_case_insensitive(self, manager):
+        workspace = manager.add_workspace('w')
+        existing = manager.create_group(workspace.id, 'inbox')
+
+        assert manager.get_or_create_inbox(workspace.id) is existing
+        assert manager.list_groups(workspace.id) == [existing]
+
+    def test_delete_then_recreate(self, manager):
+        workspace = manager.add_workspace('w')
+        inbox = manager.get_or_create_inbox(workspace.id)
+        manager.delete_group(workspace.id, inbox.group_id)
+
+        fresh = manager.get_or_create_inbox(workspace.id)
+
+        assert fresh is not inbox
+        assert manager.list_groups(workspace.id) == [fresh]
+
+
 class TestTabMembership:
 
     def test_add_and_remove_tab(self, manager):

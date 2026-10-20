@@ -22,6 +22,9 @@ from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import TabMetadata, WorkspaceManager
 from qutebrowser.workspaces.model import Group, Workspace
 
+#: Name of the default group collect commands land in when none is given.
+INBOX_GROUP_NAME = 'Inbox'
+
 
 def _manager() -> WorkspaceManager:
     """Return the app-wide WorkspaceManager."""
@@ -247,12 +250,18 @@ def tab_collect(tab: Any, group_id: str = '') -> None:
     """Collect the current tab into a group, capturing its metadata.
 
     Args:
-        group_id: Group name or UUID. When omitted, the tab is collected as
-            a standalone entry.
+        group_id: Group name or UUID. When omitted, the tab is collected
+            into the workspace's Inbox group (created on demand).
     """
     manager = _manager()
     workspace = _active_workspace(manager)
-    group = _resolve_group(manager, workspace, group_id)
+    if group_id:
+        group = _resolve_group(manager, workspace, group_id)
+        target_name = group_id
+    else:
+        inbox = manager.get_or_create_inbox(workspace.id)
+        group = inbox.group_id
+        target_name = inbox.name or INBOX_GROUP_NAME
 
     metadata = _metadata_from_tab(tab)
 
@@ -276,27 +285,31 @@ def tab_collect(tab: Any, group_id: str = '') -> None:
         workspace.id, tab.tab_id, group, metadata=metadata)
     _persist_description(manager, workspace.id, collected.tab_id, tab)
 
-    if group_id:
-        message.info(f"Collected tab into group '{group_id}'.")
-    else:
-        message.info("Collected tab.")
+    message.info(f"Collected tab into '{target_name}'.")
 
 
 @cmdutils.register(name='vp-collect-all')
 @cmdutils.argument('group_id', metavar='group')
 @cmdutils.argument('win_id', value=cmdutils.Value.win_id)
-def vp_collect_all(group_id: str, win_id: int = 0) -> None:
+def vp_collect_all(group_id: str = '', win_id: int = 0) -> None:
     """Collect every collectable tab in the current window into a group.
 
     Browser-internal pages (``qute://*``, ``about:blank``, ``chrome://*``,
     ``view-source:*``, ...) are skipped silently.
 
     Args:
-        group_id: Group name or UUID to collect the tabs into.
+        group_id: Group name or UUID. When omitted, the tabs are collected
+            into the workspace's Inbox group (created on demand).
     """
     manager = _manager()
     workspace = _active_workspace(manager)
-    group = _resolve_group(manager, workspace, group_id)
+    if group_id:
+        group = _resolve_group(manager, workspace, group_id)
+        target_name = group_id
+    else:
+        inbox = manager.get_or_create_inbox(workspace.id)
+        group = inbox.group_id
+        target_name = inbox.name or INBOX_GROUP_NAME
 
     try:
         registry = objreg.get(
@@ -322,7 +335,7 @@ def vp_collect_all(group_id: str, win_id: int = 0) -> None:
             _persist_description(manager, workspace.id, tab.tab_id, tab)
 
     message.info(
-        f"Collected {len(collected)} tab(s) into '{group_id}'; "
+        f"Collected {len(collected)} tab(s) into '{target_name}'; "
         f"skipped {len(skipped)}.")
 
 
