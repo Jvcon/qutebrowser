@@ -114,24 +114,48 @@ class PinnedTabModel(QAbstractItemModel):
     ) -> None:
         super().__init__(parent)
         self._pinned: list[PinnedTab] = list(pinned) if pinned else []
+        self._filter_text = ''
+        self._visible: list[PinnedTab] = list(self._pinned)
 
     def set_pinned(self, pinned: list[PinnedTab]) -> None:
         """Replace the model contents with *pinned* and reset views."""
         self.beginResetModel()
         self._pinned = list(pinned)
+        self._recompute_visible()
         self.endResetModel()
 
+    def set_filter(self, text: str) -> None:
+        """Filter rows to those whose title/URL contains *text*."""
+        text = text.strip()
+        if text == self._filter_text:
+            return
+        self._filter_text = text
+        self.beginResetModel()
+        self._recompute_visible()
+        self.endResetModel()
+
+    def _recompute_visible(self) -> None:
+        """Recompute :attr:`_visible` from :attr:`_pinned` and the filter."""
+        if not self._filter_text:
+            self._visible = list(self._pinned)
+            return
+        needle = self._filter_text.lower()
+        self._visible = [
+            tab for tab in self._pinned
+            if needle in f"{tab.title} {tab.url}".lower()
+        ]
+
     def pinned_at(self, row: int) -> PinnedTab | None:
-        """Return the PinnedTab at *row*, or None if out of range."""
-        if 0 <= row < len(self._pinned):
-            return self._pinned[row]
+        """Return the visible PinnedTab at *row*, or None if out of range."""
+        if 0 <= row < len(self._visible):
+            return self._visible[row]
         return None
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         if parent.isValid():
             # We are a list, not a tree.
             return 0
-        return len(self._pinned)
+        return len(self._visible)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 1
@@ -144,7 +168,7 @@ class PinnedTabModel(QAbstractItemModel):
     ) -> QModelIndex:
         if not self.hasIndex(row, column, parent):
             return QModelIndex()
-        return self.createIndex(row, column, self._pinned[row])
+        return self.createIndex(row, column, self._visible[row])
 
     def parent(  # noqa: N802 - Qt naming
             self,
@@ -161,7 +185,7 @@ class PinnedTabModel(QAbstractItemModel):
     ):
         if not index.isValid():
             return None
-        tab = self._pinned[index.row()]
+        tab = self._visible[index.row()]
         return _pinned_tab_data(tab, role)
 
 
@@ -417,3 +441,7 @@ class PINPanel(QWidget):
     def list_widget(self) -> QListView:
         """Return the inner QListView for direct focus / event routing."""
         return self._list
+
+    def set_filter(self, text: str) -> None:
+        """Apply a title/URL filter to the pinned list (delegates to model)."""
+        self._model.set_filter(text)

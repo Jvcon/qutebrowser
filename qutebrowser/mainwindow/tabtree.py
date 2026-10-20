@@ -240,7 +240,7 @@ class TabTreeModel(QAbstractItemModel):
         self._highlighted_tab_id: Optional[int] = None
         self._highlight_timer: Optional[QTimer] = None
         self._show_archived = False
-        # VP-P5: when ``_search_hits`` is not None the tree renders only the
+# VP-P5: when ``_search_hits`` is not None the tree renders only the
         # matching entries, aggregated by group.  ``None`` means the normal,
         # unfiltered view.
         self._search_hits: Optional[list[search.SearchHit]] = None
@@ -249,6 +249,7 @@ class TabTreeModel(QAbstractItemModel):
         # selection mid-operation.
         self._selected: set[int] = set()
         self._selection_mode: bool = False
+        self._filter_text = ''
         self._placeholder_pixmap = self._create_placeholder_pixmap()
         self.set_workspace(manager.get_active())
 
@@ -299,6 +300,20 @@ class TabTreeModel(QAbstractItemModel):
         if show == self._show_archived:
             return
         self._show_archived = show
+        self.set_workspace(self._workspace)
+
+    def set_filter(self, text: str) -> None:
+        """Filter rows to those whose title/URL contains *text*.
+
+        The filter is a case-insensitive substring match on the tab's
+        persisted and runtime title/URL. Matching tabs and their ancestor
+        chain (parent tabs, groups) stay visible so matches remain
+        reachable. An empty *text* clears the filter.
+        """
+        text = text.strip()
+        if text == self._filter_text:
+            return
+        self._filter_text = text
         self.set_workspace(self._workspace)
 
     def set_tab_info(
@@ -673,12 +688,27 @@ class TabTreeModel(QAbstractItemModel):
 
     def _build_tree(self, workspace: Workspace) -> None:
         tabs = list(workspace.tabs)
+
+        if self._filter_text:
+            keep_ids = self._filter_keep_ids(tabs)
+            tabs = [t for t in tabs if t.tab_id in keep_ids]
+        else:
+            keep_ids = None
+
         parent_ids = {t.parent_id for t in tabs if t.parent_id is not None}
 
         groups = [
             group for group in workspace.groups
             if self._show_archived or not group.archived
         ]
+        if keep_ids is not None:
+            needle = self._filter_text.lower()
+            groups = [
+                group for group in groups
+                if needle in group.name.lower()
+                or any(t.tab_id in keep_ids
+                       for t in workspace.tabs if t.group_id == group.group_id)
+            ]
         # Pinned groups sort first. Without the open-first setting,
         # insertion order is preserved within each band (``sorted`` is
         # stable); pinning itself never changes list order.
@@ -754,6 +784,36 @@ class TabTreeModel(QAbstractItemModel):
             node.row = len(target.children)
             target.children.append(node)
             self._tab_nodes[hit.entry.tab_id] = node
+
+    def _filter_keep_ids(self, tabs: list[WorkspaceTab]) -> set[int]:
+        """Return the tab ids to keep under the active filter.
+
+        A tab is kept when its title or URL (persisted or runtime) contains
+        the filter text; its ancestor chain via ``parent_id`` is also kept so
+        matches remain reachable in the tree.
+        """
+        needle = self._filter_text.lower()
+        matched: set[int] = set()
+        for tab in tabs:
+            info = self._tab_info.get(tab.tab_id, _TabInfo())
+            haystack = ' '.join(
+                [tab.title, tab.url, info.title, info.url]).lower()
+            if needle in haystack:
+                matched.add(tab.tab_id)
+
+        parent_of = {
+            t.tab_id: t.parent_id for t in tabs if t.parent_id is not None
+        }
+        keep = set(matched)
+        changed = True
+        while changed:
+            changed = False
+            for tab_id in list(keep):
+                parent_id = parent_of.get(tab_id)
+                if parent_id is not None and parent_id not in keep:
+                    keep.add(parent_id)
+                    changed = True
+        return keep
 
     def _group_tab_count(self, group: Group) -> int:
         if self._workspace is None:
@@ -1873,6 +1933,10 @@ class TabTree(QWidget):
         else:
             self._placeholder.setText("No tabs in this workspace")
         self._stack.setCurrentIndex(1 if empty else 0)
+
+    def set_filter(self, text: str) -> None:
+        """Apply a title/URL filter to the tree (delegates to the model)."""
+        self._model.set_filter(text)
 
     def view(self) -> QTreeView:
         """Return the inner ``QTreeView`` for focus routing."""

@@ -1919,3 +1919,14 @@ class CommandDispatcher:
         panel = objreg.get('vertical-panel', scope='window',
                            window=self._win_id)
         panel.toggle()
+
+    @cmdutils.register(instance='command-dispatcher', scope='window',
+                       name='panel-filter')
+    def panel_filter(self) -> None:
+        """Open (show and focus) the vertical panel's transient filter row.
+
+        Bound to ``/`` in ``workspace_panel`` mode per ADR 0008 § 2.
+        """
+        panel = objreg.get('vertical-panel', scope='window',
+                           window=self._win_id)
+        panel.open_filter()

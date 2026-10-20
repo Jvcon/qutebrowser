@@ -33,7 +33,7 @@ from qutebrowser.qt.widgets import QApplication, QVBoxLayout, QWidget
 
 from qutebrowser.config import config
 from qutebrowser.keyinput import modeman
-from qutebrowser.mainwindow import pinpanel, tabtree, workspaceindicator
+from qutebrowser.mainwindow import filterrow, pinpanel, tabtree, workspaceindicator
 from qutebrowser.utils import usertypes
 
 
@@ -89,6 +89,13 @@ class VerticalPanel(QWidget):
             self.pin_panel = pinpanel.PINPanel(
                 win_id=win_id, manager=manager, parent=self)
             self._layout.addWidget(self.pin_panel)
+
+        # FilterRow sits above the TabTree (ADR 0008 § 2); hidden until
+        # '/' opens it. It is manager-independent, so it is always built.
+        self.filter_row = filterrow.FilterRow(parent=self)
+        self._layout.addWidget(self.filter_row)
+        self.filter_row.filter_changed.connect(self._on_filter_changed)
+        self.filter_row.closed.connect(self._on_filter_closed)
 
         # TabTree fills the space between PINPanel and the future
         # WorkspaceIndicator. It is optional so tests can pass a mock
@@ -162,6 +169,22 @@ class VerticalPanel(QWidget):
                 else self
             )
             target.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def open_filter(self) -> None:
+        """Show and focus the transient filter row."""
+        self.filter_row.open()
+
+    def _on_filter_changed(self, text: str) -> None:
+        """Push the filter text into the PIN and TabTree models."""
+        if self.pin_panel is not None:
+            self.pin_panel.set_filter(text)
+        if self.tab_tree is not None:
+            self.tab_tree.set_filter(text)
+
+    def _on_filter_closed(self) -> None:
+        """Return focus to the TabTree when the filter row closes."""
+        if self.tab_tree is not None:
+            self.tab_tree.view().setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_focus_changed(
             self,
