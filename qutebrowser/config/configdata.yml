@@ -4135,6 +4135,8 @@ bindings.default:
       <Ctrl-Return>: vp-batch-open-tabs
       <Ctrl-Shift-Return>: vp-batch-open-window
       <Ctrl-C>: vp-collect-all
+      "]": workspace-next
+      "[": workspace-prev
   type:
     name: Dict
     none_ok: true

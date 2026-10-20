@@ -599,6 +599,78 @@ class TestWorkspaceDelete:
             commands.workspace_delete('nope')
 
 
+class TestWorkspaceSwitch:
+
+    def test_switch_sets_active(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        fake_manager.add_workspace('first')
+        second = fake_manager.add_workspace('second')
+
+        commands.workspace_switch('second')
+
+        assert fake_manager.get_active() is second
+        assert messages == ["Switched to workspace 'second'."]
+
+    def test_switch_to_same_is_noop(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        fake_manager.add_workspace('first')
+
+        commands.workspace_switch('first')
+
+        assert messages == ["Already on workspace 'first'."]
+
+    def test_switch_missing_raises(self, fake_manager: FakeManager) -> None:
+        fake_manager.add_workspace('first')
+        with pytest.raises(cmdutils.CommandError, match='No workspace'):
+            commands.workspace_switch('nope')
+
+
+class TestWorkspaceCycle:
+
+    def test_next_wraps_to_first(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        first = fake_manager.add_workspace('first')
+        fake_manager.add_workspace('second')
+        third = fake_manager.add_workspace('third')
+        fake_manager.set_active(third.id)
+
+        commands.workspace_next()
+
+        assert fake_manager.get_active() is first
+        assert messages == ["Switched to workspace 'first'."]
+
+    def test_prev_moves_back(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        first = fake_manager.add_workspace('first')
+        second = fake_manager.add_workspace('second')
+        fake_manager.set_active(second.id)
+
+        commands.workspace_prev()
+
+        assert fake_manager.get_active() is first
+        assert messages == ["Switched to workspace 'first'."]
+
+    def test_cycle_skips_archived(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        first = fake_manager.add_workspace('first')
+        hidden = fake_manager.add_workspace('hidden')
+        third = fake_manager.add_workspace('third')
+        fake_manager.archive_workspace(hidden.id)
+        fake_manager.set_active(first.id)
+
+        commands.workspace_next()
+
+        assert fake_manager.get_active() is third
+
+    def test_cycle_noop_with_one_workspace(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        fake_manager.add_workspace('only')
+
+        commands.workspace_next()
+
+        assert messages == ["No other workspace to switch to."]
+
+
 class TestGroupCommands:
 
     def test_new_creates_group(

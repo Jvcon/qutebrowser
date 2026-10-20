@@ -1048,3 +1048,63 @@ def vp_batch_open_tabs(win_id: int = 0) -> None:
         workspace.id, selected, win_id=win_id)
     message.info(f"Opened {opened} tab(s); reused {reused}.")
     _report_ignored(selected, opened + reused)
+# Workspace switching (ADR 0008 § 4: switching happens via the
+# WorkspaceIndicator; these commands are the keyboard/command equivalents,
+# registered in `bindings.default.workspace_panel:`).
+
+
+@cmdutils.register(name='workspace-switch')
+def workspace_switch(name: str) -> None:
+    """Switch the active workspace to the given name.
+
+    Args:
+        name: The name of the workspace to switch to.
+    """
+    manager = _manager()
+    workspace = _lookup(name, manager)
+    active = manager.get_active()
+    if active is not None and active.id == workspace.id:
+        message.info(f"Already on workspace '{workspace.name}'.")
+        return
+    manager.set_active(workspace.id)
+    message.info(f"Switched to workspace '{workspace.name}'.")
+
+
+@cmdutils.register(name='workspace-next')
+def workspace_next() -> None:
+    """Switch to the next non-archived workspace (wrapping around)."""
+    _cycle_workspace(step=1)
+
+
+@cmdutils.register(name='workspace-prev')
+def workspace_prev() -> None:
+    """Switch to the previous non-archived workspace (wrapping around)."""
+    _cycle_workspace(step=-1)
+
+
+def _cycle_workspace(step: int) -> None:
+    """Switch to the workspace *step* positions away from the active one.
+
+    Archived workspaces are skipped. With fewer than two candidates this is
+    a no-op.
+    """
+    manager = _manager()
+    workspaces = [ws for ws in manager.list_all_workspaces()
+                  if not ws.archived]
+    if len(workspaces) < 2:
+        message.info("No other workspace to switch to.")
+        return
+
+    active = manager.get_active()
+    if active is None:
+        manager.set_active(workspaces[0].id)
+        message.info(f"Switched to workspace '{workspaces[0].name}'.")
+        return
+
+    index = next(
+        (i for i, ws in enumerate(workspaces) if ws.id == active.id),
+        0,
+    )
+    target = workspaces[(index + step) % len(workspaces)]
+    manager.set_active(target.id)
+    message.info(f"Switched to workspace '{target.name}'.")

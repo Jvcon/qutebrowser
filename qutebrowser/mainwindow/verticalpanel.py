@@ -9,12 +9,11 @@ panel is composed (top to bottom) of:
 
 - :class:`qutebrowser.mainwindow.pinpanel.PINPanel`
 - :class:`qutebrowser.mainwindow.tabtree.TabTree`
-- WorkspaceIndicator  (added in a later sub-slice)
+- :class:`qutebrowser.mainwindow.workspaceindicator.WorkspaceIndicator`
 
-The PINPanel and TabTree are now wired in; the WorkspaceIndicator
-follows in a subsequent sub-slice. The empty shell plus the focus
-event filter and the visibility toggle landed in the prior sub-slice
-and remain unchanged.
+The PINPanel, TabTree, and WorkspaceIndicator are all wired in. The
+empty shell plus the focus event filter and the visibility toggle landed
+in the prior sub-slice and remain unchanged.
 
 Focus protocol
 =============
@@ -34,7 +33,7 @@ from qutebrowser.qt.widgets import QApplication, QVBoxLayout, QWidget
 
 from qutebrowser.config import config
 from qutebrowser.keyinput import modeman
-from qutebrowser.mainwindow import pinpanel, tabtree
+from qutebrowser.mainwindow import pinpanel, tabtree, workspaceindicator
 from qutebrowser.utils import usertypes
 
 
@@ -99,6 +98,15 @@ class VerticalPanel(QWidget):
             self.tab_tree = tabtree.TabTree(
                 win_id=win_id, manager=manager, parent=self)
             self._layout.addWidget(self.tab_tree, stretch=1)
+
+        # WorkspaceIndicator (workspace switching) sits at the bottom.
+        # Optional for the same reason as the sections above.
+        self.workspace_indicator: (
+            workspaceindicator.WorkspaceIndicator | None) = None
+        if manager is not None:
+            self.workspace_indicator = workspaceindicator.WorkspaceIndicator(
+                win_id=win_id, manager=manager, parent=self)
+            self._layout.addWidget(self.workspace_indicator)
 
         self._apply_width()
         if config.val.verticalpanel.visible:
