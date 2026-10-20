@@ -46,6 +46,28 @@ def _host(url: str) -> str:
     return QUrl(url).host().lower()
 
 
+# The three reading states of a WorkspaceTab (issue #15).
+READING_STATUSES = ('FRESH', 'ACTIVE', 'DONE')
+
+# The two open states used by the VP-D1 suspend/restore machinery.
+OPEN_STATUSES = ('OPEN', 'SUSPENDED')
+
+
+def _parse_timestamp(value: str) -> Optional[datetime.datetime]:
+    """Parse an ISO 8601 *value* into an aware UTC datetime, or None.
+
+    Naive timestamps are assumed to be UTC so comparisons against the
+    timezone-aware cutoff never raise.
+    """
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed
+
+
 @dataclasses.dataclass
 class TabMetadata:
 
@@ -669,6 +691,106 @@ class WorkspaceManager(QObject):
                 workspace_id, tab_id, group_id, metadata=meta)
             collected.append(tab_id)
         return collected, skipped
+
+    # --- reading status / auto-cleanup (VP-F3) ---
+
+    def set_reading_status(
+            self,
+            workspace_id: uuid.UUID,
+            tab_ids: Iterable[int],
+            status: str,
+    ) -> int:
+        """Set the reading status of the given tabs in one batch.
+
+        Valid *status* values are ``'FRESH'``, ``'ACTIVE'`` and ``'DONE'``.
+        :attr:`changed` is emitted at most once, and only when at least one
+        tab was matched (so a no-op batch stays silent).
+
+        Args:
+            workspace_id: Workspace owning the tabs.
+            tab_ids: Runtime ids of the tabs to update. Unknown ids are
+                ignored.
+            status: One of the :data:`READING_STATUSES`.
+
+        Returns:
+            The number of tabs that were matched (and assigned *status*).
+
+        Raises:
+            ValueError: If *status* is not a valid reading status.
+        """
+        if status not in READING_STATUSES:
+            raise ValueError(
+                f"Invalid reading status {status!r}; expected one of "
+                f"{', '.join(READING_STATUSES)}.")
+        wanted = set(tab_ids)
+        workspace = self._workspaces[workspace_id]
+        count = 0
+        for tab in workspace.tabs:
+            if tab.tab_id in wanted:
+                tab.reading_status = status
+                count += 1
+        if count > 0:
+            self.changed.emit()
+        return count
+
+    def tabs_by_status(
+            self,
+            workspace_id: uuid.UUID,
+            status: str,
+    ) -> list[WorkspaceTab]:
+        """Return the tabs in *workspace_id* whose reading status matches.
+
+        This is a pure query: no :attr:`changed` is emitted.
+        """
+        workspace = self._workspaces[workspace_id]
+        return [tab for tab in workspace.tabs
+                if tab.reading_status == status]
+
+    def cleanup_old_done(
+            self,
+            workspace_id: uuid.UUID,
+            days: int,
+    ) -> int:
+        """Remove old ``'DONE'`` suspended tabs from a workspace.
+
+        A tab is removed only when *all* of the following hold:
+
+        * its ``reading_status`` is ``'DONE'``;
+        * its ``open_status`` is ``'SUSPENDED'`` (read via ``getattr`` with a
+          ``'SUSPENDED'`` fallback so this works before VP-D1 adds the
+          field);
+        * its effective timestamp — ``last_fetched``, else the workspace's
+          ``last_active``, else "now" — is older than *days*.
+
+        Groups are never touched. :attr:`changed` is emitted once if (and
+        only if) at least one tab was removed.
+
+        Returns:
+            The number of tabs that were removed.
+        """
+        workspace = self._workspaces[workspace_id]
+        cutoff = (datetime.datetime.now(datetime.timezone.utc)
+                  - datetime.timedelta(days=days))
+        removed = 0
+        kept: list[WorkspaceTab] = []
+        for tab in workspace.tabs:
+            if tab.reading_status != 'DONE':
+                kept.append(tab)
+                continue
+            if getattr(tab, 'open_status', 'SUSPENDED') != 'SUSPENDED':
+                kept.append(tab)
+                continue
+            timestamp = (tab.last_fetched or workspace.last_active
+                         or _now_seconds())
+            parsed = _parse_timestamp(timestamp)
+            if parsed is not None and parsed < cutoff:
+                removed += 1
+            else:
+                kept.append(tab)
+        if removed:
+            workspace.tabs = kept
+            self.changed.emit()
+        return removed
 
     # --- pinned tabs ---
 
