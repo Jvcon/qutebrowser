@@ -671,7 +671,8 @@ def vp_cleanup_done(days: int | None = None) -> None:
         effective = configured
 
     removed = manager.cleanup_old_done(workspace.id, effective)
-    message.info(f"Removed {removed} done tab(s).")
+    if removed > 0:
+        message.info(f"Removed {removed} done tab(s).")
 
 # VP-F4 (vp/16): multi-select + batch operations. The selection itself lives
 # in the window's TabTree model; these commands drive it and hand the selected

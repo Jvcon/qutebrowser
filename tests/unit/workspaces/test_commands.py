@@ -728,6 +728,20 @@ class TestCleanupCommand:
         assert fake_manager.cleanups == [(workspace.id, 50)]
         assert any('range' in text for text in messages)
 
+    def test_silent_when_nothing_removed(
+            self,
+            fake_manager: FakeManager,
+            auto_cleanup_days: list[int],
+            messages: list[str],
+    ) -> None:
+        auto_cleanup_days[0] = 30
+        fake_manager.add_workspace('w')
+        fake_manager.cleanup_result = 0
+
+        commands.vp_cleanup_done()
+
+        assert messages == []
+
     def test_requires_active_workspace(
             self,
             fake_manager: FakeManager,
