@@ -465,17 +465,29 @@ class WorkspaceManager(QObject):
             self,
             workspace_id: uuid.UUID,
             tab_ids: Iterable[int],
+            *,
+            confirm: bool = True,
     ) -> int:
         """Remove every known tab in *tab_ids* from *workspace_id*.
 
         Children of a removed tab are detached (their ``parent_id`` is
         cleared).  Unknown tab ids are skipped silently.  :attr:`changed`
-        is emitted once if anything was removed; the command layer is
-        responsible for confirming the deletion.
+        is emitted once if anything was removed.
+
+        Args:
+            workspace_id: Workspace owning the tabs.
+            tab_ids: Runtime ids of the tabs to remove.
+            confirm: When True (the default) the call is a no-op returning
+                ``0`` so the command layer can ask the user first; pass
+                ``False`` (or use ``-!``) to delete immediately.
 
         Returns:
             The number of tabs that were removed.
         """
+        if confirm:
+            # The command layer confirms via ``message.confirm_async`` and
+            # calls back with ``confirm=False`` from the yes_action.
+            return 0
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
             return 0
@@ -528,33 +540,45 @@ class WorkspaceManager(QObject):
 
         opened = 0
         reused = 0
+        to_open: list[str] = []
         for url in urls:
-            match: Any = None
-            for live in registry.values():
-                try:
-                    if live.url().toString() == url:
-                        match = live
-                        break
-                except (AttributeError, NotImplementedError):
-                    continue
+            match = self._live_tab_for_url(registry, url)
             if match is not None:
                 browser.widget.setCurrentWidget(match)
                 reused += 1
-            elif newwindow:
-                # The real ``TabbedBrowser.tabopen`` has no ``newwindow`` kwarg;
-                # the new-window path is to construct a fresh ``MainWindow``
-                # and use *its* tabbed browser, mirroring the
-                # ``tabs.tabs_are_windows`` branch in
-                # :meth:`TabbedBrowser.tabopen`.
-                from qutebrowser.mainwindow import mainwindow as _mw
-                window = _mw.MainWindow(private=browser.is_private)
-                window.tabbed_browser.tabopen(QUrl(url))
-                window.show()
-                opened += 1
             else:
+                to_open.append(url)
+
+        if not to_open:
+            return 0, reused
+        if newwindow:
+            # The real ``TabbedBrowser.tabopen`` has no ``newwindow`` kwarg;
+            # the new-window path constructs a *single* fresh ``MainWindow``
+            # holding every non-reused URL, mirroring the
+            # ``tabs.tabs_are_windows`` branch in
+            # :meth:`TabbedBrowser.tabopen`.  The first ``tabopen`` creates
+            # the window's initial tab; the rest land in the same window.
+            from qutebrowser.mainwindow import mainwindow as _mw
+            window = _mw.MainWindow(private=browser.is_private)
+            for url in to_open:
+                window.tabbed_browser.tabopen(QUrl(url))
+            window.show()
+        else:
+            for url in to_open:
                 browser.tabopen(QUrl(url))
-                opened += 1
+        opened = len(to_open)
         return opened, reused
+
+    @staticmethod
+    def _live_tab_for_url(registry: Mapping[int, Any], url: str) -> Any:
+        """Return the live tab in *registry* whose URL matches *url*."""
+        for live in registry.values():
+            try:
+                if live.url().toString() == url:
+                    return live
+            except (AttributeError, NotImplementedError):
+                continue
+        return None
 
     def open_tabs_in_new_window(
             self,

@@ -194,7 +194,10 @@ class FakeManager:
         return count
 
     def delete_tabs(self, workspace_id: uuid.UUID,
-                    tab_ids: set[int]) -> int:
+                    tab_ids: set[int], *,
+                    confirm: bool = True) -> int:
+        if confirm:
+            return 0
         workspace = self._workspaces[workspace_id]
         id_set = set(tab_ids)
         removed = [tab for tab in workspace.tabs if tab.tab_id in id_set]
@@ -878,13 +881,14 @@ class TestBatchCommands:
         assert fake_manager.deleted_tabs == [1]
         assert workspace.tabs == []
 
-    def test_vp_batch_delete_empty_selection_noop(
+    def test_vp_batch_delete_empty_selection_raises(
             self, fake_manager: FakeManager, fake_tree: FakeTree,
             confirmations: list[Callable[[], None]],
             messages: list[str]) -> None:
-        commands.vp_batch_delete(win_id=0)
+        with pytest.raises(cmdutils.CommandError, match='No tabs selected'):
+            commands.vp_batch_delete(win_id=0)
         assert confirmations == []
-        assert messages == ["No tabs selected."]
+        assert messages == []
 
     def test_vp_batch_open_window_dispatches(
             self, fake_manager: FakeManager, fake_tree: FakeTree,
@@ -909,11 +913,24 @@ class TestBatchCommands:
         assert fake_manager.opened_tabs == [(workspace.id, {1})]
         assert messages == ["Opened 2 tab(s); reused 0."]
 
-    def test_vp_batch_open_empty_selection_noop(
+    def test_vp_batch_open_window_empty_selection_silent(
             self, fake_manager: FakeManager, fake_tree: FakeTree,
             messages: list[str]) -> None:
         commands.vp_batch_open_window(win_id=0)
-        assert messages == ["No tabs selected."]
+        assert messages == []
+
+    def test_vp_batch_move_reports_ignored(
+            self, fake_manager: FakeManager, fake_tree: FakeTree,
+            messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        fake_manager.create_group(workspace.id, 'g')
+        fake_manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+        fake_tree.model().selected.update({1, 99})
+
+        commands.vp_batch_move('g', win_id=0)
+
+        assert messages == [
+            "Moved 1 tab(s) into 'g'.", "Ignored 1 unknown id(s)."]
 
 
 class TestPersistence:

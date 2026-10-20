@@ -631,6 +631,9 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             is in multi-select mode.  The click is consumed instead of
             triggering :attr:`activated`; the host decides whether to add,
             remove or extend the selection.
+        selection_range_requested: Emitted when a tab row is Shift-clicked
+            while the model is in multi-select mode.  The host extends the
+            selection from its current anchor to the clicked row.
     """
 
     fold_toggled = pyqtSignal(QModelIndex)
@@ -639,6 +642,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
     pin_toggled = pyqtSignal(QModelIndex)
     activated = pyqtSignal(QModelIndex)
     selection_toggled = pyqtSignal(QModelIndex)
+    selection_range_requested = pyqtSignal(QModelIndex)
 
     ROW_HEIGHT_GROUP = 24
     ROW_HEIGHT_TAB = 22
@@ -785,10 +789,19 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         # selection and is consumed so it never activates the tab.  The
         # delegate only reports the hit; the host (which owns both the
         # model and the selection-mode state) decides add/remove/extend.
+        #
+        # Modifier choice (documented per review): Shift extends the range
+        # from the current anchor; Ctrl/Meta toggles a single row; a plain
+        # click is treated as a single toggle too, matching the discoverable
+        # click-to-select behaviour.
         selection_mode = getattr(model, 'selection_mode', None)
         if (callable(selection_mode) and selection_mode()
                 and kind in (Kind.Tab, Kind.ParentTab)):
-            self.selection_toggled.emit(index)
+            modifiers = event.modifiers()
+            if modifiers & Qt.KeyboardModifier.ShiftModifier:
+                self.selection_range_requested.emit(index)
+            else:
+                self.selection_toggled.emit(index)
             return True
 
         rect = option.rect
@@ -1197,6 +1210,9 @@ class TabTree(QWidget):
         selection_toggled: Emitted when a tab row is clicked while
             multi-select mode is active.  Argument: the clicked
             ``QModelIndex``.
+        selection_range_requested: Emitted when a tab row is Shift-clicked
+            while multi-select mode is active.  Argument: the clicked
+            ``QModelIndex``.
     """
 
     activated = pyqtSignal(QModelIndex)
@@ -1206,6 +1222,7 @@ class TabTree(QWidget):
     close_requested = pyqtSignal(QModelIndex)
     pin_toggled = pyqtSignal(QModelIndex)
     selection_toggled = pyqtSignal(QModelIndex)
+    selection_range_requested = pyqtSignal(QModelIndex)
 
     def __init__(
             self,
@@ -1268,6 +1285,8 @@ class TabTree(QWidget):
         self._delegate.pin_toggled.connect(self.pin_toggled)
         self._delegate.activated.connect(self.activated)
         self._delegate.selection_toggled.connect(self._on_selection_toggled)
+        self._delegate.selection_range_requested.connect(
+            self._on_selection_range_requested)
 
         # Keyboard selection (J/K).  These are a *secondary* affordance: the
         # host only emits ``activated``; the bridge turns that into a
@@ -1353,6 +1372,21 @@ class TabTree(QWidget):
             return
         selected = tab_id in self._model.selected_tab_ids()
         self._model.set_selected(tab_id, not selected)
+        # Remember the last plain toggle as the anchor for a later
+        # Shift-click range extension.
+        self._selection_anchor = index
+        self.selection_toggled.emit(index)
+
+    def _on_selection_range_requested(self, index: QModelIndex) -> None:
+        """Extend the selection from the anchor to a Shift-clicked row."""
+        anchor = self._selection_anchor
+        if anchor is None or not anchor.isValid():
+            anchor = self._view.currentIndex()
+        if not anchor.isValid():
+            self._on_selection_toggled(index)
+            return
+        self._view.setCurrentIndex(index)
+        self._model.select_range(self._tab_ids_between(anchor, index), True)
         self.selection_toggled.emit(index)
 
     def _extend_selection(self, delta: int) -> None:

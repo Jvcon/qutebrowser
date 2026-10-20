@@ -735,6 +735,13 @@ def vp_select_none(win_id: int = 0) -> None:
     message.info("Cleared tab selection.")
 
 
+def _report_ignored(selected: set[int], handled: int) -> None:
+    """Report how many selected ids the manager did not recognise."""
+    ignored = len(selected) - handled
+    if ignored > 0:
+        message.info(f"Ignored {ignored} unknown id(s).")
+
+
 @cmdutils.register(name='vp-batch-move')
 @cmdutils.argument('group_ref', metavar='group')
 @cmdutils.argument('win_id', value=cmdutils.Value.win_id)
@@ -755,6 +762,7 @@ def vp_batch_move(group_ref: str, win_id: int = 0) -> None:
     workspace, group = _resolve_group_target(manager, group_ref)
     moved = manager.move_tabs(workspace.id, selected, group.group_id)
     message.info(f"Moved {moved} tab(s) into '{group.name}'.")
+    _report_ignored(selected, moved)
 
 
 @cmdutils.register(name='vp-batch-status')
@@ -779,6 +787,7 @@ def vp_batch_status(status: str, win_id: int = 0) -> None:
     except ValueError as e:
         raise cmdutils.CommandError(str(e)) from e
     message.info(f"Marked {count} tab(s) as {normalized}.")
+    _report_ignored(selected, count)
 
 
 @cmdutils.register(name='vp-batch-delete')
@@ -794,20 +803,30 @@ def vp_batch_delete(force: bool = False, win_id: int = 0) -> None:
     model = tree.model()
     selected = model.selected_tab_ids()
     if not selected:
-        message.info("No tabs selected.")
-        return
+        raise cmdutils.CommandError("No tabs selected.")
     workspace = _active_workspace(manager)
     if force:
-        count = manager.delete_tabs(workspace.id, selected)
+        count = manager.delete_tabs(workspace.id, selected, confirm=False)
         model.select_all(False)
         message.info(f"Deleted {count} tab(s).")
+        _report_ignored(selected, count)
         return
     message.confirm_async(
         title=f"Delete {len(selected)} selected tab(s)?",
         default=False,
         yes_action=_make_batch_delete_action(
             manager, workspace, selected, model),
+        cancel_action=_make_batch_delete_cancel(),
     )
+
+
+def _make_batch_delete_cancel() -> Callable[[], None]:
+    """Return the callback emitted when the delete prompt is cancelled."""
+
+    def cancel() -> None:
+        message.info("Cancelled.")
+
+    return cancel
 
 
 def _make_batch_delete_action(
@@ -820,9 +839,10 @@ def _make_batch_delete_action(
     ids = set(tab_ids)
 
     def delete() -> None:
-        count = manager.delete_tabs(workspace.id, ids)
+        count = manager.delete_tabs(workspace.id, ids, confirm=False)
         model.select_all(False)
         message.info(f"Deleted {count} tab(s).")
+        _report_ignored(ids, count)
 
     return delete
 
@@ -835,13 +855,14 @@ def vp_batch_open_window(win_id: int = 0) -> None:
     tree = _tab_tree(win_id)
     selected = tree.model().selected_tab_ids()
     if not selected:
-        message.info("No tabs selected.")
+        # Spec: silent no-op (unlike the other batch commands).
         return
     workspace = _active_workspace(manager)
     opened, reused = manager.open_tabs_in_new_window(
         workspace.id, selected, win_id=win_id)
     message.info(
         f"Opened {opened} tab(s) in a new window; reused {reused}.")
+    _report_ignored(selected, opened + reused)
 
 
 @cmdutils.register(name='vp-batch-open-tabs')
@@ -852,9 +873,9 @@ def vp_batch_open_tabs(win_id: int = 0) -> None:
     tree = _tab_tree(win_id)
     selected = tree.model().selected_tab_ids()
     if not selected:
-        message.info("No tabs selected.")
-        return
+        raise cmdutils.CommandError("No tabs selected.")
     workspace = _active_workspace(manager)
     opened, reused = manager.open_tabs_as_new_tabs(
         workspace.id, selected, win_id=win_id)
     message.info(f"Opened {opened} tab(s); reused {reused}.")
+    _report_ignored(selected, opened + reused)
