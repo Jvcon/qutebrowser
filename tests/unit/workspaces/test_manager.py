@@ -245,6 +245,70 @@ class TestTabMembership:
         assert workspace.tabs[0].group_id is None
 
 
+class TestOpenStatus:
+
+    def test_set_open_status_updates_single_entry(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=1, open_status='SUSPENDED'))
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=2, open_status='SUSPENDED'))
+
+        result = manager.set_open_status(workspace.id, 1, 'OPEN')
+
+        assert result == 1
+        assert workspace.tabs[0].open_status == 'OPEN'
+        assert workspace.tabs[1].open_status == 'SUSPENDED'
+
+    def test_set_open_status_invalid_raises(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id, WorkspaceTab(tab_id=1))
+
+        with pytest.raises(ValueError):
+            manager.set_open_status(workspace.id, 1, 'CLOSED')
+
+    def test_set_open_status_emits_changed_on_change(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=1, open_status='SUSPENDED'))
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.set_open_status(workspace.id, 1, 'OPEN')
+
+        assert changes == [True]
+
+    def test_set_open_status_noop_does_not_emit(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=1, open_status='OPEN'))
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        result = manager.set_open_status(workspace.id, 1, 'OPEN')
+
+        assert result == 1
+        assert changes == []
+
+    def test_set_open_status_unknown_tab_returns_zero(self, manager):
+        workspace = manager.add_workspace('w')
+        assert manager.set_open_status(workspace.id, 99, 'OPEN') == 0
+
+    def test_open_and_suspended_queries(self, manager):
+        workspace = manager.add_workspace('w')
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=1, open_status='OPEN'))
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=2, open_status='SUSPENDED'))
+        manager.add_tab(workspace.id,
+                        WorkspaceTab(tab_id=3, open_status='OPEN'))
+
+        assert [tab.tab_id for tab in manager.open_tabs(workspace.id)] == [
+            1, 3]
+        assert [tab.tab_id
+                for tab in manager.suspended_tabs(workspace.id)] == [2]
+
+
 class TestCollect:
 
     def test_collect_fresh_url_captures_metadata(self, manager):

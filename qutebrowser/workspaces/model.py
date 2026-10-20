@@ -147,6 +147,9 @@ class WorkspaceTab:
             fetch, if any.
         fetch_attempts: Number of metadata fetch attempts made so far.
         last_error: Short error string from the last failed fetch, if any.
+        open_status: Whether the tab is currently open in the browser
+            (``'OPEN'``) or was closed/suspended but kept in the workspace
+            (``'SUSPENDED'``).  These are the only valid values.
     """
 
     tab_id: int
@@ -161,6 +164,7 @@ class WorkspaceTab:
     last_fetched: Optional[str] = None
     fetch_attempts: int = 0
     last_error: Optional[str] = None
+    open_status: str = 'SUSPENDED'
 
     def __post_init__(self) -> None:
         """Ensure every user-editable field has an explicit flag."""
@@ -201,6 +205,7 @@ class WorkspaceTab:
             'last_fetched': self.last_fetched,
             'fetch_attempts': self.fetch_attempts,
             'last_error': self.last_error,
+            'open_status': self.open_status,
         }
 
     @classmethod
@@ -232,6 +237,7 @@ class WorkspaceTab:
             last_fetched=d.get('last_fetched'),
             fetch_attempts=int(d.get('fetch_attempts', 0) or 0),
             last_error=d.get('last_error'),
+            open_status=d.get('open_status', 'SUSPENDED') or 'SUSPENDED',
         )
 
 

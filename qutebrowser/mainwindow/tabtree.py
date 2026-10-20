@@ -85,6 +85,7 @@ BadgeRole = Qt.ItemDataRole.UserRole + 4
 UrlRole = Qt.ItemDataRole.UserRole + 5
 ActiveRole = Qt.ItemDataRole.UserRole + 6
 PinStateRole = Qt.ItemDataRole.UserRole + 7
+OpenStatusRole = Qt.ItemDataRole.UserRole + 8
 
 
 class Kind(enum.IntEnum):
@@ -165,6 +166,7 @@ class TabTreeModel(QAbstractItemModel):
         UrlRole: Role id for the tab URL (str).
         ActiveRole: Role id for whether the row is the active tab (bool).
         PinStateRole: Role id for whether the tab row is pinned (bool).
+        OpenStatusRole: Role id for the entry's OPEN/SUSPENDED state (str).
     """
 
     KindRole = KindRole
@@ -174,6 +176,7 @@ class TabTreeModel(QAbstractItemModel):
     UrlRole = UrlRole
     ActiveRole = ActiveRole
     PinStateRole = PinStateRole
+    OpenStatusRole = OpenStatusRole
 
     def __init__(
             self,
@@ -454,6 +457,8 @@ class TabTreeModel(QAbstractItemModel):
             return count
         if role == StatusRole:
             return Status.NONE
+        if role == OpenStatusRole:
+            return None
         if role == ActiveRole:
             return False
         return None
@@ -464,6 +469,8 @@ class TabTreeModel(QAbstractItemModel):
             return kind
         if role == ActiveRole:
             return self._active_tab_id == tab.tab_id
+        if role == OpenStatusRole:
+            return getattr(tab, 'open_status', 'SUSPENDED')
         if role in (
             Qt.ItemDataRole.DisplayRole,
             Qt.ItemDataRole.ToolTipRole,
@@ -474,7 +481,10 @@ class TabTreeModel(QAbstractItemModel):
         if role == FoldedRole:
             return self._tab_folded(tab, kind)
         if role == StatusRole:
-            return info.status
+            status = info.status
+            if getattr(tab, 'open_status', 'SUSPENDED') == 'SUSPENDED':
+                status |= Status.SUSPENDED
+            return status
         if role == PinStateRole:
             return info.status & Status.PINNED != 0
         if role == BadgeRole:

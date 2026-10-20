@@ -415,6 +415,52 @@ class WorkspaceManager(QObject):
                 return tab
         return None
 
+    def set_open_status(
+            self,
+            workspace_id: uuid.UUID,
+            tab_id: int,
+            status: str,
+    ) -> int:
+        """Set the OPEN/SUSPENDED state of a single tab entry.
+
+        Valid *status* values are ``'OPEN'`` and ``'SUSPENDED'``.  A
+        suspended entry is retained in the workspace (so it can be restored)
+        instead of being removed.
+
+        Args:
+            workspace_id: Workspace owning the tab.
+            tab_id: Runtime id of the tab entry to update.
+            status: Either ``'OPEN'`` or ``'SUSPENDED'``.
+
+        Returns:
+            1 if the entry was found and updated, 0 otherwise.
+
+        Raises:
+            ValueError: If *status* is not ``'OPEN'`` or ``'SUSPENDED'``.
+        """
+        if status not in ('OPEN', 'SUSPENDED'):
+            raise ValueError(
+                f"Invalid open status {status!r}; expected 'OPEN' or "
+                "'SUSPENDED'.")
+        tab = self.find_tab_by_id(workspace_id, tab_id)
+        if tab is None:
+            return 0
+        if tab.open_status != status:
+            tab.open_status = status
+            self.changed.emit()
+        return 1
+
+    def open_tabs(self, workspace_id: uuid.UUID) -> list[WorkspaceTab]:
+        """Return the tab entries in *workspace_id* which are OPEN."""
+        workspace = self._workspaces[workspace_id]
+        return [tab for tab in workspace.tabs if tab.open_status == 'OPEN']
+
+    def suspended_tabs(self, workspace_id: uuid.UUID) -> list[WorkspaceTab]:
+        """Return the tab entries in *workspace_id* which are SUSPENDED."""
+        workspace = self._workspaces[workspace_id]
+        return [tab for tab in workspace.tabs
+                if tab.open_status == 'SUSPENDED']
+
     def find_or_create_tab_by_url(
             self,
             workspace_id: uuid.UUID,
@@ -444,6 +490,7 @@ class WorkspaceManager(QObject):
             tab_id=tab_id if tab_id is not None else -1,
             url=url,
             source=_host(url),
+            open_status='OPEN',
         )
         self.add_tab(workspace_id, tab)
         return tab
@@ -554,6 +601,8 @@ class WorkspaceManager(QObject):
         meta = metadata or TabMetadata()
         tab = self.find_or_create_tab_by_url(
             workspace_id, meta.url, tab_id=tab_id)
+        # Collecting associates the entry with a live tab.
+        tab.open_status = 'OPEN'
 
         if meta.url:
             tab.url = meta.url

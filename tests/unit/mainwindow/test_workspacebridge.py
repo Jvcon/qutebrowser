@@ -217,19 +217,51 @@ class TestWorkspaceBridge:
         assert workspace.name == 'default'
         assert [t.tab_id for t in workspace.tabs] == [7]
 
-    def test_tab_removed_drops_from_manager(self, browser, manager, bridge):
+    def test_first_register_creates_open_entry(
+            self, browser, manager, bridge):
+        _open_tab(browser, MockTab(1))
+        workspace = manager.get_active()
+        assert workspace is not None
+        assert workspace.tabs[0].open_status == 'OPEN'
+        assert manager.open_tabs(workspace.id) == workspace.tabs
+
+    def test_reregister_keeps_entry_open(self, browser, manager, bridge):
+        tab = _open_tab(browser, MockTab(1))
+        manager.set_open_status(manager.get_active().id, 1, 'SUSPENDED')
+
+        bridge._register_tab(tab, 0)
+
+        assert manager.get_active().tabs[0].open_status == 'OPEN'
+
+    def test_tab_removed_suspends_entry(self, browser, manager, bridge):
         _open_tab(browser, MockTab(1))
         _open_tab(browser, MockTab(2))
         assert [t.tab_id for t in manager.get_active().tabs] == [1, 2]
 
         browser.widget.remove(0)
-        assert [t.tab_id for t in manager.get_active().tabs] == [2]
+        tabs = manager.get_active().tabs
+        assert [t.tab_id for t in tabs] == [1, 2]
+        assert tabs[0].open_status == 'SUSPENDED'
+        assert tabs[1].open_status == 'OPEN'
 
-    def test_shutting_down_drops_from_manager(
-            self, browser, manager, bridge):
+    def test_shutting_down_suspends_entry(self, browser, manager, bridge):
         tab = _open_tab(browser, MockTab(1))
         tab.shutting_down.emit()
-        assert manager.get_active().tabs == []
+        tabs = manager.get_active().tabs
+        assert [t.tab_id for t in tabs] == [1]
+        assert tabs[0].open_status == 'SUSPENDED'
+
+    def test_shutting_down_pushes_suspended_status(
+            self, browser, manager, model, bridge):
+        tab = _open_tab(browser, MockTab(1))
+        tab.title_changed.emit('Gone')
+
+        tab.shutting_down.emit()
+
+        assert model._tab_info[1].status & tabtree.Status.SUSPENDED
+        # The live display data was cleared before the status bit was pushed.
+        assert model._tab_info[1].title == ''
+        assert model.active_tab_id() is None
 
     def test_title_changed_updates_model(self, browser, model, bridge):
         tab = _open_tab(browser, MockTab(1))
@@ -279,12 +311,15 @@ class TestWorkspaceBridge:
         # so the new tab now occupies a row.
         assert tree._model.rowCount(QModelIndex()) == 1
 
-    def test_clear_tab_info_on_removal(self, browser, manager, model, bridge):
+    def test_clear_tab_info_on_suspend(self, browser, manager, model, bridge):
         tab = _open_tab(browser, MockTab(1))
         tab.title_changed.emit('Gone')
-        assert 1 in model._tab_info
+        assert model._tab_info[1].title == 'Gone'
         tab.shutting_down.emit()
-        assert 1 not in model._tab_info
+        # Metadata is cleared, but the SUSPENDED status bit is retained so
+        # the tree can paint the "zZ" badge.
+        assert model._tab_info[1].title == ''
+        assert model._tab_info[1].status & tabtree.Status.SUSPENDED
 
     def test_noop_when_manager_none(self, browser, model):
         bridge = workspacebridge.WorkspaceBridge(browser, None, model)
