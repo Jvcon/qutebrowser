@@ -12,6 +12,7 @@ effects — the ``@cmdutils.register`` decorators run at import time — from
 :mod:`qutebrowser.workspaces`.
 """
 
+import base64
 import uuid
 from collections.abc import Callable
 from typing import Any, Optional
@@ -23,7 +24,8 @@ from qutebrowser.utils.utils import format_size
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import (READING_STATUSES, TabMetadata,
                                             WorkspaceManager)
-from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
+from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
+                                          WorkspaceTab)
 
 #: Name of the default group collect commands land in when none is given.
 INBOX_GROUP_NAME = 'Inbox'
@@ -1152,6 +1154,144 @@ def tab_move_to_group(tab_id: int, group_name: str = 'root') -> None:
     manager.move_tab_to_group(workspace.id, tab_id, group_id)
     target = group_name if group_id is not None else 'root'
     message.info(f"Moved tab {tab_id} to {target}.")
+
+
+def _live_tab(win_id: int, tab_id: int) -> Any:
+    """Return the live tab for *tab_id* in *win_id*, or ``None``."""
+    try:
+        registry = objreg.get(
+            'tab-registry', scope='window', window=win_id)
+    except (KeyError, objreg.RegistryUnavailableError):
+        return None
+    return registry.get(tab_id)
+
+
+def _resolve_pinned(manager: WorkspaceManager, target: str) -> PinnedTab:
+    """Resolve *target* (a tab id or URL) to a pinned tab entry."""
+    try:
+        tab_id: Optional[int] = int(target)
+    except ValueError:
+        tab_id = None
+
+    pinned = manager.list_pinned()
+    if tab_id is not None:
+        for entry in pinned:
+            if entry.tab_id == tab_id:
+                return entry
+    for entry in pinned:
+        if entry.url == target:
+            return entry
+    raise cmdutils.CommandError(f"No pinned tab matching '{target}'.")
+
+
+def _resolve_pinned_position(
+        pinned: list[PinnedTab],
+        target: str,
+        *,
+        exclude_tab_id: int,
+) -> int:
+    """Resolve *target* to an index in the pinned list.
+
+    A tab id or URL selects the index of that entry.  A bare integer which
+    is not a pinned tab id is treated as a final position (0-based), which
+    makes ``:pintab-move 3 0`` move tab 3 to the top.
+    """
+    try:
+        value: Optional[int] = int(target)
+    except ValueError:
+        value = None
+
+    if value is not None:
+        for index, entry in enumerate(pinned):
+            if entry.tab_id == value and entry.tab_id != exclude_tab_id:
+                return index
+        if 0 <= value < len(pinned):
+            return value
+
+    for index, entry in enumerate(pinned):
+        if entry.url == target and entry.tab_id != exclude_tab_id:
+            return index
+    raise cmdutils.CommandError(f"No pinned position matching '{target}'.")
+
+
+def _pinned_from_entry(
+        manager: WorkspaceManager,
+        workspace: Workspace,
+        entry: WorkspaceTab,
+        win_id: int,
+) -> PinnedTab:
+    """Build a :class:`PinnedTab` from a workspace entry and its live tab."""
+    title = entry.title
+    url = entry.url
+    favicon_b64 = entry.favicon
+    live = _live_tab(win_id, entry.tab_id)
+    if live is not None:
+        metadata = _metadata_from_tab(live)
+        title = metadata.title or title
+        url = metadata.url or url
+        favicon_b64 = metadata.favicon or favicon_b64
+    favicon = (
+        base64.b64decode(favicon_b64) if favicon_b64 else None
+    )
+    return PinnedTab(
+        tab_id=entry.tab_id,
+        title=title,
+        url=url,
+        favicon=favicon,
+    )
+
+
+@cmdutils.register(name='pintab-add')
+@cmdutils.argument('target', metavar='target')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def pintab_add(target: str, win_id: int = 0) -> None:
+    """Pin a tab entry, shown in the vertical panel's PIN section.
+
+    Args:
+        target: Tab id or URL of the regular tab to pin.
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+    entry = _resolve_status_target(manager, workspace, target)
+    pinned = _pinned_from_entry(manager, workspace, entry, win_id)
+    manager.add_pinned(pinned)
+    message.info(f"Pinned tab {entry.tab_id}.")
+
+
+@cmdutils.register(name='pintab-remove')
+@cmdutils.argument('target', metavar='target')
+def pintab_remove(target: str) -> None:
+    """Remove a tab from the PIN section without closing the tab.
+
+    Args:
+        target: Tab id or URL of the pinned entry to unpin.
+    """
+    manager = _manager()
+    pinned = _resolve_pinned(manager, target)
+    manager.remove_pinned(pinned.tab_id)
+    message.info(f"Unpinned tab {pinned.tab_id}.")
+
+
+@cmdutils.register(name='pintab-move')
+@cmdutils.argument('from_target', metavar='from')
+@cmdutils.argument('to_target', metavar='to')
+def pintab_move(from_target: str, to_target: str) -> None:
+    """Reorder a pinned entry within the PIN section.
+
+    Args:
+        from_target: Tab id or URL of the pinned entry to move.
+        to_target: Target tab id, URL, or 0-based final position.
+    """
+    manager = _manager()
+    pinned = manager.list_pinned()
+    source = _resolve_pinned(manager, from_target)
+    new_index = _resolve_pinned_position(
+        pinned, to_target, exclude_tab_id=source.tab_id)
+    if not manager.move_pinned(source.tab_id, new_index):
+        message.info(f"Pinned tab {source.tab_id} is already in that position.")
+        return
+    message.info(
+        f"Moved pinned tab {source.tab_id} to position {new_index}.")
 
 
 @cmdutils.register(name='pintab-style-toggle')

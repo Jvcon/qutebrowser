@@ -1882,6 +1882,34 @@ class WorkspaceManager(QObject):
         self.changed.emit()
         self.pinned_changed.emit()
 
+    def move_pinned(self, tab_id: int, new_index: int) -> bool:
+        """Move the pinned tab *tab_id* to *new_index*.
+
+        Returns True when the list changed.  Unknown ids and out-of-range
+        indices are ignored (logged) so callers can resolve user input
+        without a second lookup.
+        """
+        entry = next(
+            (pinned for pinned in self._pinned if pinned.tab_id == tab_id),
+            None)
+        if entry is None:
+            log.workspaces.debug(
+                "move_pinned: unknown pinned tab %s", tab_id)
+            return False
+        if not 0 <= new_index < len(self._pinned):
+            log.workspaces.debug(
+                "move_pinned: index %s out of range (0..%s)",
+                new_index, len(self._pinned) - 1)
+            return False
+        old_index = self._pinned.index(entry)
+        if old_index == new_index:
+            return False
+        self._pinned.pop(old_index)
+        self._pinned.insert(new_index, entry)
+        self.changed.emit()
+        self.pinned_changed.emit()
+        return True
+
     def list_pinned(self) -> list[PinnedTab]:
         """Return all pinned tabs."""
         return list(self._pinned)

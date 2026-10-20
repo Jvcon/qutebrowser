@@ -1397,6 +1397,25 @@ class TestPinned:
         manager.add_pinned(PinnedTab(tab_id=1, title='new', url='u'))
         assert [p.title for p in manager.list_pinned()] == ['new']
 
+    def test_move_pinned_reorders(self, manager):
+        for tab_id in (1, 2, 3):
+            manager.add_pinned(
+                PinnedTab(tab_id=tab_id, title=str(tab_id), url='u'))
+
+        changes = []
+        manager.pinned_changed.connect(lambda: changes.append(True))
+        assert manager.move_pinned(1, 2) is True
+
+        assert [p.tab_id for p in manager.list_pinned()] == [2, 3, 1]
+        assert changes == [True]
+
+    def test_move_pinned_rejects_unknown_and_out_of_range(self, manager):
+        manager.add_pinned(PinnedTab(tab_id=1, title='t', url='u'))
+
+        assert manager.move_pinned(99, 0) is False
+        assert manager.move_pinned(1, 5) is False
+        assert [p.tab_id for p in manager.list_pinned()] == [1]
+
 
 class TestSetParent:
 

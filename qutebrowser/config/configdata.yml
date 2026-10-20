@@ -3837,6 +3837,9 @@ bindings.default:
       gm: tab-move
       gK: tab-move -
       gJ: tab-move +
+      gp: cmd-set-text -s :pintab-add
+      gP: cmd-set-text -s :pintab-remove
+      gM: cmd-set-text -s :pintab-move
       J: tab-next
       <Ctrl-PgDown>: tab-next
       K: tab-prev
@@ -4128,6 +4131,9 @@ bindings.default:
       <Escape>: mode-leave
     workspace_panel:
       <Escape>: mode-leave
+      gp: cmd-set-text -s :pintab-add
+      gP: cmd-set-text -s :pintab-remove
+      gM: cmd-set-text -s :pintab-move
       <Ctrl-Space>: vp-select-mode
       <Ctrl-A>: vp-select-all
       <Ctrl-N>: vp-select-none

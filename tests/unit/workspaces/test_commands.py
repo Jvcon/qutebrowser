@@ -16,7 +16,8 @@ from qutebrowser.api import cmdutils
 from qutebrowser.qt.core import QUrl
 from qutebrowser.workspaces import commands
 from qutebrowser.workspaces.manager import BYTES_PER_TAB, WorkspaceManager
-from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
+from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
+                                          WorkspaceTab)
 from qutebrowser.workspaces.persistence import (PinnedPersistence,
                                                 WorkspacePersistence)
 
@@ -54,6 +55,7 @@ class FakeManager:
         self.close_group_result: tuple[int, int] = (0, 0)
         self.reopened_groups: list[tuple[uuid.UUID, uuid.UUID, int]] = []
         self.reopen_group_result: tuple[int, int, int] = (0, 0, 0)
+        self.pinned: list = []
 
     def add_workspace(self, name: str) -> Workspace:
         workspace = Workspace(id=uuid.uuid4(), name=name,
@@ -269,6 +271,29 @@ class FakeManager:
 
     def add_tab(self, workspace_id: uuid.UUID, tab: WorkspaceTab) -> None:
         self._workspaces[workspace_id].tabs.append(tab)
+
+    # --- pinned tabs ---
+
+    def add_pinned(self, tab) -> None:
+        self.pinned = [entry for entry in self.pinned
+                       if entry.tab_id != tab.tab_id]
+        self.pinned.append(tab)
+
+    def remove_pinned(self, tab_id: int) -> None:
+        self.pinned = [entry for entry in self.pinned
+                       if entry.tab_id != tab_id]
+
+    def list_pinned(self):
+        return list(self.pinned)
+
+    def move_pinned(self, tab_id: int, new_index: int) -> bool:
+        entry = next(
+            (item for item in self.pinned if item.tab_id == tab_id), None)
+        if entry is None or not 0 <= new_index < len(self.pinned):
+            return False
+        self.pinned.remove(entry)
+        self.pinned.insert(new_index, entry)
+        return True
 
     def move_tabs(self, workspace_id: uuid.UUID, tab_ids: set[int],
                   group_id: Optional[uuid.UUID]) -> int:
@@ -787,6 +812,59 @@ class TestPintabStyleToggle:
 
         assert calls == [('pinned_tabs.style', 'line')]
         assert messages == ['Pinned-tab style: line.']
+
+
+class TestPintabCommands:
+
+    def _workspace_with_tab(self, fake_manager):
+        workspace = fake_manager.add_workspace('w')
+        workspace.tabs.append(WorkspaceTab(
+            tab_id=1, title='One', url='https://example.com/',
+            open_status='OPEN'))
+        return workspace
+
+    def test_add_pins_entry(self, fake_manager, messages):
+        self._workspace_with_tab(fake_manager)
+
+        commands.pintab_add('1')
+
+        assert [entry.tab_id for entry in fake_manager.list_pinned()] == [1]
+        assert messages == ['Pinned tab 1.']
+
+    def test_add_resolves_url(self, fake_manager, messages):
+        self._workspace_with_tab(fake_manager)
+
+        commands.pintab_add('https://example.com/')
+
+        assert [entry.tab_id for entry in fake_manager.list_pinned()] == [1]
+
+    def test_remove_unpins_without_touching_tab(
+            self, fake_manager, messages):
+        workspace = self._workspace_with_tab(fake_manager)
+        commands.pintab_add('1')
+
+        commands.pintab_remove('1')
+
+        assert fake_manager.list_pinned() == []
+        assert [tab.tab_id for tab in workspace.tabs] == [1]
+        assert messages[-1] == 'Unpinned tab 1.'
+
+    def test_remove_unknown_raises(self, fake_manager):
+        with pytest.raises(cmdutils.CommandError, match='No pinned tab'):
+            commands.pintab_remove('1')
+
+    def test_move_reorders_by_position(self, fake_manager, messages):
+        self._workspace_with_tab(fake_manager)
+        for tab_id in (1, 2, 3):
+            fake_manager.add_pinned(
+                PinnedTab(tab_id=tab_id, title=str(tab_id), url='u'))
+
+        commands.pintab_move('1', '0')
+
+        assert [entry.tab_id for entry in fake_manager.list_pinned()] == [1, 2, 3]
+        commands.pintab_move('1', '3')
+        assert [entry.tab_id for entry in fake_manager.list_pinned()] == [2, 3, 1]
+        assert messages[-1] == 'Moved pinned tab 1 to position 2.'
 
 
 class TestGroupCommands:
