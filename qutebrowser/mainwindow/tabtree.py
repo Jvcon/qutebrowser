@@ -1997,12 +1997,45 @@ class TabTree(QWidget):
         self._refresh_empty_state()
 
     def _on_manager_changed(self) -> None:
-        """Rebuild the tree from the active workspace."""
+        """Rebuild the tree from the active workspace, keeping selection.
+
+        A model reset invalidates every QModelIndex, so the current row is
+        captured by id (tab first, then group) with its row as a fallback.
+        The selection is restored only when the rebuilt tree still has the
+        row, so switching to an unrelated workspace never points at stale
+        data.
+        """
+        current = self._view.currentIndex()
+        tab_id = self._model.tab_id_for_index(current)
+        group = self._model.group_for_index(current)
+        group_id = group.group_id if group is not None else None
+        row = current.row() if current.isValid() else -1
+
         self._model.set_workspace(self._manager.get_active())
         if self._search_terms:
             self._apply_search()
         else:
             self._refresh_empty_state()
+
+        self._restore_current_selection(tab_id, group_id, row)
+
+    def _restore_current_selection(
+            self,
+            tab_id: Optional[int],
+            group_id: Optional[uuid.UUID],
+            row: int,
+    ) -> None:
+        """Restore the tree's current row after a model reset."""
+        index = QModelIndex()
+        if tab_id is not None:
+            index = self._model.index_for_tab_id(tab_id)
+        if not index.isValid() and group_id is not None:
+            index = self._model._index_for_group_id(group_id)
+        if (not index.isValid() and row >= 0
+                and row < self._model.rowCount(QModelIndex())):
+            index = self._model.index(row, 0)
+        if index.isValid():
+            self._view.setCurrentIndex(index)
 
     # --- group context menu (VP-A1) ---
 

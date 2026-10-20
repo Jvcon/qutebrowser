@@ -1280,6 +1280,27 @@ class TestPinnedDrop:
         assert model.data(group_index, model.DropTargetRole) is False
 
 
+class TestSelectionPreservation:
+
+    def test_current_tab_survives_manager_rebuild(self, qtbot):
+        workspace = _make_workspace()
+        manager = MockManager(workspace)
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        tree.show()
+
+        child_index = tree.model().index_for_tab_id(11)
+        tree.view().setCurrentIndex(child_index)
+
+        # A workspace switch rebuilds the model (manager.changed).  Tab 11
+        # still exists in the new workspace, so the selection is valid.
+        manager._workspace = _make_workspace()
+        manager.changed.emit()
+
+        current = tree.view().currentIndex()
+        assert tree.model().tab_id_for_index(current) == 11
+
+
 class TestTabTreeSearch:
 
     """Live in-panel search (VP-P5)."""
