@@ -67,7 +67,7 @@ from qutebrowser.qt.widgets import QWidget
 
 from qutebrowser.config import config
 from qutebrowser.mainwindow.tabtree import Status, TabTreeModel
-from qutebrowser.utils import objreg, qtutils
+from qutebrowser.utils import log, objreg, qtutils
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import WorkspaceManager
 from qutebrowser.workspaces.model import Workspace, WorkspaceTab
@@ -95,6 +95,250 @@ def _panel_setting(name: str, default: object) -> object:
 #: URL schemes which never map to a workspace entry; a switch to one of
 #: these must not trigger the VP-D5 auto-locate (internal pages).
 _INTERNAL_SCHEMES = frozenset({'qute', 'about', 'chrome', 'view-source'})
+
+
+# --- Search result click-to-jump (VP-P5) ---
+
+def _get_manager() -> Optional[WorkspaceManager]:
+    """Return the app-wide workspace manager, or ``None`` if unavailable."""
+    try:
+        return objreg.get('workspace-manager')
+    except (KeyError, objreg.RegistryUnavailableError):
+        return None
+
+
+def _registry_for_window(win_id: int) -> dict[int, 'AbstractTab']:
+    """Return the ``tab_id -> tab`` registry for *win_id* (empty if absent)."""
+    try:
+        registry = objreg.get(
+            'tab-registry', scope='window', window=win_id)
+    except (KeyError, objreg.RegistryUnavailableError):
+        return {}
+    return dict(registry or {})
+
+
+def _iter_window_resources():
+    """Yield ``(win_id, registry, browser)`` for every usable window."""
+    win_ids = getattr(objreg.window_registry, 'window_ids', None)
+    if win_ids is None:
+        try:
+            win_ids = list(objreg.window_registry)
+        except TypeError:
+            win_ids = []
+    for win_id in list(win_ids) or [0]:
+        try:
+            registry = objreg.get(
+                'tab-registry', scope='window', window=win_id)
+            browser = objreg.get(
+                'tabbed-browser', scope='window', window=win_id)
+        except (KeyError, objreg.RegistryUnavailableError):
+            continue
+        if registry is None or browser is None:
+            continue
+        yield win_id, registry, browser
+
+
+def _find_live_tab_by_url(url: str):
+    """Return ``(win_id, browser, live_tab)`` for the first matching URL."""
+    if not url:
+        return None
+    for win_id, registry, browser in _iter_window_resources():
+        for live in registry.values():
+            try:
+                live_url = live.url().toString()
+            except (AttributeError, NotImplementedError):
+                continue
+            if live_url == url:
+                return win_id, browser, live
+    return None
+
+
+def _workspace_for_entry(
+        manager: Optional[WorkspaceManager],
+        entry: WorkspaceTab,
+) -> Optional[Workspace]:
+    """Find the workspace containing *entry* (by identity, then by tab id)."""
+    if manager is None:
+        return None
+    for workspace in manager.list_workspaces():
+        for candidate in workspace.tabs:
+            if candidate is entry:
+                return workspace
+    for workspace in manager.list_workspaces():
+        for candidate in workspace.tabs:
+            if candidate.tab_id == entry.tab_id:
+                return workspace
+    return None
+
+
+def _mark_entry_open(
+        manager: Optional[WorkspaceManager],
+        workspace: Optional[Workspace],
+        entry: WorkspaceTab,
+) -> None:
+    """Mark *entry* OPEN when a manager/workspace pair is available."""
+    if manager is not None and workspace is not None:
+        manager.set_open_status(workspace.id, entry.tab_id, 'OPEN')
+
+
+def _browser_for_window(win_id: int):
+    """Return the tabbed browser for *win_id*, or ``None``."""
+    for res_win_id, _registry, browser in _iter_window_resources():
+        if res_win_id == win_id:
+            return browser
+    return None
+
+
+def _reuse_live_tab(
+        hit,
+        manager: Optional[WorkspaceManager],
+        workspace: Optional[Workspace],
+        entry: WorkspaceTab,
+):
+    """Focus the live tab from *hit* and mark *entry* OPEN."""
+    hit_win_id, browser, live = hit
+    try:
+        browser.widget.setCurrentWidget(live)
+    except Exception as e:  # noqa: BLE001 - reopening is best-effort
+        log.workspaces.debug(
+            f"reopen_tab: setCurrentWidget failed for {entry.tab_id}: {e}")
+        return None
+    _mark_entry_open(manager, workspace, entry)
+    _raise_window(hit_win_id)
+    return live
+
+
+def _open_new_tab(
+        browser,
+        manager: Optional[WorkspaceManager],
+        workspace: Optional[Workspace],
+        entry: WorkspaceTab,
+        win_id: int,
+):
+    """Open *entry*'s URL in *browser* and return the resulting live tab."""
+    try:
+        qurl = QUrl(entry.url)
+        qtutils.ensure_valid(qurl)
+        browser.tabopen(qurl, background=False)
+    except Exception as e:  # noqa: BLE001 - reopening is best-effort
+        log.workspaces.debug(
+            f"reopen_tab: tabopen failed for url={entry.url!r}: {e}")
+        return None
+
+    _mark_entry_open(manager, workspace, entry)
+
+    live = _registry_for_window(win_id).get(entry.tab_id)
+    if live is None:
+        hit = _find_live_tab_by_url(entry.url)
+        if hit is not None:
+            live = hit[2]
+    if live is None:
+        try:
+            live = browser.widget.currentWidget()
+        except Exception:  # noqa: BLE001 - best-effort fallback
+            live = None
+    return live
+
+
+def _reopen_single_tab(
+        workspace: Optional[Workspace],
+        entry: WorkspaceTab,
+        *,
+        win_id: int = 0,
+):
+    """Reopen one SUSPENDED *entry* and return the live tab, or ``None``.
+
+    This is the single-entry equivalent of
+    :meth:`WorkspaceManager.reopen_group` (VP-D4): a live tab with the same
+    URL in *any* window is reused, otherwise the URL is opened in *win_id*.
+    """
+    if not entry.url:
+        log.workspaces.debug(
+            f"reopen_tab: skipping tab {entry.tab_id} with an empty URL")
+        return None
+
+    manager = _get_manager()
+    hit = _find_live_tab_by_url(entry.url)
+    if hit is not None:
+        return _reuse_live_tab(hit, manager, workspace, entry)
+
+    browser = _browser_for_window(win_id)
+    if browser is None:
+        log.workspaces.debug(
+            f"reopen_tab: no browser for window {win_id}; "
+            f"cannot reopen {entry.tab_id}")
+        return None
+    return _open_new_tab(browser, manager, workspace, entry, win_id)
+
+
+def _raise_window(win_id: int) -> None:
+    """Raise / activate the main window for *win_id* (best-effort)."""
+    try:
+        window = objreg.get(
+            'main-window', scope='window', window=win_id)
+    except (KeyError, objreg.RegistryUnavailableError):
+        return
+    try:
+        window.raise_()
+        window.activateWindow()
+    except (AttributeError, RuntimeError):
+        pass
+
+
+def reopen_tab(entry: WorkspaceTab, *, win_id: int = 0):
+    """Reopen a single SUSPENDED *entry* and return the live tab widget."""
+    manager = _get_manager()
+    workspace = _workspace_for_entry(manager, entry)
+    return _reopen_single_tab(workspace, entry, win_id=win_id)
+
+
+def _browser_for_live(live, win_id: int):
+    """Return the browser owning *live*, falling back to *win_id*'s browser."""
+    for _win_id, _registry, browser in _iter_window_resources():
+        try:
+            if browser.widget.indexOf(live) >= 0:
+                return browser
+        except Exception:  # noqa: BLE001 - mock / incomplete tab widgets
+            continue
+    for res_win_id, _registry, browser in _iter_window_resources():
+        if res_win_id == win_id:
+            return browser
+    return None
+
+
+def jump_to_entry(entry: WorkspaceTab, win_id: int = 0) -> None:
+    """Switch to the live tab behind *entry*, reopening it when suspended.
+
+    OPEN entries are looked up in the window's ``tab-registry``; an orphaned
+    entry is logged and skipped.  SUSPENDED entries go through
+    :func:`reopen_tab` first and the returned live tab is then focused.
+    """
+    if entry.open_status == 'OPEN':
+        live = _registry_for_window(win_id).get(entry.tab_id)
+        if live is None:
+            log.workspaces.debug(
+                f"jump_to_entry: OPEN tab {entry.tab_id} not in registry; "
+                "skipping")
+            return
+    else:
+        live = reopen_tab(entry, win_id=win_id)
+        if live is None:
+            log.workspaces.debug(
+                f"jump_to_entry: could not reopen tab {entry.tab_id}")
+            return
+
+    browser = _browser_for_live(live, win_id)
+    if browser is None:
+        log.workspaces.debug(
+            f"jump_to_entry: no browser for window {win_id}; "
+            f"cannot switch to {entry.tab_id}")
+        return
+    try:
+        browser.widget.setCurrentWidget(live)
+        live.setFocus(Qt.FocusReason.TabFocusReason)
+    except Exception as e:  # noqa: BLE001 - switching is best-effort
+        log.workspaces.debug(
+            f"jump_to_entry: setCurrentWidget failed for {entry.tab_id}: {e}")
 
 
 @dataclasses.dataclass
@@ -340,6 +584,36 @@ class WorkspaceBridge(QObject):
         self._tab_tree.group_focus_requested.emit(
             entry.group_id, entry.tab_id)
 
+    def _activate_tab_id(self, tab_id: int, *, focus: bool) -> None:
+        """Switch to *tab_id*, reopening a SUSPENDED entry first (VP-P5).
+
+        Live tabs take the fast path through the per-window registry.  When
+        the row points at a SUSPENDED workspace entry (e.g. a search result),
+        the single-entry D4 reopen path produces a live tab which is then
+        focused.
+        """
+        widget = self._tab_registry().get(tab_id)
+        if widget is not None:
+            self._browser.widget.setCurrentWidget(widget)
+            if focus:
+                widget.setFocus(Qt.FocusReason.TabFocusReason)
+            return
+
+        workspace_id = self._active_workspace_id()
+        entry = None
+        if workspace_id is not None and self._manager is not None:
+            entry = self._manager.find_tab_by_id(workspace_id, tab_id)
+        if entry is None or entry.open_status != 'SUSPENDED':
+            log.workspaces.debug(
+                f"_activate_tab_id: tab {tab_id} not live; skipping")
+            return
+        live = reopen_tab(entry, win_id=self._win_id)
+        if live is None:
+            return
+        self._browser.widget.setCurrentWidget(live)
+        if focus:
+            live.setFocus(Qt.FocusReason.TabFocusReason)
+
     def _on_tree_activated(self, idx: QModelIndex) -> None:
         """Switch to the tab behind a clicked/selected tree row."""
         if self._model is None:
@@ -347,11 +621,7 @@ class WorkspaceBridge(QObject):
         tab_id = self._model.tab_id_for_index(idx)
         if tab_id is None:
             return
-        widget = self._tab_registry().get(tab_id)
-        if widget is None:
-            return
-        self._browser.widget.setCurrentWidget(widget)
-        widget.setFocus(Qt.FocusReason.TabFocusReason)
+        self._activate_tab_id(tab_id, focus=True)
 
     def _on_tree_keyboard_activated(self, idx: QModelIndex) -> None:
         """Switch tabs from keyboard nav; keep focus in the tree for J/K."""
@@ -360,10 +630,7 @@ class WorkspaceBridge(QObject):
         tab_id = self._model.tab_id_for_index(idx)
         if tab_id is None:
             return
-        widget = self._tab_registry().get(tab_id)
-        if widget is None:
-            return
-        self._browser.widget.setCurrentWidget(widget)
+        self._activate_tab_id(tab_id, focus=False)
 
     def _on_tree_close_requested(self, idx: QModelIndex) -> None:
         """Close the tab behind a tree row by emitting ``tabCloseRequested``."""

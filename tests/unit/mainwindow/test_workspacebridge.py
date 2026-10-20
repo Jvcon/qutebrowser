@@ -828,3 +828,117 @@ class TestDelayedHook:
 
         assert seen == [5000]
         assert checks == [0]
+
+
+class TestJumpToEntry:
+
+    """Click-to-jump from a search result (VP-P5)."""
+
+    def _resources(self, monkeypatch, browser, registry=None):
+        registry = registry or {}
+        monkeypatch.setattr(
+            workspacebridge,
+            '_iter_window_resources',
+            lambda: iter([(0, registry, browser)]),
+        )
+
+    def test_open_entry_switches_live_tab(
+            self, browser, tab_registry, monkeypatch):
+        tab = MockTab(1, title='A')
+        browser.widget.insert(tab)
+        tab_registry[1] = tab
+        self._resources(monkeypatch, browser, tab_registry)
+        entry = WorkspaceTab(tab_id=1, title='A', open_status='OPEN')
+
+        workspacebridge.jump_to_entry(entry)
+
+        assert browser.widget.currentWidget() is tab
+        assert tab._focused is True
+
+    def test_open_entry_not_in_registry_is_skipped(
+            self, browser, tab_registry, monkeypatch):
+        tab = MockTab(1, title='A')
+        browser.widget.insert(tab)
+        browser.widget.setCurrentWidget(tab)
+        tab_registry[1] = tab
+        self._resources(monkeypatch, browser, tab_registry)
+        entry = WorkspaceTab(tab_id=9, title='orphan', open_status='OPEN')
+
+        workspacebridge.jump_to_entry(entry)
+
+        assert browser.widget.currentWidget() is tab
+
+    def test_suspended_entry_reopens_then_switches(
+            self, browser, monkeypatch):
+        live = MockTab(5, title='Reopened')
+        browser.widget.insert(live)
+        other = MockTab(6, title='Other')
+        browser.widget.insert(other)
+        browser.widget.setCurrentWidget(other)
+        self._resources(monkeypatch, browser, {5: live})
+        calls = []
+
+        def fake_reopen(entry, *, win_id=0):
+            calls.append((entry, win_id))
+            return live
+
+        monkeypatch.setattr(workspacebridge, 'reopen_tab', fake_reopen)
+        entry = WorkspaceTab(
+            tab_id=5, url='https://example.com',
+            open_status='SUSPENDED')
+
+        workspacebridge.jump_to_entry(entry)
+
+        assert calls == [(entry, 0)]
+        assert browser.widget.currentWidget() is live
+
+    def test_reopen_tab_reuses_live_url(
+            self, browser, manager, tab_registry, monkeypatch):
+        """The single-entry D4 path still reuses a live same-URL tab."""
+        workspace = manager.add_workspace('ws')
+        entry = WorkspaceTab(
+            tab_id=10, url='https://example.com',
+            open_status='SUSPENDED')
+        manager.add_tab(workspace.id, entry)
+
+        live = MockTab(3, url=QUrl('https://example.com'))
+        browser.widget.insert(live)
+        tab_registry[3] = live
+        self._resources(monkeypatch, browser, tab_registry)
+        monkeypatch.setattr(
+            workspacebridge, '_get_manager', lambda: manager)
+
+        result = workspacebridge.reopen_tab(entry)
+
+        assert result is live
+        assert entry.open_status == 'OPEN'
+        assert browser.widget.currentWidget() is live
+
+
+class TestBridgeSuspendedActivation:
+
+    """Tree-row activation of a SUSPENDED search result (VP-P5)."""
+
+    def test_activate_reopens_then_focuses(
+            self, browser, manager, model, bridge, monkeypatch):
+        workspace = manager.add_workspace('ws')
+        entry = WorkspaceTab(
+            tab_id=10, url='https://example.com',
+            open_status='SUSPENDED')
+        manager.add_tab(workspace.id, entry)
+
+        live = MockTab(10, url=QUrl('https://example.com'))
+        browser.widget.insert(live)
+        calls = []
+
+        def fake_reopen(tab_entry, *, win_id=0):
+            calls.append((tab_entry, win_id))
+            return live
+
+        monkeypatch.setattr(workspacebridge, 'reopen_tab', fake_reopen)
+
+        bridge._activate_tab_id(10, focus=True)
+
+        assert calls == [(entry, 0)]
+        assert browser.widget.currentWidget() is live
+        assert live._focused is True

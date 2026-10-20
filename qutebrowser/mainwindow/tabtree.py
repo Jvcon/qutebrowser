@@ -65,6 +65,7 @@ from qutebrowser.qt.gui import (
 from qutebrowser.qt.widgets import (
     QAbstractItemView,
     QLabel,
+    QLineEdit,
     QStackedWidget,
     QStyle,
     QStyleOptionViewItem,
@@ -75,6 +76,7 @@ from qutebrowser.qt.widgets import (
     QWidget,
 )
 
+from qutebrowser.workspaces import search
 from qutebrowser.workspaces.manager import WorkspaceManager
 from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
 
@@ -236,6 +238,10 @@ class TabTreeModel(QAbstractItemModel):
         self._highlighted_tab_id: Optional[int] = None
         self._highlight_timer: Optional[QTimer] = None
         self._show_archived = False
+        # VP-P5: when ``_search_hits`` is not None the tree renders only the
+        # matching entries, aggregated by group.  ``None`` means the normal,
+        # unfiltered view.
+        self._search_hits: Optional[list[search.SearchHit]] = None
         # Multi-select (VP-F4).  The ids survive ``set_workspace`` rebuilds
         # so a batch command that emits ``changed`` does not wipe the
         # selection mid-operation.
@@ -248,11 +254,39 @@ class TabTreeModel(QAbstractItemModel):
         """Replace the model contents with *workspace* and reset views."""
         self.beginResetModel()
         self._workspace = workspace
+        self._search_hits = None
         self._root.children.clear()
         self._tab_nodes.clear()
         if workspace is not None:
             self._build_tree(workspace)
         self.endResetModel()
+
+    def set_search_hits(
+            self,
+            hits: Optional[list[search.SearchHit]],
+    ) -> None:
+        """Render only *hits*, or the normal view when *hits* is ``None``.
+
+        Hits are expected to be pre-sorted by relevance (see
+        :func:`qutebrowser.workspaces.search.search_workspace`); the model
+        keeps that order inside each group while creating one group header
+        per group that contains at least one hit.
+        """
+        self.beginResetModel()
+        self._search_hits = None if hits is None else list(hits)
+        self._root.children.clear()
+        self._tab_nodes.clear()
+        if self._workspace is not None:
+            if self._search_hits is None:
+                self._build_tree(self._workspace)
+            else:
+                self._build_search_tree(self._search_hits)
+        self.endResetModel()
+
+    @property
+    def search_active(self) -> bool:
+        """Return whether the model is showing filtered search results."""
+        return self._search_hits is not None
 
     def set_show_archived(self, show: bool) -> None:
         """Show or hide archived groups in the tree.
@@ -684,6 +718,31 @@ class TabTreeModel(QAbstractItemModel):
             node.row = len(target.children)
             target.children.append(node)
 
+    def _build_search_tree(self, hits: list[search.SearchHit]) -> None:
+        """Build a flat-by-group tree from pre-sorted *hits*.
+
+        Group headers are created on first hit, so groups without matches are
+        omitted naturally.  Tabs are always plain ``Kind.Tab`` rows: nesting
+        a hit under a non-hit parent would hide it, and the search result
+        list is sorted globally by relevance rather than tree topology.
+        """
+        group_nodes: dict[uuid.UUID, _Node] = {}
+        for hit in hits:
+            group = hit.group
+            if group is not None:
+                target = group_nodes.get(group.group_id)
+                if target is None:
+                    target = _Node(Kind.Group, group, self._root)
+                    target.row = len(self._root.children)
+                    self._root.children.append(target)
+                    group_nodes[group.group_id] = target
+            else:
+                target = self._root
+            node = _Node(Kind.Tab, hit.entry, target)
+            node.row = len(target.children)
+            target.children.append(node)
+            self._tab_nodes[hit.entry.tab_id] = node
+
     def _group_tab_count(self, group: Group) -> int:
         if self._workspace is None:
             return 0
@@ -700,7 +759,9 @@ class TabTreeModel(QAbstractItemModel):
             plural = 's' if count != 1 else ''
             return f"{group.name}\n{count} tab{plural}"
         if role == FoldedRole:
-            return group.folded
+            # Search results are always expanded: folding a hit group would
+            # hide the very rows the user asked for.
+            return False if self.search_active else group.folded
         if role == BadgeRole:
             return self._group_badge(group)
         if role == GroupStateRole:
@@ -1469,6 +1530,9 @@ class TabTree(QWidget):
         self._manager = manager
         # Anchor for shift+J/K range extension in multi-select mode.
         self._selection_anchor: Optional[QModelIndex] = None
+        # VP-P5: parsed query terms of the active search (empty = default
+        # view).  Kept on the host so a manager rebuild can re-apply it.
+        self._search_terms: list[str] = []
 
         self.setObjectName('tab-tree')
 
@@ -1507,6 +1571,16 @@ class TabTree(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        # VP-P5: in-panel keyword search.  The line edit sits above the
+        # group/tab list and filters live on every keystroke.
+        self.search_input = QLineEdit(self)
+        self.search_input.setObjectName('tab-tree-search')
+        self.search_input.setPlaceholderText("Search tabs…")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self._on_search_changed)
+        layout.addWidget(self.search_input)
+
         layout.addWidget(self._stack)
 
         self._refresh_empty_state()
@@ -1542,10 +1616,32 @@ class TabTree(QWidget):
         # TODO(v0.2): Replace wholesale rebuild with fine-grained inserts/removes.
         self._manager.changed.connect(self._on_manager_changed)
 
+    def _on_search_changed(self, text: str) -> None:
+        """Filter the tree live as the user types (VP-P5)."""
+        self._search_terms = search.parse_query(text)
+        self._apply_search()
+
+    def _apply_search(self) -> None:
+        """Push the current query into the model and refresh the stack.
+
+        An empty query restores the normal grouped view through the regular
+        rebuild path; a non-empty query renders only the hits.
+        """
+        workspace = self._manager.get_active()
+        if not self._search_terms or workspace is None:
+            self._model.set_search_hits(None)
+        else:
+            hits = search.search_workspace(workspace, self._search_terms)
+            self._model.set_search_hits(hits)
+        self._refresh_empty_state()
+
     def _on_manager_changed(self) -> None:
         """Rebuild the tree from the active workspace."""
         self._model.set_workspace(self._manager.get_active())
-        self._refresh_empty_state()
+        if self._search_terms:
+            self._apply_search()
+        else:
+            self._refresh_empty_state()
 
     def focus_group_and_tab(
             self,
@@ -1721,7 +1817,14 @@ class TabTree(QWidget):
     def _refresh_empty_state(self) -> None:
         """Show the placeholder when the active workspace is empty."""
         workspace = self._manager.get_active()
-        empty = workspace is None or (not workspace.groups and not workspace.tabs)
+        empty = workspace is None or (
+            not workspace.groups and not workspace.tabs)
+        if self._search_terms:
+            empty = self._model.rowCount(QModelIndex()) == 0
+            self._placeholder.setText(
+                "No matching tabs" if empty else "")
+        else:
+            self._placeholder.setText("No tabs in this workspace")
         self._stack.setCurrentIndex(1 if empty else 0)
 
     def view(self) -> QTreeView:

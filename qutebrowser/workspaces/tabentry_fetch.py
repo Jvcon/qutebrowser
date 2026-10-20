@@ -22,7 +22,7 @@ DESCRIPTION_JS = (
 )
 
 
-def fetch_description(
+def fetch_description(  # noqa: C901
     tab: object,
     callback: Optional[Callable[[str], None]] = None,
     *,
@@ -46,6 +46,7 @@ def fetch_description(
     result: list[str] = []
 
     def finish(value: object) -> None:
+        nonlocal finished
         if finished:
             return
         finished = True

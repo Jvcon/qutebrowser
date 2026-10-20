@@ -1177,3 +1177,83 @@ class TestTabTree:
         assert len(scrolled) == 2
         assert highlighted == [30]
         assert tree.model().active_group_id() == group_id
+
+
+class TestTabTreeSearch:
+
+    """Live in-panel search (VP-P5)."""
+
+    def _workspace(self):
+        group = Group(group_id=uuid.uuid4(), name='Research')
+        other = Group(group_id=uuid.uuid4(), name='Misc')
+        return Workspace(
+            id=uuid.uuid4(),
+            name='search',
+            groups=[group, other],
+            tabs=[
+                WorkspaceTab(
+                    tab_id=1, group_id=group.group_id,
+                    title='Alpha docs', open_status='OPEN'),
+                WorkspaceTab(
+                    tab_id=2, group_id=group.group_id, title='Beta'),
+                WorkspaceTab(
+                    tab_id=3, group_id=other.group_id,
+                    title='Alpha notes', open_status='SUSPENDED'),
+                WorkspaceTab(tab_id=4, title='Standalone Alpha'),
+            ],
+        )
+
+    def _tree(self, qtbot):
+        tree = tabtree.TabTree(win_id=0, manager=MockManager(self._workspace()))
+        qtbot.add_widget(tree)
+        return tree
+
+    def test_search_input_is_first_child(self, qtbot):
+        tree = self._tree(qtbot)
+        assert tree.layout().indexOf(tree.search_input) == 0
+
+    def test_search_filters_live_and_hides_empty_groups(self, qtbot):
+        tree = self._tree(qtbot)
+        tree.search_input.setText('alpha')
+        model = tree.model()
+        assert model.search_active
+
+        root = QModelIndex()
+        root_kinds = [
+            model.index(row, 0).data(tabtree.KindRole)
+            for row in range(model.rowCount(root))
+        ]
+        assert root_kinds == [
+            tabtree.Kind.Group, tabtree.Kind.Group, tabtree.Kind.Tab]
+        grouped_ids = {
+            model.tab_id_for_index(model.index(row, 0, model.index(0, 0)))
+            for row in range(model.rowCount(model.index(0, 0)))
+        }
+        assert grouped_ids == {3}
+        research_ids = {
+            model.tab_id_for_index(model.index(row, 0, model.index(1, 0)))
+            for row in range(model.rowCount(model.index(1, 0)))
+        }
+        assert research_ids == {1}
+
+    def test_clearing_search_restores_default_view(self, qtbot):
+        tree = self._tree(qtbot)
+        before = tree.model().rowCount(QModelIndex())
+        tree.search_input.setText('alpha')
+        tree.search_input.setText('')
+        assert not tree.model().search_active
+        assert tree.model().rowCount(QModelIndex()) == before
+
+    def test_no_matches_shows_placeholder(self, qtbot):
+        tree = self._tree(qtbot)
+        tree.search_input.setText('does-not-exist')
+        assert tree._stack.currentIndex() == 1
+        assert tree._placeholder.text() == 'No matching tabs'
+
+    def test_search_result_keeps_open_status_role(self, qtbot):
+        tree = self._tree(qtbot)
+        tree.search_input.setText('notes')
+        model = tree.model()
+        group_index = model.index(0, 0)
+        tab_index = model.index(0, 0, group_index)
+        assert tab_index.data(tabtree.OpenStatusRole) == 'SUSPENDED'
