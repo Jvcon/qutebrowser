@@ -4,6 +4,7 @@
 
 """Tests for qutebrowser.mainwindow.workspacebridge."""
 
+import datetime
 from unittest import mock
 
 import pytest
@@ -958,3 +959,82 @@ class TestBridgeSuspendedActivation:
         assert calls == [(entry, 0)]
         assert browser.widget.currentWidget() is live
         assert live._focused is True
+def _stale_group(manager, name='stale', days_ago=10):
+    """Create an active workspace with one stale Group (VP-A2)."""
+    workspace = manager.get_active() or manager.add_workspace('w')
+    group = manager.create_group(workspace.id, name)
+    old = (datetime.datetime.now(datetime.timezone.utc)
+           - datetime.timedelta(days=days_ago)).isoformat()
+    next_id = 1 + max((tab.tab_id for tab in workspace.tabs), default=0)
+    for offset in range(3):
+        tab = WorkspaceTab(
+            tab_id=next_id + offset,
+            open_status='OPEN',
+            reading_status='DONE',
+            done_at=old,
+        )
+        tab.assign_group(group.group_id)
+        manager.add_tab(workspace.id, tab)
+    return workspace, group
+
+
+class TestSuggestionCard:
+
+    def test_hidden_when_disabled(
+            self, manager, bridge, config_stub):
+        config_stub.val.content.vertical_panel.suggestion_enabled = False
+        _stale_group(manager)
+
+        bridge.refresh_suggestions()
+
+        assert bridge.suggestion_card.isHidden()
+
+    def test_hidden_when_ignored(
+            self, manager, bridge, config_stub):
+        config_stub.val.content.vertical_panel.suggestion_enabled = True
+        workspace, group = _stale_group(manager)
+        manager.ignore_suggestion_groups(
+            workspace.id, [str(group.group_id)])
+
+        bridge.refresh_suggestions()
+
+        assert bridge.suggestion_card.isHidden()
+
+    def test_shown_for_stale_group(
+            self, manager, bridge, config_stub):
+        config_stub.val.content.vertical_panel.suggestion_enabled = True
+        _workspace, group = _stale_group(manager, name='old-group')
+
+        bridge.refresh_suggestions()
+
+        assert not bridge.suggestion_card.isHidden()
+        assert 'old-group' in bridge.suggestion_label.text()
+        assert '长时间未使用' in bridge.suggestion_label.text()
+
+    def test_suspend_button_closes_each_group(
+            self, manager, bridge, config_stub):
+        config_stub.val.content.vertical_panel.suggestion_enabled = True
+        workspace, group = _stale_group(manager)
+        bridge.refresh_suggestions()
+        close_group = mock.Mock(return_value=(0, 0))
+        manager.close_group = close_group
+
+        bridge.suspend_button.click()
+
+        close_group.assert_called_once_with(
+            workspace.id, group.group_id, win_id=0)
+        assert bridge.suggestion_card.isHidden()
+
+    def test_ignore_button_ignores_and_hides(
+            self, manager, bridge, config_stub):
+        config_stub.val.content.vertical_panel.suggestion_enabled = True
+        workspace, group = _stale_group(manager)
+        bridge.refresh_suggestions()
+        ignore = mock.Mock(return_value=1)
+        manager.ignore_suggestion_groups = ignore
+
+        bridge.ignore_button.click()
+
+        ignore.assert_called_once_with(
+            workspace.id, [str(group.group_id)])
+        assert bridge.suggestion_card.isHidden()

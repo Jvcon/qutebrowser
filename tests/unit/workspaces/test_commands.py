@@ -43,6 +43,8 @@ class FakeManager:
         self.cleanup_result = 0
         self.auto_suspends: list[tuple[uuid.UUID, Optional[int]]] = []
         self.auto_suspend_result = 0
+        self.suggested: list[Group] = []
+        self.ignored_suggestions: list[tuple[uuid.UUID, list[str]]] = []
         self.moved: list[tuple[set[int], Optional[uuid.UUID]]] = []
         self.statuses: list[tuple[set[int], str]] = []
         self.deleted_tabs: list[int] = []
@@ -234,6 +236,21 @@ class FakeManager:
             self, workspace_id: uuid.UUID, days: Optional[int] = None) -> int:
         self.auto_suspends.append((workspace_id, days))
         return self.auto_suspend_result
+
+    def suggest_stale_groups(self, workspace_id: uuid.UUID,
+                             **_kwargs: object) -> list[Group]:
+        return list(self.suggested)
+
+    def get_ignored_suggestion_groups(
+            self, workspace_id: uuid.UUID) -> set[str]:
+        return set()
+
+    def ignore_suggestion_groups(
+            self, workspace_id: uuid.UUID,
+            group_ids: 'list[str] | set[str]') -> int:
+        ids = [str(group_id) for group_id in group_ids]
+        self.ignored_suggestions.append((workspace_id, ids))
+        return len(ids)
 
     # --- batched operations (VP-F4) ---
 
@@ -1115,6 +1132,49 @@ class TestSuspendStaleCommand:
         auto_suspend_days[0] = 30
         with pytest.raises(cmdutils.CommandError, match='No active workspace'):
             commands.vp_suspend_stale()
+
+
+class TestSuggestionCommands:
+
+    def test_stale_prints_count_and_names(
+            self,
+            fake_manager: FakeManager,
+            messages: list[str],
+    ) -> None:
+        workspace = fake_manager.add_workspace('w')
+        first = fake_manager.create_group(workspace.id, 'alpha')
+        second = fake_manager.create_group(workspace.id, 'beta')
+        fake_manager.suggested = [first, second]
+
+        commands.vp_suggestion_stale()
+
+        assert messages == ['2 stale group(s): alpha, beta']
+
+    def test_stale_silent_when_empty(
+            self,
+            fake_manager: FakeManager,
+            messages: list[str],
+    ) -> None:
+        fake_manager.add_workspace('w')
+
+        commands.vp_suggestion_stale()
+
+        assert messages == ['No stale groups.']
+
+    def test_ignore_adds_to_list(
+            self,
+            fake_manager: FakeManager,
+            messages: list[str],
+    ) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'old')
+        fake_manager.suggested = [group]
+
+        commands.vp_suggestion_ignore()
+
+        assert fake_manager.ignored_suggestions == [
+            (workspace.id, [str(group.group_id)])]
+        assert messages == ['Ignored 1 group(s) for 7 days.']
 
 
 @pytest.fixture

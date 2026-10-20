@@ -1320,6 +1320,33 @@ content.vertical_panel.auto_suspend_enabled:
     than `content.vertical_panel.auto_suspend_done_days`. The periodic scan
     runs every 12 hours and on startup.
 
+content.vertical_panel.suggestion_enabled:
+  default: true
+  type: Bool
+  desc: >-
+    Show a non-modal suggestion card when a Group has many OPEN tabs and has
+    gone untouched for a while. The periodic scan still runs when disabled;
+    only the card is suppressed.
+
+content.vertical_panel.suggestion_min_open_tabs:
+  default: 3
+  type:
+    name: Int
+    minval: 1
+  desc: >-
+    Minimum number of OPEN tab entries a Group must have before it can be
+    suggested for suspension.
+
+content.vertical_panel.suggestion_idle_days:
+  default: 7
+  type:
+    name: Int
+    minval: 1
+    maxval: 90
+  desc: >-
+    Minimum number of days a Group must have gone untouched before it can be
+    suggested for suspension.
+
 content.vertical_panel.sort_open_groups_first:
   default: true
   type: Bool

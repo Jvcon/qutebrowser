@@ -302,6 +302,10 @@ class Workspace:
         last_active: ISO 8601 timestamp of when this workspace was last active.
         archived: Whether this workspace is archived (hidden from normal
             use, but not deleted).
+        suggestion_ignored: Group ids the user has ignored in the smart
+            suggestion card, mapped to the ISO 8601 timestamp until which
+            they stay suppressed (VP-A2). Older state files without this
+            key load with an empty mapping.
     """
 
     id: uuid.UUID
@@ -310,6 +314,8 @@ class Workspace:
     tabs: list[WorkspaceTab] = dataclasses.field(default_factory=list)
     last_active: Optional[str] = None
     archived: bool = False
+    suggestion_ignored: dict[str, str] = dataclasses.field(
+        default_factory=dict)
 
     def add_group(self, group: Group) -> None:
         """Append *group* to this workspace's group list."""
@@ -324,11 +330,16 @@ class Workspace:
             'tabs': [tab.to_dict() for tab in self.tabs],
             'last_active': self.last_active,
             'archived': self.archived,
+            '_suggestion_ignored': dict(self.suggestion_ignored),
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> 'Workspace':
         """Deserialize from a primitive-only dict."""
+        ignored = {
+            str(group_id): str(until)
+            for group_id, until in (d.get('_suggestion_ignored') or {}).items()
+        }
         return cls(
             id=uuid.UUID(d['id']),
             name=d['name'],
@@ -336,6 +347,7 @@ class Workspace:
             tabs=[WorkspaceTab.from_dict(t) for t in d.get('tabs', [])],
             last_active=d.get('last_active'),
             archived=bool(d.get('archived', False)),
+            suggestion_ignored=ignored,
         )
 
 

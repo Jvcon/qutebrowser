@@ -62,15 +62,16 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Optional, cast
 
 from qutebrowser.qt import sip
-from qutebrowser.qt.core import QModelIndex, QObject, QTimer, QUrl, Qt
-from qutebrowser.qt.widgets import QWidget
+from qutebrowser.qt.core import QEvent, QModelIndex, QObject, QTimer, QUrl, Qt
+from qutebrowser.qt.widgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
+                                    QVBoxLayout, QWidget)
 
 from qutebrowser.config import config
 from qutebrowser.mainwindow.tabtree import Status, TabTreeModel
 from qutebrowser.utils import log, objreg, qtutils
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import WorkspaceManager
-from qutebrowser.workspaces.model import Workspace, WorkspaceTab
+from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
 
 if TYPE_CHECKING:
     from qutebrowser.browser.browsertab import AbstractTab
@@ -382,6 +383,9 @@ class WorkspaceBridge(QObject):
         _tab_index: ``QTabWidget`` index -> ``tab.tab_id`` cache.
         _tab_state: ``tab.tab_id`` -> :class:`_TabState`.
         _attached: ``tab_id`` set of tabs whose signals are already wired.
+        suggestion_card: The non-modal VP-A2 suggestion card (or None when
+            the bridge is inert).
+        _current_suggestions: The Groups currently shown in the card.
     """
 
     def __init__(
@@ -405,6 +409,13 @@ class WorkspaceBridge(QObject):
         self._tab_state: dict[int, _TabState] = {}
         self._attached: set[int] = set()
         self._user_initiated_close_flags: dict[int, bool] = {}
+        self._current_suggestions: list[Group] = []
+        self.suggestion_card: Optional[QFrame] = None
+        self.suggestion_label: Optional[QLabel] = None
+        self.suspend_button: Optional[QPushButton] = None
+        self.ignore_button: Optional[QPushButton] = None
+        self._panel: Optional[QWidget] = (
+            tab_tree.parentWidget() if tab_tree is not None else None)
         self._description_fetcher = (
             description_fetcher or tabentry_fetch.fetch_description)
 
@@ -430,12 +441,16 @@ class WorkspaceBridge(QObject):
             tab_tree.audio_toggled.connect(self._on_tree_audio_toggled)
             tab_tree.pin_toggled.connect(self._on_tree_pin_toggled)
 
+        self._build_suggestion_card()
+        manager.suggestions_changed.connect(self._on_suggestions_changed)
+
         # Pick up tabs that already exist (e.g. the initial home tab created
         # before this bridge was constructed), and re-check once the event
         # loop runs to catch a tab opened during window construction.
         self._sync_existing_tabs()
         self._sync_active_tab()
         QTimer.singleShot(0, self._sync_existing_tabs)
+        QTimer.singleShot(0, self.refresh_suggestions)
 
     # --- registration ---
 
@@ -474,6 +489,109 @@ class WorkspaceBridge(QObject):
         tab_id = getattr(current, 'tab_id', None)
         if tab_id is not None:
             self._model.set_active_tab_id(tab_id)  # type: ignore[union-attr]
+
+    # --- smart suggestion card (VP-A2) ---
+
+    def _build_suggestion_card(self) -> None:
+        """Create the non-modal suggestion card and put it atop the panel."""
+        card = QFrame(self._panel)
+        card.setObjectName('vp-suggestion-card')
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        label = QLabel(card)
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        buttons = QHBoxLayout()
+        suspend = QPushButton("一键挂起全部", card)
+        ignore = QPushButton("忽略", card)
+        suspend.clicked.connect(self._suspend_suggested_groups)
+        ignore.clicked.connect(self._ignore_suggested_groups)
+        buttons.addWidget(suspend)
+        buttons.addWidget(ignore)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self.suggestion_card = card
+        self.suggestion_label = label
+        self.suspend_button = suspend
+        self.ignore_button = ignore
+
+        card.hide()
+        if self._panel is not None:
+            self._panel.installEventFilter(self)
+            panel_layout = self._panel.layout()
+            if panel_layout is not None:
+                panel_layout.insertWidget(0, card)
+
+    def eventFilter(  # noqa: N802 - Qt naming
+            self, obj: QObject, event: QEvent) -> bool:
+        """Refresh suggestions whenever the panel is shown."""
+        if obj is self._panel and event.type() == QEvent.Type.Show:
+            QTimer.singleShot(0, self.refresh_suggestions)
+        return super().eventFilter(obj, event)
+
+    def _on_suggestions_changed(self, _groups: list[Group]) -> None:
+        """React to a manager scan by refreshing the active-workspace card."""
+        self.refresh_suggestions()
+
+    def refresh_suggestions(self) -> None:
+        """Recompute and render the card for the active workspace."""
+        if self.suggestion_card is None or self.suggestion_label is None:
+            return
+        if self._manager is None:
+            self.suggestion_card.hide()
+            return
+        if not bool(_panel_setting('suggestion_enabled', True)):
+            self._current_suggestions = []
+            self.suggestion_card.hide()
+            return
+        workspace_id = self._active_workspace_id()
+        if workspace_id is None:
+            self._current_suggestions = []
+            self.suggestion_card.hide()
+            return
+        ignored = self._manager.get_ignored_suggestion_groups(workspace_id)
+        groups = [
+            group for group in self._manager.suggest_stale_groups(workspace_id)
+            if str(group.group_id) not in ignored
+        ]
+        self._current_suggestions = groups
+        if not groups:
+            self.suggestion_card.hide()
+            return
+        names = ', '.join(group.name for group in groups)
+        self.suggestion_label.setText(f"以下 Group 长时间未使用: {names}")
+        self.suggestion_card.show()
+
+    def _suspend_suggested_groups(self) -> None:
+        """Close every Group currently shown in the suggestion card."""
+        if self._manager is None:
+            return
+        workspace_id = self._active_workspace_id()
+        if workspace_id is None:
+            return
+        for group in list(self._current_suggestions):
+            self._manager.close_group(
+                workspace_id, group.group_id, win_id=self._win_id)
+        self._current_suggestions = []
+        if self.suggestion_card is not None:
+            self.suggestion_card.hide()
+
+    def _ignore_suggested_groups(self) -> None:
+        """Ignore the currently-shown Groups for the 7-day cooldown."""
+        if self._manager is None:
+            return
+        workspace_id = self._active_workspace_id()
+        if workspace_id is not None and self._current_suggestions:
+            self._manager.ignore_suggestion_groups(
+                workspace_id,
+                [str(group.group_id) for group in self._current_suggestions])
+        self._current_suggestions = []
+        if self.suggestion_card is not None:
+            self.suggestion_card.hide()
 
     def _tab_registry(self) -> dict[int, AbstractTab]:
         """Return the per-window ``tab_id -> AbstractTab`` registry."""

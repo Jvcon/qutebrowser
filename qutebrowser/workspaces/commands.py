@@ -805,6 +805,44 @@ def vp_suspend_stale(days: int | None = None) -> None:
     if suspended:
         message.info(f"Suspended {suspended} stale tab(s).")
 
+
+@cmdutils.register(name='vp-suggestion-stale')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_suggestion_stale(win_id: int = 0) -> None:
+    """Print the current smart-suggestion list (debug/manual trigger).
+
+    Groups already inside the ignore cooldown are omitted.
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+    ignored = manager.get_ignored_suggestion_groups(workspace.id)
+    groups = [group for group in manager.suggest_stale_groups(workspace.id)
+              if str(group.group_id) not in ignored]
+    if not groups:
+        message.info("No stale groups.")
+        return
+    names = ', '.join(group.name for group in groups)
+    message.info(f"{len(groups)} stale group(s): {names}")
+
+
+@cmdutils.register(name='vp-suggestion-ignore')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_suggestion_ignore(win_id: int = 0) -> None:
+    """Mark all currently-suggested Groups as ignored (manual)."""
+    manager = _manager()
+    workspace = _active_workspace(manager)
+    ignored = manager.get_ignored_suggestion_groups(workspace.id)
+    group_ids = [
+        str(group.group_id)
+        for group in manager.suggest_stale_groups(workspace.id)
+        if str(group.group_id) not in ignored
+    ]
+    if not group_ids:
+        message.info("No stale groups to ignore.")
+        return
+    added = manager.ignore_suggestion_groups(workspace.id, group_ids)
+    message.info(f"Ignored {added} group(s) for 7 days.")
+
 # VP-F4 (vp/16): multi-select + batch operations. The selection itself lives
 # in the window's TabTree model; these commands drive it and hand the selected
 # tab ids to the batched WorkspaceManager APIs.

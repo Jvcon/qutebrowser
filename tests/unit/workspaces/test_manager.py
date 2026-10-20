@@ -815,6 +815,9 @@ def _patch_auto_suspend_config(monkeypatch, *, enabled=True, days=30):
     panel = SimpleNamespace(
         auto_suspend_enabled=enabled,
         auto_suspend_done_days=days,
+        suggestion_enabled=True,
+        suggestion_min_open_tabs=3,
+        suggestion_idle_days=7,
     )
     monkeypatch.setattr(
         manager_module, 'config',
@@ -1030,6 +1033,175 @@ class TestAutoSuspendDueTabs:
         assert timer.started
         timer.timeout.connect  # noqa: B018 - connected in the scheduler
         assert callable(seen['timeout'])
+
+
+def _freeze_now(monkeypatch, fixed_now):
+    """Freeze ``manager_module.datetime`` at *fixed_now*."""
+    frozen = SimpleNamespace(
+        datetime=type(
+            'FrozenDatetime', (datetime.datetime,),
+            {'now': classmethod(lambda cls, tz=None: fixed_now)}),
+        timedelta=datetime.timedelta,
+        timezone=datetime.timezone,
+    )
+    monkeypatch.setattr(manager_module, 'datetime', frozen)
+
+
+class TestSuggestStaleGroups:
+
+    def _add_group(
+            self,
+            manager,
+            workspace,
+            name,
+            *,
+            tab_count=3,
+            days_ago=10,
+            open_status='OPEN',
+            done_at=True,
+            reading_status='DONE',
+    ):
+        group = manager.create_group(workspace.id, name)
+        stamp = None
+        if done_at:
+            stamp = (datetime.datetime.now(datetime.timezone.utc)
+                     - datetime.timedelta(days=days_ago)).isoformat()
+        next_id = 1 + max(
+            (tab.tab_id for tab in workspace.tabs), default=0)
+        for offset in range(tab_count):
+            tab_id = next_id + offset
+            tab = WorkspaceTab(
+                tab_id=tab_id,
+                open_status=open_status,
+                reading_status=reading_status,
+                done_at=stamp,
+            )
+            tab.assign_group(group.group_id)
+            manager.add_tab(workspace.id, tab)
+        return group
+
+    def test_returns_only_stale_open_groups(self, manager):
+        workspace = manager.add_workspace('w')
+        stale = self._add_group(manager, workspace, 'stale')
+        self._add_group(manager, workspace, 'fresh', days_ago=1)
+        self._add_group(
+            manager, workspace, 'suspended', open_status='SUSPENDED')
+        archived = self._add_group(manager, workspace, 'archived')
+        manager.archive_group(workspace.id, archived.group_id)
+
+        result = manager.suggest_stale_groups(workspace.id)
+
+        assert result == [stale]
+
+    def test_min_open_tabs_threshold(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add_group(manager, workspace, 'stale', tab_count=3)
+
+        assert manager.suggest_stale_groups(
+            workspace.id, min_open_tabs=5) == []
+
+    def test_idle_days_override(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add_group(manager, workspace, 'ten-days', days_ago=10)
+
+        assert manager.suggest_stale_groups(
+            workspace.id, idle_days=7)
+        assert manager.suggest_stale_groups(
+            workspace.id, idle_days=30) == []
+
+    def test_uses_configured_defaults(self, manager, monkeypatch):
+        _patch_auto_suspend_config(monkeypatch)
+        workspace = manager.add_workspace('w')
+        self._add_group(manager, workspace, 'ten-days', days_ago=10)
+
+        assert len(manager.suggest_stale_groups(workspace.id)) == 1
+
+    def test_falls_back_to_created_at(self, manager):
+        workspace = manager.add_workspace('w')
+        old = (datetime.datetime.now(datetime.timezone.utc)
+               - datetime.timedelta(days=10)).isoformat()
+        group = manager.create_group(workspace.id, 'old-created')
+        for tab_id in (1, 2, 3):
+            tab = WorkspaceTab(
+                tab_id=tab_id, open_status='OPEN',
+                reading_status='ACTIVE', created_at=old)
+            tab.assign_group(group.group_id)
+            manager.add_tab(workspace.id, tab)
+
+        assert manager.suggest_stale_groups(workspace.id) == [group]
+
+    def test_pure_query_emits_nothing(self, manager):
+        workspace = manager.add_workspace('w')
+        self._add_group(manager, workspace, 'stale')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.suggest_stale_groups(workspace.id)
+
+        assert changes == []
+
+    def test_scan_emits_suggestions(self, manager, monkeypatch):
+        _patch_auto_suspend_config(monkeypatch)
+        workspace = manager.add_workspace('w')
+        stale = self._add_group(manager, workspace, 'stale')
+        received = []
+        manager.suggestions_changed.connect(
+            lambda groups: received.append(list(groups)))
+
+        manager._scan_all_workspaces_for_stale()
+
+        assert received == [[stale]]
+
+
+class TestSuggestionIgnoreList:
+
+    def test_get_is_empty_initially(self, manager):
+        workspace = manager.add_workspace('w')
+        assert manager.get_ignored_suggestion_groups(workspace.id) == set()
+
+    def test_ignore_adds_group(self, manager):
+        workspace = manager.add_workspace('w')
+        group_id = str(uuid.uuid4())
+
+        added = manager.ignore_suggestion_groups(workspace.id, [group_id])
+
+        assert added == 1
+        assert manager.get_ignored_suggestion_groups(workspace.id) == {
+            group_id}
+        assert group_id in workspace.suggestion_ignored
+
+    def test_ignore_is_idempotent(self, manager):
+        workspace = manager.add_workspace('w')
+        group_id = str(uuid.uuid4())
+        manager.ignore_suggestion_groups(workspace.id, [group_id])
+
+        assert manager.ignore_suggestion_groups(
+            workspace.id, [group_id]) == 0
+
+    def test_cooldown_expires_after_seven_days(self, manager, monkeypatch):
+        fixed_now = datetime.datetime.now(datetime.timezone.utc)
+        _freeze_now(monkeypatch, fixed_now)
+        workspace = manager.add_workspace('w')
+        group_id = str(uuid.uuid4())
+        manager.ignore_suggestion_groups(workspace.id, [group_id])
+
+        _freeze_now(monkeypatch, fixed_now + datetime.timedelta(days=8))
+
+        assert manager.get_ignored_suggestion_groups(workspace.id) == set()
+        assert manager.ignore_suggestion_groups(
+            workspace.id, [group_id]) == 1
+
+    def test_persists_through_workspace_save(self, manager, pers):
+        workspace = manager.add_workspace('w')
+        group_id = str(uuid.uuid4())
+        manager.ignore_suggestion_groups(workspace.id, [group_id])
+        manager.save()
+
+        reloaded = WorkspaceManager(*pers)
+        reloaded.load()
+
+        assert reloaded.get_ignored_suggestion_groups(workspace.id) == {
+            group_id}
 
 
 class TestCleanupOldDone:

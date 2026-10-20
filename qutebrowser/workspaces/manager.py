@@ -74,6 +74,46 @@ READING_STATUSES = ('FRESH', 'ACTIVE', 'DONE')
 # TODO(vp-p1-followup): switch to chrome.processes for real values.
 BYTES_PER_TAB = 50 * 1024 * 1024  # 50 MB heuristic; MVP estimate.
 
+#: Default cooldown for ignored smart suggestions (VP-A2).
+SUGGESTION_IGNORE_DAYS = 7
+
+
+def _vertical_panel_setting(name: str, default: Any) -> Any:
+    """Return a ``content.vertical_panel`` setting or *default*.
+
+    Headless unit tests often install a minimal ``config.val`` stub (or no
+    config at all), so missing settings fall back to their documented
+    defaults instead of raising.
+    """
+    try:
+        panel = config.val.content.vertical_panel
+    except AttributeError:
+        return default
+    return getattr(panel, name, default)
+
+
+def _latest_group_activity(
+        workspace: Workspace,
+        group: Group,
+) -> Optional[datetime.datetime]:
+    """Return the newest member timestamp for *group* (VP-A2).
+
+    Mirrors VP-P3's access semantics: ``done_at`` when set, otherwise the
+    member's ``created_at``. Falls back to the Group's ``created_at`` when
+    no member has a usable timestamp (or the Group has no members).
+    """
+    latest: Optional[datetime.datetime] = None
+    for tab in workspace.tabs:
+        if tab.group_id != group.group_id:
+            continue
+        stamp = tab.done_at or tab.created_at
+        parsed = _parse_timestamp(stamp) if stamp else None
+        if parsed is not None and (latest is None or parsed > latest):
+            latest = parsed
+    if latest is None and group.created_at:
+        latest = _parse_timestamp(group.created_at)
+    return latest
+
 
 def _parse_timestamp(value: str) -> Optional[datetime.datetime]:
     """Parse an ISO 8601 *value* into an aware UTC datetime, or None.
@@ -127,6 +167,10 @@ class WorkspaceManager(QObject):
 
     changed = pyqtSignal()
     pinned_changed = pyqtSignal()
+    #: Emitted after a periodic/startup scan with the current stale
+    #: Group suggestions (``list[Group]``), so the panel can refresh its
+    #: non-modal suggestion card (VP-A2).
+    suggestions_changed = pyqtSignal(list)
 
     def __init__(self, persistence: WorkspacePersistence,
                  pinned_persistence: PinnedPersistence) -> None:
@@ -1527,6 +1571,117 @@ class WorkspaceManager(QObject):
             workspace_id, len(due))
         return len(due)
 
+    # --- smart suggestions (VP-A2) ---
+
+    def suggest_stale_groups(
+            self,
+            workspace_id: uuid.UUID,
+            *,
+            min_open_tabs: Optional[int] = None,
+            idle_days: Optional[int] = None,
+    ) -> list[Group]:
+        """Return Groups that look stale and worth suggesting to the user.
+
+        A Group is suggested when it is not archived, has at least
+        *min_open_tabs* OPEN tab entries, and its latest member activity is
+        at least *idle_days* old. Member activity uses the same semantics
+        as VP-P3: ``done_at`` when present, else ``created_at``; when no
+        member has a usable timestamp, the Group's ``created_at`` is used.
+
+        This is a pure query: no ``changed`` is emitted. The caller is
+        responsible for de-duping against the ignore list and rendering
+        the UI.
+
+        Args:
+            workspace_id: Workspace whose Groups are inspected.
+            min_open_tabs: Minimum OPEN-tab count; defaults to
+                ``content.vertical_panel.suggestion_min_open_tabs``.
+            idle_days: Minimum untouched age in days; defaults to
+                ``content.vertical_panel.suggestion_idle_days``.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            workspace = self.get_workspace(workspace_id)
+        if workspace is None:
+            return []
+        if min_open_tabs is None:
+            min_open_tabs = int(_vertical_panel_setting(
+                'suggestion_min_open_tabs', 3))
+        if idle_days is None:
+            idle_days = int(_vertical_panel_setting(
+                'suggestion_idle_days', 7))
+        cutoff = (datetime.datetime.now(datetime.timezone.utc)
+                  - datetime.timedelta(days=idle_days))
+
+        suggestions: list[Group] = []
+        for group in workspace.groups:
+            if group.archived:
+                continue
+            if self.group_open_count(
+                    workspace_id, group.group_id) < min_open_tabs:
+                continue
+            latest = _latest_group_activity(workspace, group)
+            if latest is not None and latest <= cutoff:
+                suggestions.append(group)
+        return suggestions
+
+    def get_ignored_suggestion_groups(
+            self, workspace_id: uuid.UUID) -> set[str]:
+        """Return Group ids currently in the 7-day cooldown window.
+
+        Expired entries are filtered out but left in persisted state; the
+        next :meth:`ignore_suggestion_groups` call can safely overwrite
+        them.
+        """
+        workspace = self.get_workspace(workspace_id)
+        if workspace is None:
+            return set()
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ignored: set[str] = set()
+        for group_id, until in (workspace.suggestion_ignored or {}).items():
+            parsed = _parse_timestamp(until) if until else None
+            if parsed is not None and parsed > now:
+                ignored.add(str(group_id))
+        return ignored
+
+    def ignore_suggestion_groups(
+            self,
+            workspace_id: uuid.UUID,
+            group_ids: Iterable[str],
+    ) -> int:
+        """Mark *group_ids* as ignored until now + 7 days.
+
+        Persists through the normal workspace save path (the mapping lives
+        on :attr:`Workspace.suggestion_ignored`) and emits :attr:`changed`
+        at most once. Idempotent for Groups already inside the cooldown
+        window.
+
+        Returns:
+            The number of ids newly added (or refreshed after expiry).
+        """
+        workspace = self.get_workspace(workspace_id)
+        if workspace is None:
+            return 0
+        now = datetime.datetime.now(datetime.timezone.utc)
+        until = (now + datetime.timedelta(
+            days=SUGGESTION_IGNORE_DAYS)).isoformat(timespec='seconds')
+        ignored = dict(workspace.suggestion_ignored or {})
+        count = 0
+        for group_id in group_ids:
+            key = str(group_id)
+            existing = _parse_timestamp(ignored[key]) if key in ignored else None
+            if existing is not None and existing > now:
+                continue
+            ignored[key] = until
+            count += 1
+        if count:
+            workspace.suggestion_ignored = ignored
+            log.workspaces.debug(
+                "ignore_suggestion_groups: workspace %s ignored %d group(s)",
+                workspace_id, count)
+            self.changed.emit()
+        return count
+
     def start_auto_suspend_scheduler(self, parent: QObject) -> None:
         """Run a stale-tab scan now (deferred) and every 12 hours thereafter.
 
@@ -1548,13 +1703,29 @@ class WorkspaceManager(QObject):
         self._auto_suspend_timer = timer
 
     def _scan_all_workspaces_for_stale(self) -> int:
-        """Suspend stale ``DONE`` tabs across every loaded workspace."""
+        """Run the periodic stale scan.
+
+        Suspends stale ``DONE`` tabs (when auto-suspend is enabled), then
+        recomputes smart-suggestion candidates for every loaded workspace
+        and emits :attr:`suggestions_changed`. The suggestion scan still runs
+        when auto-suspend is disabled; the UI decides whether the card is
+        shown via ``content.vertical_panel.suggestion_enabled``.
+        """
         value = config.val
-        if value is None or not value.content.vertical_panel.auto_suspend_enabled:
-            return 0
+        panel = getattr(getattr(value, 'content', None),
+                        'vertical_panel', None)
         total = 0
-        for workspace_id in list(self._workspaces.keys()):
-            total += self.auto_suspend_due_tabs(workspace_id)
+        if panel is not None and getattr(
+                panel, 'auto_suspend_enabled', False):
+            for workspace_id in list(self._workspaces.keys()):
+                total += self.auto_suspend_due_tabs(workspace_id)
+
+        suggestions: list[Group] = []
+        for workspace in list(self._workspaces.values()):
+            suggestions.extend(self.suggest_stale_groups(workspace.id))
+        self.suggestions_changed.emit(suggestions)
+        log.workspaces.debug(
+            "scan_all_workspaces_for_stale: %d suggestion(s)", len(suggestions))
         return total
 
     def tabs_by_status(
