@@ -995,6 +995,22 @@ class TestGroupCommands:
         assert [tab.tab_id for tab in workspace.tabs] == [2]
         assert messages == ["Deleted group 'g' (1 tabs)."]
 
+    def test_delete_empty_group_skips_confirmation(
+            self,
+            fake_manager: FakeManager,
+            confirmations: list[Callable[[], None]],
+            messages: list[str],
+    ) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+
+        commands.vp_group_delete('g')
+
+        assert confirmations == []
+        assert fake_manager.purged == [group.group_id]
+        assert workspace.groups == []
+        assert messages == ["Deleted group 'g' (0 tabs)."]
+
     def test_delete_missing_raises(self, fake_manager: FakeManager) -> None:
         fake_manager.add_workspace('w')
         with pytest.raises(cmdutils.CommandError, match='No group'):

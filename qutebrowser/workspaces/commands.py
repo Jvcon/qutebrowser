@@ -521,14 +521,19 @@ def vp_group_restore(target: str) -> None:
 def vp_group_delete(target: str) -> None:
     """Permanently delete a Group and all its TabEntries.
 
-    Requires confirmation. Unlike ``:vp-group-archive``, this cannot be
-    undone.
+    Non-empty groups require confirmation; empty groups are deleted
+    immediately (ADR 0008 § Decisions). Unlike ``:vp-group-archive``, this
+    cannot be undone.
 
     Args:
         target: The name or UUID of the group.
     """
     manager = _manager()
     workspace, group = _resolve_group_target(manager, target)
+    if manager.group_total_count(workspace.id, group.group_id) == 0:
+        # ADR 0008 § Decisions: empty groups are deleted without a prompt.
+        _make_group_delete_action(manager, workspace, group)()
+        return
     message.confirm_async(
         title=(f"Delete group '{group.name}' and all its tabs? "
                "This cannot be undone."),
