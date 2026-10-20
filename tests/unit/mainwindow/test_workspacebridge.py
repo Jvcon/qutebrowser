@@ -654,6 +654,22 @@ class TestAutoLocate:
 
         assert emitted == []
 
+    def test_auto_locate_does_not_write_window_affinity(
+            self, browser, manager, qtbot):
+        """VP-A1: only close_group writes affinity; auto-locate must not."""
+        _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))
+        tab_b = _open_tab(browser, MockTab(2, url=QUrl('https://b.example/')))
+        tree, bridge = self._tree_and_bridge(browser, manager, qtbot)
+        workspace = manager.get_active()
+        group = manager.create_group(workspace.id, 'g')
+        manager.move_tab_to_group(workspace.id, 2, group.group_id)
+        emitted = self._collect(tree)
+
+        browser.current_tab_changed.emit(tab_b)
+
+        assert emitted == [(group.group_id, 2)]
+        assert group.window_affinity is None
+
     def test_no_tab_tree_is_inert(self, browser, manager, model, bridge):
         """A bridge built without a TabTree tolerates tab switches."""
         _open_tab(browser, MockTab(1, url=QUrl('https://a.example/')))

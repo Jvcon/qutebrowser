@@ -1935,6 +1935,223 @@ class TestReopenGroup:
             'https://a.example/', 'https://b.example/', 'https://c.example/']
 
 
+def _patch_affinity_config(monkeypatch, *, enabled=True):
+    """Patch the manager module's global window-affinity kill switch."""
+    panel = SimpleNamespace(window_affinity_enabled=enabled)
+    monkeypatch.setattr(
+        manager_module, 'config',
+        SimpleNamespace(
+            val=SimpleNamespace(
+                content=SimpleNamespace(vertical_panel=panel))))
+
+
+class TestCloseGroupAffinity:
+
+    """VP-A1: closing a group records its window affinity."""
+
+    def _group(self, manager, *, statuses=('OPEN',)):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        live_tabs = []
+        registry = {}
+        for index, status in enumerate(statuses, start=1):
+            manager.add_tab(workspace.id, WorkspaceTab(
+                tab_id=index, group_id=group.group_id,
+                open_status=status))
+            live = object()
+            live_tabs.append(live)
+            registry[index] = live
+        browser = TestCloseGroup._CloseBrowser(live_tabs)
+        return workspace, group, browser, registry
+
+    @staticmethod
+    def _install(monkeypatch, browser, registry):
+        def fake_get(name, **_kwargs):
+            if name == 'tab-registry':
+                return registry
+            if name == 'tabbed-browser':
+                return browser
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+    def test_sets_affinity_when_missing(self, manager, monkeypatch):
+        workspace, group, browser, registry = self._group(manager)
+        self._install(monkeypatch, browser, registry)
+
+        manager.close_group(workspace.id, group.group_id, win_id=2)
+
+        assert group.window_affinity == 2
+
+    def test_does_not_overwrite_existing_affinity(
+            self, manager, monkeypatch):
+        workspace, group, browser, registry = self._group(manager)
+        group.window_affinity = 1
+        self._install(monkeypatch, browser, registry)
+
+        manager.close_group(workspace.id, group.group_id, win_id=2)
+
+        assert group.window_affinity == 1
+
+    def test_affinity_disabled_does_not_set(self, manager, monkeypatch):
+        workspace, group, browser, registry = self._group(manager)
+        group.affinity_enabled = False
+        self._install(monkeypatch, browser, registry)
+
+        manager.close_group(workspace.id, group.group_id, win_id=2)
+
+        assert group.window_affinity is None
+
+    def test_archived_group_does_not_set(self, manager, monkeypatch):
+        workspace, group, browser, registry = self._group(manager)
+        manager.archive_group(workspace.id, group.group_id)
+        self._install(monkeypatch, browser, registry)
+
+        manager.close_group(workspace.id, group.group_id, win_id=2)
+
+        assert group.window_affinity is None
+
+    def test_global_kill_switch_does_not_set(self, manager, monkeypatch):
+        workspace, group, browser, registry = self._group(manager)
+        self._install(monkeypatch, browser, registry)
+        _patch_affinity_config(monkeypatch, enabled=False)
+
+        manager.close_group(workspace.id, group.group_id, win_id=2)
+
+        assert group.window_affinity is None
+
+    def test_set_group_affinity_enabled(self, manager):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        changes = []
+        manager.changed.connect(lambda: changes.append(True))
+
+        manager.set_group_affinity_enabled(
+            workspace.id, group.group_id, False)
+
+        assert group.affinity_enabled is False
+        assert changes == [True]
+
+
+class TestReopenGroupAffinity:
+
+    """VP-A1: Reopen Group routes restored tabs to the affinity window."""
+
+    def _group(self, manager, url='https://a.example/'):
+        workspace = manager.add_workspace('w')
+        group = manager.create_group(workspace.id, 'g')
+        manager.add_tab(workspace.id, WorkspaceTab(
+            tab_id=1, group_id=group.group_id, open_status='SUSPENDED',
+            url=url))
+        return workspace, group
+
+    @staticmethod
+    def _install(monkeypatch, resources):
+        """Install a fake objreg exposing ``win_id -> (registry, browser)``."""
+        monkeypatch.setattr(
+            manager_module.objreg, 'window_registry',
+            {win_id: object() for win_id in resources})
+
+        def fake_get(name, **_kwargs):
+            win_id = _kwargs.get('window')
+            if name == 'tab-registry':
+                return resources[win_id][0]
+            if name == 'tabbed-browser':
+                return resources[win_id][1]
+            raise KeyError(name)
+
+        monkeypatch.setattr(manager_module.objreg, 'get', fake_get)
+
+    def test_live_affinity_routes_to_that_window(
+            self, manager, monkeypatch):
+        workspace, group = self._group(manager)
+        group.window_affinity = 1
+        browser0 = _FakeBrowser()
+        browser1 = _FakeBrowser()
+        self._install(monkeypatch, {
+            0: ({}, browser0),
+            1: ({}, browser1),
+        })
+
+        result = manager.reopen_group(
+            workspace.id, group.group_id, win_id=0)
+
+        assert result == (1, 0, 0)
+        assert [url for url, _ in browser1.opened] == [
+            'https://a.example/']
+        assert browser0.opened == []
+        assert group.window_affinity == 1
+
+    def test_dead_affinity_uses_current_and_updates(
+            self, manager, monkeypatch):
+        workspace, group = self._group(manager)
+        group.window_affinity = 9
+        browser0 = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser0)})
+
+        result = manager.reopen_group(
+            workspace.id, group.group_id, win_id=0)
+
+        assert result == (1, 0, 0)
+        assert [url for url, _ in browser0.opened] == [
+            'https://a.example/']
+        assert group.window_affinity == 0
+
+    def test_no_affinity_uses_current_and_does_not_set(
+            self, manager, monkeypatch):
+        workspace, group = self._group(manager)
+        browser0 = _FakeBrowser()
+        self._install(monkeypatch, {0: ({}, browser0)})
+
+        result = manager.reopen_group(
+            workspace.id, group.group_id, win_id=0)
+
+        assert result == (1, 0, 0)
+        assert browser0.opened == [('https://a.example/', False)]
+        assert group.window_affinity is None
+
+    def test_affinity_disabled_uses_current_and_does_not_set(
+            self, manager, monkeypatch):
+        workspace, group = self._group(manager)
+        group.window_affinity = 1
+        group.affinity_enabled = False
+        browser0 = _FakeBrowser()
+        browser1 = _FakeBrowser()
+        self._install(monkeypatch, {
+            0: ({}, browser0),
+            1: ({}, browser1),
+        })
+
+        result = manager.reopen_group(
+            workspace.id, group.group_id, win_id=0)
+
+        assert result == (1, 0, 0)
+        assert browser0.opened == [('https://a.example/', False)]
+        assert browser1.opened == []
+        # Disabled affinity never writes to the stored value.
+        assert group.window_affinity == 1
+
+    def test_global_kill_switch_uses_current_for_every_group(
+            self, manager, monkeypatch):
+        workspace, group = self._group(manager)
+        group.window_affinity = 1
+        browser0 = _FakeBrowser()
+        browser1 = _FakeBrowser()
+        self._install(monkeypatch, {
+            0: ({}, browser0),
+            1: ({}, browser1),
+        })
+        _patch_affinity_config(monkeypatch, enabled=False)
+
+        result = manager.reopen_group(
+            workspace.id, group.group_id, win_id=0)
+
+        assert result == (1, 0, 0)
+        assert browser0.opened == [('https://a.example/', False)]
+        assert browser1.opened == []
+        assert group.window_affinity == 1
+
+
 class TestSaveLoad:
 
     def test_state_restored_on_new_manager(self, pers, qapp):

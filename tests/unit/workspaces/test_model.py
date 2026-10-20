@@ -43,11 +43,27 @@ class TestGroup:
     def test_roundtrip_with_all_fields(self):
         group = model.Group(
             group_id=uuid.uuid4(), name='github', folded=True, pinned=True,
-            archived=True, created_at='2026-01-01T00:00:00+00:00')
+            archived=True, created_at='2026-01-01T00:00:00+00:00',
+            window_affinity=3, affinity_enabled=False)
         restored = model.Group.from_dict(group.to_dict())
         assert restored == group
         assert restored.pinned is True
         assert restored.archived is True
+        assert restored.window_affinity == 3
+        assert restored.affinity_enabled is False
+
+    def test_roundtrip_with_window_affinity(self):
+        group = model.Group(
+            group_id=uuid.uuid4(), name='github', window_affinity=7)
+        restored = model.Group.from_dict(group.to_dict())
+        assert restored == group
+        assert restored.window_affinity == 7
+        assert restored.affinity_enabled is True
+
+    def test_affinity_defaults(self):
+        group = model.Group(group_id=uuid.uuid4(), name='github')
+        assert group.window_affinity is None
+        assert group.affinity_enabled is True
 
     def test_from_dict_tolerates_old_format(self):
         group_id = uuid.uuid4()
@@ -61,6 +77,8 @@ class TestGroup:
         assert restored.folded is True
         assert restored.pinned is False
         assert restored.archived is False
+        assert restored.window_affinity is None
+        assert restored.affinity_enabled is True
         assert restored.created_at is not None
 
     def test_to_dict_is_primitive(self):
@@ -69,7 +87,7 @@ class TestGroup:
         assert isinstance(d['group_id'], str)
         assert set(d) == {
             'group_id', 'name', 'folded', 'pinned', 'archived',
-            'created_at',
+            'created_at', 'window_affinity', 'affinity_enabled',
         }
 
 

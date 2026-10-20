@@ -80,6 +80,13 @@ class Group:
             list, but retained and restorable).
         created_at: ISO 8601 UTC timestamp of when the group was created.
             Populated automatically when left as ``None``.
+        window_affinity: The ``win_id`` of the window this group was last
+            closed from, if any. Used by Reopen Group to route restored tabs
+            back to that window (VP-A1). Only valid for the current browser
+            session; window ids are not persisted across restarts.
+        affinity_enabled: Per-group kill switch for window affinity. When
+            ``False`` the group behaves as if :attr:`window_affinity` were
+            ``None``.
     """
 
     group_id: uuid.UUID
@@ -88,6 +95,8 @@ class Group:
     pinned: bool = False
     archived: bool = False
     created_at: Optional[str] = None
+    window_affinity: Optional[int] = None
+    affinity_enabled: bool = True
 
     def __post_init__(self) -> None:
         if self.created_at is None:
@@ -120,6 +129,8 @@ class Group:
             'pinned': self.pinned,
             'archived': self.archived,
             'created_at': self.created_at,
+            'window_affinity': self.window_affinity,
+            'affinity_enabled': self.affinity_enabled,
         }
 
     @classmethod
@@ -127,7 +138,8 @@ class Group:
         """Deserialize from a primitive-only dict.
 
         Fields added after the original format (``pinned``, ``archived``,
-        ``created_at``) default gracefully so older YAML files still load.
+        ``created_at``, ``window_affinity``, ``affinity_enabled``) default
+        gracefully so older YAML files still load.
         """
         return cls(
             group_id=uuid.UUID(d['group_id']),
@@ -136,6 +148,8 @@ class Group:
             pinned=bool(d.get('pinned', False)),
             archived=bool(d.get('archived', False)),
             created_at=d.get('created_at'),
+            window_affinity=d.get('window_affinity'),
+            affinity_enabled=bool(d.get('affinity_enabled', True)),
         )
 
 

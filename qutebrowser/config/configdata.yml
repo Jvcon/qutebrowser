@@ -1328,6 +1328,14 @@ content.vertical_panel.sort_open_groups_first:
     SUSPENDED/ARCHIVED groups. Pinned groups always sort first regardless
     of this setting.
 
+content.vertical_panel.window_affinity_enabled:
+  default: true
+  type: Bool
+  desc: >-
+    When true, Reopen Group routes restored tabs back to the window the
+    group was last closed from (if that window is still open). This is the
+    global kill switch; individual groups can additionally opt out.
+
 content.vertical_panel.snapshot_min_tabs:
   default: 1
   type:

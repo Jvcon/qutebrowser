@@ -53,6 +53,20 @@ def _snapshot_group_name() -> str:
     return "快照退出"
 
 
+def _window_affinity_globally_enabled() -> bool:
+    """Return the global window-affinity kill switch (default: on).
+
+    ``config.val`` is ``None`` in bare unit tests, in which case affinity is
+    treated as enabled (the production default). Missing attributes are also
+    treated as enabled so the feature degrades gracefully.
+    """
+    try:
+        return bool(
+            config.val.content.vertical_panel.window_affinity_enabled)
+    except AttributeError:
+        return True
+
+
 # The three reading states of a WorkspaceTab (issue #15).
 READING_STATUSES = ('FRESH', 'ACTIVE', 'DONE')
 
@@ -488,6 +502,20 @@ class WorkspaceManager(QObject):
         group.archived = False
         self.changed.emit()
 
+    def set_group_affinity_enabled(self, workspace_id: uuid.UUID,
+                                   group_id: uuid.UUID,
+                                   enabled: bool) -> None:
+        """Enable or disable window affinity for a single group (VP-A1).
+
+        Disabling affinity makes the group behave as if it had no
+        :attr:`~qutebrowser.workspaces.model.Group.window_affinity`; the
+        stored affinity is left untouched so re-enabling restores the old
+        routing within the same browser session.
+        """
+        group = self._find_group(workspace_id, group_id)
+        group.affinity_enabled = bool(enabled)
+        self.changed.emit()
+
     def list_archived_groups(self, workspace_id: uuid.UUID) -> list[Group]:
         """Return only the archived groups in a workspace."""
         return [group for group in self._workspaces[workspace_id].groups
@@ -682,6 +710,14 @@ class WorkspaceManager(QObject):
                 closed += 1
             else:
                 skipped += 1
+        # VP-A1: remember the window this group was closed from so Reopen
+        # Group can route its tabs back. Never overwrite an existing
+        # affinity, and honour both the per-group and global switches.
+        if (group.window_affinity is None
+                and group.affinity_enabled
+                and not group.archived
+                and _window_affinity_globally_enabled()):
+            group.window_affinity = win_id
         if closed:
             self.changed.emit()
         log.workspaces.debug(
@@ -747,6 +783,20 @@ class WorkspaceManager(QObject):
                 continue
             out.append((win_id, registry, browser))
         return out or [(0, {}, None)]
+
+    @staticmethod
+    def _window_alive(win_id: int) -> bool:
+        """Return whether the window *win_id* is still registered.
+
+        Probes the per-window ``tabbed-browser`` object. Registry errors are
+        treated as "dead" so Reopen Group falls back to the current window.
+        """
+        try:
+            browser = objreg.get(
+                'tabbed-browser', scope='window', window=win_id, default=None)
+        except (KeyError, TypeError, objreg.RegistryUnavailableError):
+            return False
+        return browser is not None
 
     def _find_live_tab_in_windows(
             self,
@@ -864,7 +914,20 @@ class WorkspaceManager(QObject):
         if workspace is None:
             return (0, 0, 0)
         # Verify the group exists before touching any tab.
-        self._find_group(workspace_id, group_id)
+        group = self._find_group(workspace_id, group_id)
+
+        # VP-A1: route the restore to the window this group was closed from
+        # when that window is still alive. A dead affinity is replaced with
+        # the current window; a disabled affinity behaves like ``None``.
+        target_win_id = win_id
+        if (group.affinity_enabled
+                and _window_affinity_globally_enabled()
+                and group.window_affinity is not None):
+            if self._window_alive(group.window_affinity):
+                target_win_id = group.window_affinity
+            else:
+                group.window_affinity = win_id
+                target_win_id = win_id
 
         total = sum(1 for tab in workspace.tabs
                     if tab.group_id == group_id
@@ -873,7 +936,7 @@ class WorkspaceManager(QObject):
         windows = self._all_window_resources()
         by_win = {w_win_id: w_browser
                   for w_win_id, _registry, w_browser in windows}
-        cur_browser = by_win.get(win_id)
+        cur_browser = by_win.get(target_win_id)
 
         opened = reused = skipped = 0
         for tab in list(workspace.tabs):

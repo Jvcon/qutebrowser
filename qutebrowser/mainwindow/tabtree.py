@@ -44,6 +44,7 @@ from qutebrowser.qt.core import (
     QAbstractItemModel,
     QEvent,
     QModelIndex,
+    QPoint,
     QRect,
     QSize,
     Qt,
@@ -66,6 +67,7 @@ from qutebrowser.qt.widgets import (
     QAbstractItemView,
     QLabel,
     QLineEdit,
+    QMenu,
     QStackedWidget,
     QStyle,
     QStyleOptionViewItem,
@@ -580,6 +582,16 @@ class TabTreeModel(QAbstractItemModel):
         if not isinstance(tab, WorkspaceTab):
             return None
         return tab.tab_id
+
+    def group_for_index(self, index: QModelIndex) -> Optional[Group]:
+        """Return the group behind *index*, or ``None`` for non-group rows."""
+        if not index.isValid():
+            return None
+        node = index.internalPointer()
+        if node.kind != Kind.Group:
+            return None
+        group = node.obj
+        return group if isinstance(group, Group) else None
 
     def toggle_folded(self, index: QModelIndex) -> None:
         """Toggle the folded state of a group or parent-tab row."""
@@ -1559,6 +1571,11 @@ class TabTree(QWidget):
         self._view.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel)
         self._view.setAlternatingRowColors(True)
+        # Group rows expose a minimal context menu (VP-A1 affinity toggle).
+        self._view.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._view.customContextMenuRequested.connect(
+            self._on_context_menu_requested)
 
         self._placeholder = QLabel("No tabs in this workspace", self)
         self._placeholder.setObjectName('tab-tree-placeholder')
@@ -1642,6 +1659,36 @@ class TabTree(QWidget):
             self._apply_search()
         else:
             self._refresh_empty_state()
+
+    # --- group context menu (VP-A1) ---
+
+    def _on_context_menu_requested(self, pos: QPoint) -> None:
+        """Show the Group context menu for the row under *pos*."""
+        index = self._view.indexAt(pos)
+        group = self._model.group_for_index(index)
+        if group is None:
+            return
+        menu = QMenu(self._view)
+        label = (
+            '窗口亲和：已启用'
+            if group.affinity_enabled
+            else '窗口亲和：已禁用'
+        )
+        action = menu.addAction(label)
+        action.setCheckable(True)
+        action.setChecked(group.affinity_enabled)
+        action.triggered.connect(
+            lambda checked=False, g=group: self._set_group_affinity(
+                g, checked))
+        menu.exec(self._view.viewport().mapToGlobal(pos))
+
+    def _set_group_affinity(self, group: Group, enabled: bool) -> None:
+        """Persist the per-group affinity toggle for *group*."""
+        workspace = self._manager.get_active()
+        if workspace is None:
+            return
+        self._manager.set_group_affinity_enabled(
+            workspace.id, group.group_id, enabled)
 
     def focus_group_and_tab(
             self,
