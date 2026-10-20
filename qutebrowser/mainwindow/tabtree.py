@@ -47,6 +47,7 @@ from qutebrowser.qt.core import (
     QRect,
     QSize,
     Qt,
+    QTimer,
     pyqtSignal,
 )
 from qutebrowser.qt.gui import (
@@ -89,6 +90,8 @@ PinStateRole = Qt.ItemDataRole.UserRole + 7
 OpenStatusRole = Qt.ItemDataRole.UserRole + 8
 SelectionRole = Qt.ItemDataRole.UserRole + 9
 GroupStateRole = Qt.ItemDataRole.UserRole + 10
+ActiveGroupRole = Qt.ItemDataRole.UserRole + 11
+HighlightRole = Qt.ItemDataRole.UserRole + 12
 
 
 class Kind(enum.IntEnum):
@@ -107,6 +110,23 @@ class Status(enum.IntFlag):
     AUDIBLE = 2
     PINNED = 4
     SUSPENDED = 8
+
+
+#: Constant group-row role values (everything not derived from live state).
+_GROUP_STATIC_ROLES = {
+    KindRole: Kind.Group,
+    StatusRole: Status.NONE,
+    OpenStatusRole: None,
+    ActiveRole: False,
+    SelectionRole: False,
+    HighlightRole: False,
+}
+
+#: Constant tab-row role values (everything not derived from live state).
+_TAB_STATIC_ROLES = {
+    BadgeRole: None,
+    ActiveGroupRole: False,
+}
 
 
 @enum.unique
@@ -176,6 +196,12 @@ class TabTreeModel(QAbstractItemModel):
         GroupStateRole: Role id for the resolved group running state, one
             of ``'OPEN'``, ``'SUSPENDED'`` or ``'ARCHIVED'`` (str).  Group
             rows only; tab rows report ``None``.
+        ActiveGroupRole: Role id for whether the row belongs to the
+            auto-located group (bool).  Only the matching group header row
+            reports ``True``; every other row reports ``False``.
+        HighlightRole: Role id for the transient auto-locate highlight
+            (bool).  ``True`` on the single tab row highlighted after a
+            browser tab switch; every other row reports ``False``.
     """
 
     KindRole = KindRole
@@ -188,6 +214,8 @@ class TabTreeModel(QAbstractItemModel):
     OpenStatusRole = OpenStatusRole
     SelectionRole = SelectionRole
     GroupStateRole = GroupStateRole
+    ActiveGroupRole = ActiveGroupRole
+    HighlightRole = HighlightRole
 
     def __init__(
             self,
@@ -202,6 +230,10 @@ class TabTreeModel(QAbstractItemModel):
         self._tab_info: dict[int, _TabInfo] = {}
         self._folded_state: dict[int, bool] = {}
         self._active_tab_id: Optional[int] = None
+        # Auto-locate (VP-D5): the group header currently accented and the
+        # tab row carrying the transient highlight.
+        self._active_group_id: Optional[uuid.UUID] = None
+        self._highlighted_tab_id: Optional[int] = None
         self._show_archived = False
         # Multi-select (VP-F4).  The ids survive ``set_workspace`` rebuilds
         # so a batch command that emits ``changed`` does not wipe the
@@ -315,6 +347,112 @@ class TabTreeModel(QAbstractItemModel):
     def active_tab_id(self) -> Optional[int]:
         """Return the tab id currently marked active, or ``None``."""
         return self._active_tab_id
+
+    # --- auto-locate on tab switch (VP-D5) ---
+
+    def set_active_group_id(
+            self, group_id: Optional[uuid.UUID]) -> None:
+        """Mark the group header for *group_id* as the active group.
+
+        Passing ``None`` clears the marker.  The call is idempotent: when
+        *group_id* is unchanged nothing happens.  When the marker moves, a
+        ``dataChanged`` carrying :data:`ActiveGroupRole` is emitted for both
+        the previously active group row and the new one (when present in the
+        current workspace).
+        """
+        if group_id == self._active_group_id:
+            return
+        previous = self._active_group_id
+        self._active_group_id = group_id
+        for changed_id in (previous, group_id):
+            if changed_id is None:
+                continue
+            idx = self._index_for_group_id(changed_id)
+            if idx.isValid():
+                self.dataChanged.emit(idx, idx, [ActiveGroupRole])
+
+    def active_group_id(self) -> Optional[uuid.UUID]:
+        """Return the group id currently marked active, or ``None``."""
+        return self._active_group_id
+
+    def set_highlighted_tab_id(
+            self,
+            tab_id: Optional[int],
+            *,
+            timeout_ms: int = 2500,
+    ) -> None:
+        """Transiently highlight the tab row for *tab_id*.
+
+        Emits a ``dataChanged`` carrying :data:`HighlightRole` for the row
+        and schedules an automatic clear after *timeout_ms* milliseconds
+        (skipped when *tab_id* is ``None``).  The scheduled callback only
+        clears the highlight when it is still the one it was created for, so
+        a newer highlight is never wiped by a stale timer.
+        """
+        if tab_id == self._highlighted_tab_id:
+            return
+        previous = self._highlighted_tab_id
+        self._highlighted_tab_id = tab_id
+        for changed_id in (previous, tab_id):
+            if changed_id is None:
+                continue
+            node = self._tab_nodes.get(changed_id)
+            if node is None:
+                continue
+            idx = self._index_for_node(node)
+            if idx.isValid():
+                self.dataChanged.emit(idx, idx, [HighlightRole])
+        if tab_id is not None:
+            QTimer.singleShot(
+                timeout_ms,
+                lambda expected=tab_id: self._clear_highlight(expected),
+            )
+
+    def _clear_highlight(self, tab_id: int) -> None:
+        """Clear the highlight created for *tab_id* if still current."""
+        if self._highlighted_tab_id == tab_id:
+            self.set_highlighted_tab_id(None)
+
+    def highlight_tab(self, tab_id: int, *, timeout_ms: int = 2500) -> None:
+        """Highlight the tab row for *tab_id* for *timeout_ms* milliseconds."""
+        self.set_highlighted_tab_id(tab_id, timeout_ms=timeout_ms)
+
+    def focus_group_and_tab(
+            self,
+            group_id: Optional[uuid.UUID],
+            tab_id: int,
+    ) -> QModelIndex:
+        """Mark *group_id* active, expand it and return the tab's index.
+
+        The returned :class:`QModelIndex` is the row for *tab_id* (invalid
+        when the tab is not in the current workspace) so the host can scroll
+        to it after bringing the group header into view.
+        """
+        self.set_active_group_id(group_id)
+        if group_id is not None:
+            for node in self._root.children:
+                if (node.kind == Kind.Group
+                        and isinstance(node.obj, Group)
+                        and node.obj.group_id == group_id):
+                    node.obj.folded = False
+                    idx = self._index_for_node(node)
+                    if idx.isValid():
+                        self.dataChanged.emit(idx, idx, [FoldedRole])
+                    break
+        node = self._tab_nodes.get(tab_id)
+        if node is None:
+            return QModelIndex()
+        return self._index_for_node(node)
+
+    def _index_for_group_id(
+            self, group_id: uuid.UUID) -> QModelIndex:
+        """Return the index for the group header with *group_id*, or invalid."""
+        for node in self._root.children:
+            if (node.kind == Kind.Group
+                    and isinstance(node.obj, Group)
+                    and node.obj.group_id == group_id):
+                return self._index_for_node(node)
+        return QModelIndex()
 
     # --- multi-select (VP-F4) ---
 
@@ -551,23 +689,15 @@ class TabTreeModel(QAbstractItemModel):
         if role == Qt.ItemDataRole.ToolTipRole:
             plural = 's' if count != 1 else ''
             return f"{group.name}\n{count} tab{plural}"
-        if role == KindRole:
-            return Kind.Group
         if role == FoldedRole:
             return group.folded
         if role == BadgeRole:
             return self._group_badge(group)
         if role == GroupStateRole:
             return self._group_state(group)
-        if role == StatusRole:
-            return Status.NONE
-        if role == OpenStatusRole:
-            return None
-        if role == ActiveRole:
-            return False
-        if role == SelectionRole:
-            return False
-        return None
+        if role == ActiveGroupRole:
+            return group.group_id == self._active_group_id
+        return _GROUP_STATIC_ROLES.get(role)
 
     def _group_badge(self, group: Group) -> str:
         """Return the ``"open/total"`` badge text for *group*."""
@@ -624,9 +754,9 @@ class TabTreeModel(QAbstractItemModel):
             return info.status & Status.PINNED != 0
         if role == SelectionRole:
             return tab.tab_id in self._selected
-        if role == BadgeRole:
-            return None
-        return None
+        if role == HighlightRole:
+            return self._highlighted_tab_id == tab.tab_id
+        return _TAB_STATIC_ROLES.get(role)
 
     def _tab_visible_data(self, info: _TabInfo, role: int):
         if role == Qt.ItemDataRole.DisplayRole:
@@ -748,6 +878,12 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         folded = bool(index.data(FoldedRole))
 
         painter.save()
+
+        # Transient auto-locate highlight (VP-D5): a faint wash painted
+        # beneath the selection / hover pass so those still win when both
+        # apply.
+        if bool(index.data(HighlightRole)):
+            painter.fillRect(option.rect, self._highlight_color(option))
 
         # Background / selection.
         if option.state & QStyle.StateFlag.State_Selected:
@@ -1078,7 +1214,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             )
 
         self._finish_row(
-            painter, option, index, rect, is_tab, close_rect, pin_rect,
+            painter, option, index, rect, is_tab, kind, close_rect, pin_rect,
             is_pinned,
         )
 
@@ -1089,11 +1225,12 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             index: QModelIndex,
             rect: QRect,
             is_tab: bool,
+            kind: Kind,
             close_rect: Optional[QRect],
             pin_rect: Optional[QRect],
             is_pinned: bool,
     ) -> None:
-        """Draw the close/pin glyphs and the active-tab left accent."""
+        """Draw the close/pin glyphs and the active-tab/group left accent."""
         # Hover close glyph and its hit-rect cache.
         if close_rect is not None:
             self._draw_close(painter, close_rect, option.palette.mid().color())
@@ -1114,9 +1251,12 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         else:
             self._last_pin_rect.pop(index, None)
 
-        # Active-tab left-edge accent (visible without hover).
-        active = bool(index.data(ActiveRole)) and is_tab
-        if active:
+        # Active-tab / auto-located group left-edge accent (visible without
+        # hover).
+        active_tab = is_tab and bool(index.data(ActiveRole))
+        active_group = (
+            kind == Kind.Group and bool(index.data(ActiveGroupRole)))
+        if active_tab or active_group:
             accent_rect = QRect(
                 rect.x(), rect.y(), self.ACTIVE_ACCENT_WIDTH, rect.height())
             painter.fillRect(accent_rect, option.palette.highlight().color())
@@ -1244,6 +1384,18 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         painter.restore()
 
     @staticmethod
+    def _highlight_color(option: QStyleOptionViewItem) -> QColor:
+        """Return the faint auto-locate wash for *option*'s palette."""
+        base = QColor(option.palette.base().color())
+        accent = QColor(option.palette.highlight().color())
+        ratio = 0.18
+        return QColor(
+            round(base.red() + (accent.red() - base.red()) * ratio),
+            round(base.green() + (accent.green() - base.green()) * ratio),
+            round(base.blue() + (accent.blue() - base.blue()) * ratio),
+        )
+
+    @staticmethod
     def _status_text(status: Status) -> str:
         parts = []
         if status & Status.LOADING:
@@ -1280,6 +1432,10 @@ class TabTree(QWidget):
         selection_range_requested: Emitted when a tab row is Shift-clicked
             while multi-select mode is active.  Argument: the clicked
             ``QModelIndex``.
+        group_focus_requested: Emitted when the browser switches to a tab
+            the tree should auto-locate (VP-D5).  Arguments: the owning
+            group id (or ``None`` for a standalone tab) and the tab id.  The
+            host connects this to :meth:`focus_group_and_tab`.
     """
 
     activated = pyqtSignal(QModelIndex)
@@ -1290,6 +1446,7 @@ class TabTree(QWidget):
     pin_toggled = pyqtSignal(QModelIndex)
     selection_toggled = pyqtSignal(QModelIndex)
     selection_range_requested = pyqtSignal(QModelIndex)
+    group_focus_requested = pyqtSignal(object, int)
 
     def __init__(
             self,
@@ -1354,6 +1511,9 @@ class TabTree(QWidget):
         self._delegate.selection_toggled.connect(self._on_selection_toggled)
         self._delegate.selection_range_requested.connect(
             self._on_selection_range_requested)
+        # Auto-locate (VP-D5): the bridge emits ``group_focus_requested`` and
+        # the host owns the actual scrolling / highlighting.
+        self.group_focus_requested.connect(self.focus_group_and_tab)
 
         # Keyboard selection (J/K).  These are a *secondary* affordance: the
         # host only emits ``activated``; the bridge turns that into a
@@ -1376,6 +1536,33 @@ class TabTree(QWidget):
         """Rebuild the tree from the active workspace."""
         self._model.set_workspace(self._manager.get_active())
         self._refresh_empty_state()
+
+    def focus_group_and_tab(
+            self,
+            group_id: Optional[uuid.UUID],
+            tab_id: int,
+            *,
+            highlight_timeout_ms: int = 2500,
+    ) -> None:
+        """Scroll to *group_id* / *tab_id* and highlight the tab (VP-D5).
+
+        The group header is expanded and brought into view first, then the
+        tab row, before the transient highlight is applied.  A ``None``
+        *group_id* handles a standalone tab.
+        """
+        tab_index = self._model.focus_group_and_tab(group_id, tab_id)
+        if group_id is not None:
+            group_index = self._model._index_for_group_id(group_id)
+            if group_index.isValid():
+                self._view.scrollTo(
+                    group_index,
+                    QAbstractItemView.ScrollHint.EnsureVisible,
+                )
+        if not tab_index.isValid():
+            return
+        self._view.scrollTo(
+            tab_index, QAbstractItemView.ScrollHint.EnsureVisible)
+        self._model.highlight_tab(tab_id, timeout_ms=highlight_timeout_ms)
 
     def _move_selection(self, delta: int) -> None:
         """Move the tree selection by *delta* rows and activate the result."""
