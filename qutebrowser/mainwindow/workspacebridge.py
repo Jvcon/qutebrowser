@@ -408,6 +408,12 @@ class WorkspaceBridge(QObject):
         self._tab_index: dict[int, int] = {}
         self._tab_state: dict[int, _TabState] = {}
         self._attached: set[int] = set()
+        # The tab which was current before a foreground tab switch.  A newly
+        # opened tab is nested under this entry (ADR 0008 § 3): by the time
+        # ``new_tab`` fires, ``setCurrentWidget`` has already moved focus to
+        # the new tab, so the model's active id alone cannot identify the
+        # opener.
+        self._previous_active_tab_id: Optional[int] = None
         self._user_initiated_close_flags: dict[int, bool] = {}
         self._current_suggestions: list[Group] = []
         self.suggestion_card: Optional[QFrame] = None
@@ -477,8 +483,19 @@ class WorkspaceBridge(QObject):
             self._register_tab(cast('AbstractTab', tab), idx)
 
     def _on_new_tab(self, tab: AbstractTab, idx: int) -> None:
-        """Register a tab announced through ``TabbedBrowser.new_tab``."""
-        self._register_tab(tab, idx)
+        """Register a tab announced through ``TabbedBrowser.new_tab``.
+
+        The opener is the tab that was current in this window when the new
+        tab appeared.  For a foreground tab the browser has already switched
+        away from it; for a background tab it is still the current tab.  A
+        fresh window (no previous tab) deliberately gets no opener.
+        """
+        opener_id = None
+        if self._model is not None and not sip.isdeleted(self._model):
+            opener_id = self._model.active_tab_id()
+            if opener_id == tab.tab_id:
+                opener_id = self._previous_active_tab_id
+        self._register_tab(tab, idx, opener_id=opener_id)
 
     def _sync_active_tab(self) -> None:
         """Reflect the browser's current tab as the active tree row."""
@@ -661,9 +678,11 @@ class WorkspaceBridge(QObject):
         if self._model is None or sip.isdeleted(self._model):
             return
         new_id = tab.tab_id
-        if new_id == self._model.active_tab_id():
+        current_id = self._model.active_tab_id()
+        if new_id == current_id:
             # Guard against the feedback loop from a tree-driven switch.
             return
+        self._previous_active_tab_id = current_id
         self._model.set_active_tab_id(new_id)
         self._auto_locate(tab)
 
@@ -795,8 +814,19 @@ class WorkspaceBridge(QObject):
         # is not (yet) attached to the per-tab signal pipeline.
         self._model.set_tab_pinned(tab_id, new_state)
 
-    def _register_tab(self, tab: AbstractTab, idx: int) -> None:
-        """Add *tab* to the active workspace and wire its signals."""
+    def _register_tab(
+            self,
+            tab: AbstractTab,
+            idx: int,
+            *,
+            opener_id: Optional[int] = None,
+    ) -> None:
+        """Add *tab* to the active workspace and wire its signals.
+
+        *opener_id* is the tab which was current when *tab* appeared; when
+        given, the new entry is nested under it (``parent_id``).  Existing
+        entries keep their parent.
+        """
         tab_id = tab.tab_id
         if tab_id in self._tab_state:
             # Already bridged (e.g. the single-shot re-sync); just refresh
@@ -816,6 +846,13 @@ class WorkspaceBridge(QObject):
         workspace = self._manager.get_active()  # type: ignore[union-attr]
         assert workspace is not None
         self._ensure_entry(workspace_id, workspace, tab, tab_id)
+
+        if opener_id is not None and opener_id != tab_id:
+            entry = self._manager.find_tab_by_id(  # type: ignore[union-attr]
+                workspace_id, tab_id)
+            if entry is not None and entry.parent_id is None:
+                self._manager.set_parent(  # type: ignore[union-attr]
+                    workspace_id, tab_id, opener_id)
 
         # A tab inserted at *idx* shifts every later index up by one.
         self._tab_index = {

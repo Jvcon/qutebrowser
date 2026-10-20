@@ -1398,6 +1398,48 @@ class TestPinned:
         assert [p.title for p in manager.list_pinned()] == ['new']
 
 
+class TestSetParent:
+
+    def _workspace_with_tabs(self, manager):
+        workspace = manager.add_workspace('w')
+        for tab_id in (1, 2, 3):
+            manager.add_tab(workspace.id, WorkspaceTab(tab_id=tab_id))
+        return workspace
+
+    def test_sets_and_clears_parent(self, manager):
+        workspace = self._workspace_with_tabs(manager)
+        group = manager.create_group(workspace.id, 'g')
+        tab = workspace.tabs[1]
+        tab.assign_group(group.group_id)
+
+        manager.set_parent(workspace.id, 2, 1)
+        assert tab.parent_id == 1
+        # The orthogonal group relation is untouched.
+        assert tab.group_id == group.group_id
+
+        manager.set_parent(workspace.id, 2, None)
+        assert tab.parent_id is None
+        assert tab.group_id == group.group_id
+
+    def test_unknown_ids_are_ignored(self, manager):
+        workspace = self._workspace_with_tabs(manager)
+
+        manager.set_parent(workspace.id, 99, 1)
+        manager.set_parent(workspace.id, 1, 99)
+
+        assert all(tab.parent_id is None for tab in workspace.tabs)
+
+    def test_self_parent_and_cycles_are_rejected(self, manager):
+        workspace = self._workspace_with_tabs(manager)
+        manager.set_parent(workspace.id, 2, 1)
+
+        manager.set_parent(workspace.id, 1, 1)
+        assert workspace.tabs[0].parent_id is None
+
+        manager.set_parent(workspace.id, 1, 2)
+        assert workspace.tabs[0].parent_id is None
+
+
 class _FakeLiveTab:
 
     """Minimal stand-in for a live tab exposing ``url()``."""

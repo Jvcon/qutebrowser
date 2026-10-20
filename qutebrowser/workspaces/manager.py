@@ -636,6 +636,69 @@ class WorkspaceManager(QObject):
         self._mutate_group_or_tab(
             workspace_id, tab_id, lambda tab: tab.assign_group(group_id))
 
+    def set_parent(self, workspace_id: uuid.UUID, tab_id: int,
+                   parent_tab_id: Optional[int]) -> None:
+        """Set (or clear) a tab entry's parent tab.
+
+        Both *tab_id* and *parent_tab_id* are resolved against the same
+        workspace.  Unknown ids are logged and ignored so a stale bridge
+        signal can never corrupt the tree.  ``tab_id == parent_tab_id`` (and
+        longer ancestor cycles) are rejected for the same reason.
+
+        Only ``parent_id`` is touched: a tab's ``group_id`` is an orthogonal
+        relation and is preserved (ADR 0008 § 3/§ "auto-group-rules").
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            log.workspaces.debug(
+                "set_parent: unknown workspace %s", workspace_id)
+            return
+
+        tab = next((t for t in workspace.tabs if t.tab_id == tab_id), None)
+        if tab is None:
+            log.workspaces.debug(
+                "set_parent: unknown tab %s in workspace %s",
+                tab_id, workspace_id)
+            return
+
+        if parent_tab_id is None:
+            if tab.parent_id is not None:
+                tab.clear_parent()
+                self.changed.emit()
+            return
+
+        if parent_tab_id == tab_id:
+            log.workspaces.debug(
+                "set_parent: refusing to make tab %s its own parent", tab_id)
+            return
+
+        parent = next(
+            (t for t in workspace.tabs if t.tab_id == parent_tab_id), None)
+        if parent is None:
+            log.workspaces.debug(
+                "set_parent: unknown parent tab %s in workspace %s",
+                parent_tab_id, workspace_id)
+            return
+
+        # Walk up from the proposed parent; reaching *tab* would create a
+        # cycle (A -> B -> A).
+        seen: set[int] = set()
+        cursor: Optional[WorkspaceTab] = parent
+        while cursor is not None and cursor.tab_id not in seen:
+            if cursor.tab_id == tab_id:
+                log.workspaces.debug(
+                    "set_parent: refusing cyclic parent %s -> %s",
+                    tab_id, parent_tab_id)
+                return
+            seen.add(cursor.tab_id)
+            cursor = next(
+                (t for t in workspace.tabs
+                 if t.tab_id == cursor.parent_id), None)
+
+        if tab.parent_id != parent_tab_id:
+            tab.parent_id = parent_tab_id
+            self.changed.emit()
+
     # --- batched operations (VP-F4) ---
 
     def move_tabs(

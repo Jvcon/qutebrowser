@@ -272,6 +272,42 @@ class TestWorkspaceBridge:
         assert tabs[1].open_status == 'OPEN'
         assert tabs[1].parent_id == 1
 
+    def test_foreground_tab_records_opener_as_parent(
+            self, browser, manager, bridge):
+        """A foreground tab opened from another tab nests under it."""
+        parent = _open_tab(browser, MockTab(1, title='Parent'))
+        browser.widget.setCurrentWidget(parent)
+        bridge._on_current_tab_changed(parent)
+
+        child = MockTab(2, title='Child')
+        browser.widget.insert(child, 1)
+        browser.widget.setCurrentWidget(child)
+        bridge._on_current_tab_changed(child)
+        browser.new_tab.emit(child, 1)
+
+        entries = {tab.tab_id: tab for tab in manager.get_active().tabs}
+        assert entries[2].parent_id == 1
+
+    def test_background_tab_records_current_tab_as_parent(
+            self, browser, manager, bridge):
+        """The current tab stays the opener for a background tab."""
+        parent = _open_tab(browser, MockTab(1, title='Parent'))
+        browser.widget.setCurrentWidget(parent)
+        bridge._on_current_tab_changed(parent)
+
+        child = MockTab(2, title='Child')
+        browser.widget.insert(child, 1)
+        browser.new_tab.emit(child, 1)
+
+        entries = {tab.tab_id: tab for tab in manager.get_active().tabs}
+        assert entries[2].parent_id == 1
+
+    def test_first_tab_has_no_parent(self, browser, manager, bridge):
+        _open_tab(browser, MockTab(1, title='First'))
+
+        entries = {tab.tab_id: tab for tab in manager.get_active().tabs}
+        assert entries[1].parent_id is None
+
     def test_shutting_down_suspends_entry(self, browser, manager, bridge):
         tab = _open_tab(browser, MockTab(1))
         tab.shutting_down.emit()
