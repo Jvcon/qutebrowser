@@ -306,6 +306,10 @@ class Workspace:
             suggestion card, mapped to the ISO 8601 timestamp until which
             they stay suppressed (VP-A2). Older state files without this
             key load with an empty mapping.
+        created_at: ISO 8601 UTC timestamp of when this workspace was
+            first created. ``None`` for workspaces loaded from older YAML
+            files that pre-date the field; newly-created workspaces set
+            it explicitly via ``WorkspaceManager.add_workspace``.
     """
 
     id: uuid.UUID
@@ -316,6 +320,7 @@ class Workspace:
     archived: bool = False
     suggestion_ignored: dict[str, str] = dataclasses.field(
         default_factory=dict)
+    created_at: Optional[str] = None
 
     def add_group(self, group: Group) -> None:
         """Append *group* to this workspace's group list."""
@@ -331,6 +336,7 @@ class Workspace:
             'last_active': self.last_active,
             'archived': self.archived,
             '_suggestion_ignored': dict(self.suggestion_ignored),
+            'created_at': self.created_at,
         }
 
     @classmethod
@@ -348,6 +354,7 @@ class Workspace:
             last_active=d.get('last_active'),
             archived=bool(d.get('archived', False)),
             suggestion_ignored=ignored,
+            created_at=d.get('created_at'),
         )
 
 

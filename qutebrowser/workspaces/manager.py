@@ -288,9 +288,17 @@ class WorkspaceManager(QObject):
         """Create, store, and return a new workspace.
 
         The new workspace is stamped with ``last_active`` so a first launch
-        followed by a save can restore it on the next start.
+        followed by a save can restore it on the next start, and with
+        ``created_at`` so the portability exchange format can carry the
+        user's actual creation time instead of ``null`` (issue #40).
         """
-        workspace = Workspace(id=uuid.uuid4(), name=name, last_active=_now())
+        now = _now()
+        workspace = Workspace(
+            id=uuid.uuid4(),
+            name=name,
+            last_active=now,
+            created_at=now,
+        )
         self._workspaces[workspace.id] = workspace
         if self._active_id is None:
             self._active_id = workspace.id
@@ -305,18 +313,23 @@ class WorkspaceManager(QObject):
             *,
             archived: bool = False,
             last_active: Optional[str] = None,
+            created_at: Optional[str] = None,
     ) -> Workspace:
         """Create, store, and return a workspace with a caller-supplied id.
 
         Import is the only caller: it must preserve the ``Workspace.id``
         from the interchange document so an entry's ``group_id`` keeps its
-        referential integrity (ADR 0009 § 2).
+        referential integrity (ADR 0009 § 2). When the document carries a
+        real ``created_at`` it is preserved; otherwise we stamp it now so
+        newly-imported workspaces still get a meaningful timestamp.
         """
+        now = _now()
         workspace = Workspace(
             id=workspace_id,
             name=name,
-            last_active=last_active or _now(),
+            last_active=last_active or now,
             archived=archived,
+            created_at=created_at or now,
         )
         self._workspaces[workspace.id] = workspace
         if self._active_id is None:

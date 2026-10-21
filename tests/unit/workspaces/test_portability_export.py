@@ -229,3 +229,25 @@ def test_export_emits_tabs_index(tmp_path, monkeypatch) -> None:
         '1': 'https://example.com/paper',
         '2': 'https://example.com/standalone',
     }
+
+
+def test_export_workspace_created_at_is_real(tmp_path, monkeypatch) -> None:
+    """Every emitted workspace carries a non-null ISO-8601 created_at.
+
+    Until issue #40 the field was a structural placeholder emitting
+    ``None`` on every export; the model now surfaces a real timestamp.
+    """
+    manager = _manager()
+    _wire(monkeypatch, manager)
+    workspace = manager.list_all_workspaces()[0]
+    workspace.created_at = '2026-01-15T12:34:56+00:00'
+
+    out = portability.export_to_path(tmp_path / 'export.json')
+    document = json.loads(out.read_text(encoding='utf-8'))
+
+    assert document['workspaces'][0]['created_at'] == (
+        '2026-01-15T12:34:56+00:00'
+    )
+    # And it parses as a real timestamp, so the importer can keep using it.
+    datetime.datetime.fromisoformat(
+        document['workspaces'][0]['created_at'])

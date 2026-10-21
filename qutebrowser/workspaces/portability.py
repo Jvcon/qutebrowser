@@ -155,9 +155,9 @@ def _workspace_to_dict(workspace: Workspace) -> dict[str, Any]:
     """Serialize one workspace and the groups/tabs it owns.
 
     ``last_active`` is machine-local (which workspace *this* machine last
-    showed) and is excluded (ADR 0009 § 3).  The model has no
-    ``Workspace.created_at`` field yet, so the key is emitted as ``None``
-    (tracked as a known limitation, see issue #41).
+    showed) and is excluded (ADR 0009 § 3).  ``created_at`` is emitted
+    verbatim from the model — it is a user-meaningful timestamp set when
+    the workspace was first created.
 
     Pinned tabs are deliberately **not** here: they are profile-scoped, so
     they sit at the document root where exactly one copy round-trips
@@ -176,7 +176,7 @@ def _workspace_to_dict(workspace: Workspace) -> dict[str, Any]:
         'id': str(workspace.id),
         'name': workspace.name,
         'archived': workspace.archived,
-        'created_at': None,
+        'created_at': workspace.created_at,
         'groups': [
             _group_to_dict(group, workspace.tabs)
             for group in workspace.groups
@@ -634,10 +634,16 @@ def import_from_path(path: Path) -> ImportReport:
                 continue
 
             name = str(workspace_doc.get('name') or '')
+            raw_created_at = workspace_doc.get('created_at')
+            created_at = (
+                raw_created_at if isinstance(raw_created_at, str)
+                and raw_created_at else None
+            )
             workspace = manager.add_workspace_with_id(
                 workspace_id,
                 name,
                 archived=bool(workspace_doc.get('archived', False)),
+                created_at=created_at,
             )
             local_workspace_ids.add(workspace_id)
             added_workspace_ids.append(workspace_id)

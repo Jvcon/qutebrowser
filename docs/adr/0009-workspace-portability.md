@@ -230,9 +230,13 @@ that are **not** in the table above:
   per-group `entries` key, but dropping them would silently lose data.
 - **`tabs_index`** lives at the document root and is the source of truth
   for `parent_id` remap on import. See § 2.
+- **`Workspace.created_at`** is now a real field on the model
+  (`#40`). It is populated on freshly-created workspaces
+  (`WorkspaceManager.add_workspace`) and forwarded through
+  `add_workspace_with_id` so an imported document's `created_at`
+  survives a round-trip. Workspaces loaded from older YAML files that
+  pre-date the field stay `None`.
 
 ### Known limitations (tracked for follow-ups)
 
-- `Workspace.created_at` is always `null` in the export today, because
-  the model has no such field. Tracked in #40; will be lifted to the
-  model and through the import path together.
+_None at this revision._
