@@ -188,29 +188,7 @@ class TestGroupLifecycle:
         with pytest.raises(KeyError):
             manager.move_group(workspace.id, uuid.uuid4(), 0)
 
-    def test_purge_group_removes_group_and_members(self, manager):
-        workspace = manager.add_workspace('w')
-        group = manager.create_group(workspace.id, 'g')
-        other = manager.create_group(workspace.id, 'other')
-        manager.add_tab(workspace.id,
-                        WorkspaceTab(tab_id=1, group_id=group.group_id))
-        manager.add_tab(workspace.id,
-                        WorkspaceTab(tab_id=2, group_id=group.group_id))
-        manager.add_tab(workspace.id,
-                        WorkspaceTab(tab_id=3, group_id=other.group_id))
-        manager.add_tab(workspace.id, WorkspaceTab(tab_id=4))
-
-        changes = []
-        manager.changed.connect(lambda: changes.append(True))
-        removed = manager.purge_group(workspace.id, group.group_id)
-
-        assert removed == 2
-        assert manager.list_groups(workspace.id) == [other]
-        assert [tab.tab_id for tab in workspace.tabs] == [3, 4]
-        assert changes
-
-    def test_delete_group_nulls_members_still_works(self, manager):
-        """The legacy delete_group semantics are unchanged by purge_group."""
+    def test_delete_group_makes_members_standalone(self, manager):
         workspace = manager.add_workspace('w')
         group = manager.create_group(workspace.id, 'g')
         manager.add_tab(workspace.id,

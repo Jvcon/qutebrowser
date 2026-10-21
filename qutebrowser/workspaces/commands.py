@@ -519,11 +519,11 @@ def vp_group_restore(target: str) -> None:
 @cmdutils.register(name='vp-group-delete')
 @cmdutils.argument('target', metavar='target')
 def vp_group_delete(target: str) -> None:
-    """Permanently delete a Group and all its TabEntries.
+    """Delete a Group, making its TabEntries standalone.
 
     Non-empty groups require confirmation; empty groups are deleted
-    immediately (ADR 0008 § Decisions). Unlike ``:vp-group-archive``, this
-    cannot be undone.
+    immediately (ADR 0008 § Decisions). Unlike ``:vp-group-archive``, the
+    group itself cannot be restored afterwards.
 
     Args:
         target: The name or UUID of the group.
@@ -547,13 +547,15 @@ def _make_group_delete_action(
     workspace: Workspace,
     group: Group,
 ) -> Callable[[], None]:
-    """Return the callback which cascade-deletes *group* after confirmation."""
+    """Return the callback which deletes *group* after confirmation."""
     name = group.name
     group_id = group.group_id
 
     def delete() -> None:
-        removed = manager.purge_group(workspace.id, group_id)
-        message.info(f"Deleted group '{name}' ({removed} tabs).")
+        count = manager.group_total_count(workspace.id, group_id)
+        manager.delete_group(workspace.id, group_id)
+        message.info(
+            f"Deleted group '{name}'; {count} tab(s) became standalone.")
 
     return delete
 
@@ -1258,8 +1260,12 @@ def pintab_add(target: str, win_id: int = 0) -> None:
     manager = _manager()
     workspace = _active_workspace(manager)
     entry = _resolve_status_target(manager, workspace, target)
+    # Resolve and read the entry *before* moving it out of the workspace.
     pinned = _pinned_from_entry(manager, workspace, entry, win_id)
     manager.add_pinned(pinned)
+    # ADR 0008: the PIN panel and the TabTree are disjoint, so the tab must
+    # stop being a workspace entry once it is pinned.
+    manager.remove_tab(workspace.id, entry.tab_id)
     message.info(f"Pinned tab {entry.tab_id}.")
 
 

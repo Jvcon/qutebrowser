@@ -560,6 +560,27 @@ class TestWorkspaceBridge:
 
         assert workspace_tab.title == 'Original'
 
+    def test_removed_workspace_entry_is_not_recreated(
+            self, browser, manager, bridge):
+        """A tab moved to the PIN panel must not re-enter the workspace.
+
+        ``pintab_add`` removes the workspace entry; the bridge's
+        already-registered fast path must stop later URL/status signals (and
+        a re-sync pass) from calling ``_ensure_entry`` again.
+        """
+        tab = _open_tab(browser, MockTab(1))
+        workspace = manager.get_active()
+        assert workspace is not None
+        manager.remove_tab(workspace.id, 1)
+
+        tab.title_changed.emit('Still pinned')
+        tab.url_changed.emit(QUrl('https://example.com/'))
+        tab.load_started.emit()
+        bridge._sync_existing_tabs()
+
+        assert manager.find_tab_by_id(workspace.id, 1) is None
+        assert workspace.tabs == []
+
 
 class TestAutoLocate:
 

@@ -588,27 +588,6 @@ class WorkspaceManager(QObject):
         workspace.groups.insert(new_index, group)
         self.changed.emit()
 
-    def purge_group(self, workspace_id: uuid.UUID,
-                    group_id: uuid.UUID) -> int:
-        """Permanently delete a group and every tab belonging to it.
-
-        Unlike :meth:`delete_group` (which makes members standalone), this
-        cascades: every :class:`~qutebrowser.workspaces.model.WorkspaceTab`
-        whose ``group_id`` matches is removed as well.
-
-        Returns:
-            The number of tabs that were removed.
-        """
-        workspace = self._workspaces[workspace_id]
-        removed_tabs = [tab for tab in workspace.tabs
-                        if tab.group_id == group_id]
-        workspace.tabs = [tab for tab in workspace.tabs
-                          if tab.group_id != group_id]
-        workspace.groups = [group for group in workspace.groups
-                            if group.group_id != group_id]
-        self.changed.emit()
-        return len(removed_tabs)
-
     # --- tab membership ---
 
     def add_tab(self, workspace_id: uuid.UUID, tab: WorkspaceTab) -> None:
