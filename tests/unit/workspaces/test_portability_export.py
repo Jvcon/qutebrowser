@@ -213,8 +213,11 @@ def test_export_carries_tab_favicon(tmp_path, monkeypatch) -> None:
 
 
 def test_export_emits_tabs_index(tmp_path, monkeypatch) -> None:
-    """Each source tab_id must be reachable from tabs_index by URL so that
-    the importer can rebuild parent_id chains (ADR 0009 § 2)."""
+    """Each source tab_id is reachable from tabs_index by URL.
+
+    The importer uses this for parent_id remap; without it round-tripped
+    parent-child chains would silently become orphans (ADR 0009 § 2).
+    """
     manager = _manager()
     _wire(monkeypatch, manager)
 

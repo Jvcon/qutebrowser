@@ -298,6 +298,33 @@ class WorkspaceManager(QObject):
         self.changed.emit()
         return workspace
 
+    def add_workspace_with_id(
+            self,
+            workspace_id: uuid.UUID,
+            name: str,
+            *,
+            archived: bool = False,
+            last_active: Optional[str] = None,
+    ) -> Workspace:
+        """Create, store, and return a workspace with a caller-supplied id.
+
+        Import is the only caller: it must preserve the ``Workspace.id``
+        from the interchange document so an entry's ``group_id`` keeps its
+        referential integrity (ADR 0009 § 2).
+        """
+        workspace = Workspace(
+            id=workspace_id,
+            name=name,
+            last_active=last_active or _now(),
+            archived=archived,
+        )
+        self._workspaces[workspace.id] = workspace
+        if self._active_id is None:
+            self._active_id = workspace.id
+            self._persistence.save_state(self._active_id)
+        self.changed.emit()
+        return workspace
+
     def delete_workspace(self, workspace_id: uuid.UUID) -> None:
         """Remove a workspace from memory and disk."""
         del self._workspaces[workspace_id]
