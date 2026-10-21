@@ -282,9 +282,11 @@ class MainWindow(QWidget):
         self._central_splitter.setChildrenCollapsible(False)
         self._central_splitter.addWidget(self.vertical_panel)
         self._central_splitter.addWidget(self.tabbed_browser.widget)
-        self._central_splitter.setSizes(
-            [config.val.verticalpanel.width,
-             max(self.width() - config.val.verticalpanel.width, 1)])
+        # Keep the splitter pane in sync with the panel's resolved
+        # width, both at construction and on later config changes.
+        self.vertical_panel.width_changed.connect(
+            self._on_panel_width_changed)
+        self._on_panel_width_changed(self.vertical_panel.pixel_width())
 
         self._init_command_dispatcher()
 
@@ -321,6 +323,9 @@ class MainWindow(QWidget):
         self._add_overlay(self._messageview, self._messageview.update_geometry)
 
         self._init_geometry(geometry)
+        if isinstance(config.val.verticalpanel.width, str):
+            # Re-resolve a percentage against the final saved geometry.
+            self.vertical_panel.apply_width()
         self._connect_signals()
 
         # When we're here the statusbar might not even really exist yet, so
@@ -453,6 +458,11 @@ class MainWindow(QWidget):
 
     def __repr__(self):
         return utils.get_repr(self)
+
+    def _on_panel_width_changed(self, width: int) -> None:
+        """Resize the splitter so the panel takes *width* pixels."""
+        self._central_splitter.setSizes(
+            [width, max(self.width() - width, 1)])
 
     @pyqtSlot(str)
     def _on_config_changed(self, option):
@@ -679,6 +689,12 @@ class MainWindow(QWidget):
             e: The QResizeEvent
         """
         super().resizeEvent(e)
+        # Percentages are relative to the window, so re-resolve them on
+        # resize to keep the configured share. Integer widths are
+        # absolute and are left alone, so a user-dragged splitter
+        # position survives a window resize.
+        if isinstance(config.val.verticalpanel.width, str):
+            self.vertical_panel.apply_width()
         self._update_overlay_geometries()
         self._downloadview.updateGeometry()
         self.tabbed_browser.widget.tab_bar().refresh()

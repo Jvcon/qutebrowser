@@ -11,7 +11,7 @@ import pytest
 from qutebrowser.qt.core import Qt
 from qutebrowser.qt.widgets import QApplication, QWidget
 
-from qutebrowser.mainwindow import verticalpanel
+from qutebrowser.mainwindow import mainwindow, verticalpanel
 from qutebrowser.utils import usertypes
 
 
@@ -78,6 +78,68 @@ class TestVerticalPanel:
     def test_applies_minimum_width(self, panel):
         """Test that the panel's minimum width tracks verticalpanel.width."""
         assert panel.minimumWidth() == 220
+
+    def test_integer_width_is_pixels(self, panel):
+        """Regression guard: an integer width stays an absolute pixel value."""
+        assert panel.pixel_width() == 220
+        assert panel.minimumWidth() == 220
+        assert panel.maximumWidth() == 880
+
+    def test_percentage_width_does_not_raise(
+            self, qtbot, config_stub, modeman_mock):
+        """Regression: percentages must be resolved before reaching Qt.
+
+        Previously the raw ``'25%'`` string was passed to
+        ``setMinimumWidth``/``setMaximumWidth``, which raised a TypeError
+        and prevented startup.
+        """
+        config_stub.val.verticalpanel.width = '25%'
+        config_stub.val.verticalpanel.visible = True
+        panel = verticalpanel.VerticalPanel(win_id=0)
+        qtbot.add_widget(panel)
+        assert isinstance(panel.minimumWidth(), int)
+
+    def test_percentage_width_resolves_to_pixels(self, panel, config_stub):
+        """A percentage resolves against the window width (like tabs.width)."""
+        # The integer fixture width caps the panel at 880px, so lift the
+        # cap before resizing to a known reference width.
+        panel.setMaximumWidth(16777215)
+        panel.resize(1000, 600)
+        QApplication.processEvents()
+        assert panel.width() == 1000
+
+        config_stub.val.verticalpanel.width = '25%'
+        assert panel.pixel_width() == 250
+        assert panel.minimumWidth() == 250
+        assert panel.maximumWidth() == 1000
+
+    def test_width_change_at_runtime(self, panel, config_stub):
+        """A runtime width change updates the panel without a restart."""
+        received = []
+        panel.width_changed.connect(received.append)
+
+        config_stub.val.verticalpanel.width = 100
+        assert panel.minimumWidth() == 100
+        assert panel.maximumWidth() == 400
+        assert received[-1] == 100
+
+        config_stub.val.verticalpanel.width = '50%'
+        assert panel.minimumWidth() == panel.pixel_width()
+        assert received[-1] == panel.pixel_width()
+
+    def test_width_change_resizes_splitter(self, panel, config_stub):
+        """A runtime change reaches MainWindow's splitter resize handler."""
+        sizes = []
+        fake_window = SimpleNamespace(
+            _central_splitter=SimpleNamespace(setSizes=sizes.append),
+            width=lambda: 1000,
+        )
+        panel.width_changed.connect(
+            lambda width: mainwindow.MainWindow._on_panel_width_changed(
+                fake_window, width))
+
+        config_stub.val.verticalpanel.width = 120
+        assert sizes[-1] == [120, 880]
 
     def test_toggle_hides(self, panel):
         """Test that toggle() hides a visible panel."""

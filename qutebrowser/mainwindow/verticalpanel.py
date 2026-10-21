@@ -28,7 +28,7 @@ Focus protocol
   pending webview state is preserved.
 """
 
-from qutebrowser.qt.core import Qt, pyqtSlot
+from qutebrowser.qt.core import Qt, pyqtSignal, pyqtSlot
 from qutebrowser.qt.widgets import QApplication, QVBoxLayout, QWidget
 
 from qutebrowser.config import config
@@ -50,6 +50,9 @@ class VerticalPanel(QWidget):
         tab_tree: The :class:`tabtree.TabTree` child below the PIN
             panel, or None when no manager is supplied.
     """
+
+    #: Emitted with the resolved pixel width whenever it is (re)applied.
+    width_changed = pyqtSignal(int)
 
     def __init__(
             self,
@@ -115,7 +118,7 @@ class VerticalPanel(QWidget):
                 win_id=win_id, manager=manager, parent=self)
             self._layout.addWidget(self.workspace_indicator)
 
-        self._apply_width()
+        self.apply_width()
         if config.val.verticalpanel.visible:
             self.show()
         else:
@@ -132,25 +135,42 @@ class VerticalPanel(QWidget):
 
     def _on_config_changed(self, option: str) -> None:
         if option == 'verticalpanel.width':
-            self._apply_width()
+            self.apply_width()
         elif option == 'verticalpanel.visible':
             if config.val.verticalpanel.visible:
                 self.show()
             else:
                 self.hide()
 
-    def _apply_width(self) -> None:
-        width = config.val.verticalpanel.width
-        # The minimum is the user-configured value (so the panel can
-        # never collapse below it). The maximum is generous so the
-        # user can drag-resize well past the default if they want;
-        # this matches the spirit of `tabs.width` (PercOrInt with
-        # min/max bounds).
+    def pixel_width(self) -> int:
+        """Resolve ``verticalpanel.width`` to pixels.
+
+        Percentages are relative to the window width, using the same
+        convention as ``tabs.width`` (``window.width() * perc // 100``).
+        They are re-resolved whenever the window is resized rather than
+        frozen at startup, so the panel keeps its configured share of
+        the window (see ``MainWindow.resizeEvent``). Integers are
+        absolute pixel values.
+        """
+        configured = config.val.verticalpanel.width
+        if isinstance(configured, str):
+            perc = int(configured.rstrip('%'))
+            return self.window().width() * perc // 100
+        return configured
+
+    def apply_width(self) -> None:
+        """Apply the configured width to the panel's min/max bounds."""
+        width = self.pixel_width()
+        # The minimum is the resolved value (so the panel can never
+        # collapse below it). The maximum is generous so the user can
+        # drag-resize well past the default if they want; this matches
+        # the spirit of `tabs.width` (PercOrInt with min/max bounds).
         self.setMinimumWidth(width)
         if width > 0:
             self.setMaximumWidth(width * 4)
         else:
             self.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+        self.width_changed.emit(width)
 
     @pyqtSlot()
     def toggle(self) -> None:
