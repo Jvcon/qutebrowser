@@ -218,33 +218,95 @@ class WorkspacePersistence:
         """Delete a workspace file, if it exists."""
         self._path(workspace_id).unlink(missing_ok=True)
 
-    def save_state(self, active_id: Optional[uuid.UUID]) -> None:
-        """Atomically persist the id of the active workspace (or None)."""
-        data = {'active_id': str(active_id) if active_id is not None else None}
+    def save_state(
+            self,
+            active_id: Optional[uuid.UUID],
+            last_active_tabs: Optional[
+                dict[uuid.UUID, Optional[int]]] = None,
+    ) -> None:
+        """Atomically persist the whole active-workspace state.
+
+        The state file carries the active workspace id plus the per-workspace
+        last-active tab ids::
+
+            active_id: <uuid>
+            last_active_tabs:
+              <uuid>: <int>
+              <uuid>: null
+
+        Both keys are written in a single ``QSaveFile`` commit so readers
+        never observe a half-written state. ``last_active_tabs`` defaults to
+        an empty map so legacy callers which only know the active id keep
+        working (and drop the map from the file, which is harmless: a missing
+        map is treated as empty on load).
+        """
+        last_active_tabs = last_active_tabs or {}
+        data = {
+            'active_id': str(active_id) if active_id is not None else None,
+            'last_active_tabs': {
+                str(workspace_id): tab_id
+                for workspace_id, tab_id in last_active_tabs.items()
+            },
+        }
         with qtutils.savefile_open(str(self.state_path)) as f:
             utils.yaml_dump(data, f)
+
+    def load_state_data(
+            self,
+    ) -> tuple[Optional[uuid.UUID],
+               dict[uuid.UUID, Optional[int]]]:
+        """Load the persisted active id plus the last-active tab map.
+
+        Legacy state files written before per-workspace tabs were tracked
+        only contain ``active_id``; they load with an empty map. Invalid ids
+        (and malformed map entries) are ignored rather than aborting the
+        whole load.
+        """
+        empty: dict[uuid.UUID, Optional[int]] = {}
+        if not self.state_path.exists():
+            return None, empty
+        with self.state_path.open('r', encoding='utf-8') as f:
+            data = utils.yaml_load(f)
+        if not isinstance(data, dict):
+            return None, empty
+
+        active_id: Optional[uuid.UUID] = None
+        raw = data.get('active_id')
+        if raw is not None:
+            try:
+                active_id = uuid.UUID(str(raw))
+            except ValueError:
+                log.message.warning(
+                    f"Ignoring invalid active workspace id {raw!r}")
+
+        last_active_tabs: dict[uuid.UUID, Optional[int]] = {}
+        raw_tabs = data.get('last_active_tabs')
+        if isinstance(raw_tabs, dict):
+            for raw_id, raw_tab_id in raw_tabs.items():
+                try:
+                    workspace_id = uuid.UUID(str(raw_id))
+                except ValueError:
+                    log.message.warning(
+                        f"Ignoring invalid workspace id {raw_id!r} in "
+                        "last_active_tabs")
+                    continue
+                if raw_tab_id is not None and not isinstance(raw_tab_id, int):
+                    log.message.warning(
+                        f"Ignoring invalid last-active tab id {raw_tab_id!r} "
+                        f"for workspace {workspace_id}")
+                    continue
+                last_active_tabs[workspace_id] = raw_tab_id
+        return active_id, last_active_tabs
 
     def load_state(self) -> Optional[uuid.UUID]:
         """Load the persisted active workspace id, if any.
 
         Returns None when the state file is missing, empty, or holds an
-        invalid id.
+        invalid id. Per-workspace tab ids are ignored by this accessor; use
+        :meth:`load_state_data` to read both.
         """
-        if not self.state_path.exists():
-            return None
-        with self.state_path.open('r', encoding='utf-8') as f:
-            data = utils.yaml_load(f)
-        if not data:
-            return None
-        raw = data.get('active_id')
-        if raw is None:
-            return None
-        try:
-            return uuid.UUID(str(raw))
-        except ValueError:
-            log.message.warning(
-                f"Ignoring invalid active workspace id {raw!r}")
-            return None
+        active_id, _last_active_tabs = self.load_state_data()
+        return active_id
 
 
 class PinnedPersistence:

@@ -222,10 +222,16 @@ class WorkspaceManager(QObject):
             (add / remove / initial load). UI consumers (e.g. the
             VerticalPanel's PINPanel) listen to this to refresh
             without having to poll.
+        active_workspace_changed: Emitted after a successful workspace
+            switch with ``(workspace_id, restored_tab_id)``. The widget
+            layer (WorkspaceBridge) uses this to filter/rebuild the tab
+            surface and restore focus to the workspace's last-active tab.
+            ``restored_tab_id`` is ``None`` when no tab was recorded yet.
     """
 
     changed = pyqtSignal()
     pinned_changed = pyqtSignal()
+    active_workspace_changed = pyqtSignal(object, object)
     #: Emitted after a periodic/startup scan with the current stale
     #: Group suggestions (``list[Group]``), so the panel can refresh its
     #: non-modal suggestion card (VP-A2).
@@ -239,6 +245,10 @@ class WorkspaceManager(QObject):
         self.profile_name: str = persistence.profile_name
         self._workspaces: dict[uuid.UUID, Workspace] = {}
         self._active_id: Optional[uuid.UUID] = None
+        # workspace id -> last runtime tab id focused in that workspace.
+        # ``None`` means "switched to this workspace but no tab was recorded
+        # yet"; the bridge then falls back to the first OPEN tab.
+        self._last_active_tabs: dict[uuid.UUID, Optional[int]] = {}
         self._pinned: list[PinnedTab] = []
         self._auto_suspend_timer: Optional[QTimer] = None
         # Tabs whose group was placed manually via :tab-move-to-group.  A
@@ -256,8 +266,16 @@ class WorkspaceManager(QObject):
         """
         self._workspaces = {}
         self._active_id = None
+        self._last_active_tabs = {}
 
-        active_id = self._persistence.load_state()
+        loader = getattr(self._persistence, 'load_state_data', None)
+        if loader is not None:
+            active_id, last_active_tabs = loader()
+        else:  # pragma: no cover - compatibility with older test doubles
+            active_id = self._persistence.load_state()
+            last_active_tabs = {}
+        self._last_active_tabs = dict(last_active_tabs)
+
         if active_id is not None:
             try:
                 workspace = self._persistence.load(active_id)
@@ -279,8 +297,13 @@ class WorkspaceManager(QObject):
         """Persist all loaded workspaces, the active id, and pinned tabs."""
         for workspace in self._workspaces.values():
             self._persistence.save(workspace)
-        self._persistence.save_state(self._active_id)
+        self._save_state()
         self._pinned_persistence.save(self._pinned)
+
+    def _save_state(self) -> None:
+        """Persist the active id plus the per-workspace tab map atomically."""
+        self._persistence.save_state(
+            self._active_id, self._last_active_tabs)
 
     # --- workspace CRUD ---
 
@@ -302,7 +325,7 @@ class WorkspaceManager(QObject):
         self._workspaces[workspace.id] = workspace
         if self._active_id is None:
             self._active_id = workspace.id
-            self._persistence.save_state(self._active_id)
+            self._save_state()
         self.changed.emit()
         return workspace
 
@@ -334,7 +357,7 @@ class WorkspaceManager(QObject):
         self._workspaces[workspace.id] = workspace
         if self._active_id is None:
             self._active_id = workspace.id
-            self._persistence.save_state(self._active_id)
+            self._save_state()
         self.changed.emit()
         return workspace
 
@@ -342,9 +365,10 @@ class WorkspaceManager(QObject):
         """Remove a workspace from memory and disk."""
         del self._workspaces[workspace_id]
         self._persistence.delete(workspace_id)
+        self._last_active_tabs.pop(workspace_id, None)
         if self._active_id == workspace_id:
             self._active_id = None
-        self._persistence.save_state(self._active_id)
+        self._save_state()
         self.changed.emit()
 
     def rename_workspace(self, workspace_id: uuid.UUID, new_name: str) -> None:
@@ -367,13 +391,74 @@ class WorkspaceManager(QObject):
         self._workspaces[workspace.id] = workspace
         return workspace
 
+    def record_active_tab(
+            self,
+            tab_id: Optional[int],
+            workspace_id: Optional[uuid.UUID] = None,
+    ) -> None:
+        """Remember *tab_id* as the last-active tab of *workspace_id*.
+
+        Called by the widget layer (``WorkspaceBridge``) on every tab switch.
+        This is deliberately *not* a state mutation on its own: no
+        :attr:`changed` is emitted and nothing is written to disk here. The
+        map is flushed whenever the active workspace changes or the manager
+        is saved, keeping the hot tab-switch path I/O free.
+
+        Args:
+            tab_id: Runtime id of the focused tab, or ``None``.
+            workspace_id: Workspace owning the tab. Defaults to the active
+                workspace. Unknown/unset workspaces are ignored.
+        """
+        if workspace_id is None:
+            workspace_id = self._active_id
+        if workspace_id is None:
+            return
+        if self._last_active_tabs.get(workspace_id) == tab_id:
+            return
+        self._last_active_tabs[workspace_id] = tab_id
+
+    def tab_id_for_workspace(
+            self,
+            workspace_id: uuid.UUID,
+    ) -> Optional[int]:
+        """Return the recorded last-active tab id for *workspace_id*.
+
+        Returns ``None`` when no tab was ever recorded (or the workspace is
+        unknown). The value is read from the in-memory cache populated by
+        :meth:`load` / :meth:`record_active_tab`, so this is a pure query.
+        """
+        return self._last_active_tabs.get(workspace_id)
+
     def set_active(self, workspace_id: uuid.UUID) -> None:
-        """Mark a workspace as active, stamping ``last_active`` and state."""
-        workspace = self._workspaces[workspace_id]
+        """Switch the active workspace atomically.
+
+        The switch performs only in-memory bookkeeping plus one state-file
+        write (shared with :meth:`_save_state`): stamp ``last_active``, set
+        the active id, persist, then notify consumers. A dedicated
+        :attr:`active_workspace_changed` signal carries
+        ``(workspace_id, restored_tab_id)`` so the widget layer can rebuild
+        its tab surface and restore focus without the manager importing any
+        Qt widget code.
+
+        Switching to the already-active workspace is a cheap no-op: it emits
+        no signal and does not touch the disk, which keeps repeated
+        ``:workspace-switch`` calls fast.
+        """
+        if workspace_id == self._active_id:
+            log.workspaces.debug(
+                "set_active: workspace %s is already active", workspace_id)
+            return
+
+        workspace = self.get_workspace(workspace_id)
+        if workspace is None:
+            raise KeyError(workspace_id)
+
         workspace.last_active = _now()
-        self._active_id = workspace_id
-        self._persistence.save_state(self._active_id)
+        self._active_id = workspace.id
+        self._save_state()
+        restored_tab_id = self._last_active_tabs.get(workspace.id)
         self.changed.emit()
+        self.active_workspace_changed.emit(workspace.id, restored_tab_id)
 
     def get_active(self) -> Optional[Workspace]:
         """Return the active workspace, or None if there is none."""
