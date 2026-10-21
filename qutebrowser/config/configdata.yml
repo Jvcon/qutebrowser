@@ -4152,6 +4152,27 @@ bindings.default:
       gp: cmd-set-text -s :pintab-add
       gP: cmd-set-text -s :pintab-remove
       gM: cmd-set-text -s :pintab-move
+      gS: pintab-style-toggle
+      gwc: cmd-set-text -s :workspace-create
+      gwr: cmd-set-text -s :workspace-rename
+      gwd: cmd-set-text -s :workspace-delete
+      gwa: cmd-set-text -s :workspace-archive
+      gwu: cmd-set-text -s :workspace-unarchive
+      gws: cmd-set-text -s :workspace-switch
+      ggl: group-list
+      ggn: cmd-set-text -s :vp-group-new
+      ggr: cmd-set-text -s :vp-group-rename
+      ggp: cmd-set-text -s :vp-group-pin
+      ggP: cmd-set-text -s :vp-group-unpin
+      gga: cmd-set-text -s :vp-group-archive
+      ggR: cmd-set-text -s :vp-group-restore
+      ggd: cmd-set-text -s :vp-group-delete
+      ggc: cmd-set-text -s :vp-group-close
+      ggo: cmd-set-text -s :vp-group-reopen
+      gX: vp-cleanup-done
+      gbm: cmd-set-text -s :vp-batch-move
+      gbs: cmd-set-text -s :vp-batch-status
+      "/": panel-filter
       <Ctrl-Space>: vp-select-mode
       <Ctrl-A>: vp-select-all
       <Ctrl-N>: vp-select-none

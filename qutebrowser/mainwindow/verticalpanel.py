@@ -34,7 +34,7 @@ from qutebrowser.qt.widgets import QApplication, QVBoxLayout, QWidget
 from qutebrowser.config import config
 from qutebrowser.keyinput import modeman
 from qutebrowser.mainwindow import filterrow, pinpanel, tabtree, workspaceindicator
-from qutebrowser.utils import usertypes
+from qutebrowser.utils import objreg, usertypes
 
 
 class VerticalPanel(QWidget):
@@ -172,7 +172,26 @@ class VerticalPanel(QWidget):
 
     def open_filter(self) -> None:
         """Show and focus the transient filter row."""
+        self._set_filter_active(True)
         self.filter_row.open()
+
+    def _set_filter_active(self, active: bool) -> None:
+        """Toggle passthrough handling on the panel's key parser.
+
+        While the filter row is open it needs raw key events (including
+        ``<Escape>``), so the ``workspace_panel`` parser must not consume
+        them as bindings. The parser is optional here because unit tests
+        can construct a panel without a mode manager.
+        """
+        try:
+            mode_manager = modeman.instance(self._win_id)
+        except (modeman.UnavailableError, objreg.RegistryUnavailableError):
+            return
+        parser = mode_manager.parsers.get(
+            usertypes.KeyMode.workspace_panel)
+        setter = getattr(parser, 'set_filter_active', None)
+        if setter is not None:
+            setter(active)
 
     def _on_filter_changed(self, text: str) -> None:
         """Push the filter text into the PIN and TabTree models."""
@@ -183,6 +202,7 @@ class VerticalPanel(QWidget):
 
     def _on_filter_closed(self) -> None:
         """Return focus to the TabTree when the filter row closes."""
+        self._set_filter_active(False)
         if self.tab_tree is not None:
             self.tab_tree.view().setFocus(Qt.FocusReason.OtherFocusReason)
 

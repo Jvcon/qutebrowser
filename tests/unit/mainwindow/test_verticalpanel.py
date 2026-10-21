@@ -4,6 +4,8 @@
 
 """Tests for the vertical workspace panel (Phase 2)."""
 
+from types import SimpleNamespace
+
 import pytest
 
 from qutebrowser.qt.core import Qt
@@ -181,3 +183,31 @@ class TestVerticalPanel:
     def test_is_panel_descendant_none(self, panel):
         """Test that _is_panel_descendant handles None gracefully."""
         assert panel._is_panel_descendant(None) is False
+
+    def test_filter_row_toggles_parser_passthrough(
+            self, panel, monkeypatch):
+        """Opening the filter row puts the panel parser in passthrough.
+
+        This is what lets the QLineEdit receive its text and the Escape
+        key while leaving ``KeyMode.workspace_panel`` active.
+        """
+        calls = []
+
+        class FakeParser:
+
+            def set_filter_active(self, active):
+                calls.append(active)
+
+        mode_manager = SimpleNamespace(
+            parsers={usertypes.KeyMode.workspace_panel: FakeParser()})
+        monkeypatch.setattr(
+            verticalpanel.modeman, 'instance',
+            lambda win_id: mode_manager)
+
+        panel.open_filter()
+        assert calls == [True]
+        assert panel.filter_row.isVisible()
+
+        panel.filter_row.close_filter()
+        assert calls == [True, False]
+        assert panel.filter_row.isHidden()

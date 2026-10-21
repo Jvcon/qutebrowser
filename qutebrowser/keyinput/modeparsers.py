@@ -159,6 +159,28 @@ class WorkspacePanelKeyParser(NormalKeyParser):
         super().__init__(win_id=win_id,
                          mode=usertypes.KeyMode.workspace_panel,
                          commandrunner=commandrunner, parent=parent)
+        self._filter_active = False
+
+    def set_filter_active(self, active: bool) -> None:
+        """Pass all keys through while the transient filter row is open.
+
+        The filter row is a plain ``QLineEdit``. In the panel's normal
+        (non-passthrough) mode its bindings would otherwise swallow every
+        character the user types, including ``<Escape>``. While the row is
+        open, unbound keys must reach it so it can receive text and close
+        itself on ``Esc`` without leaving ``workspace_panel``.
+        """
+        self._filter_active = active
+        self.passthrough = active
+        if active:
+            self.clear_keystring()
+
+    def handle(self, e: QKeyEvent, *,
+               dry_run: bool = False) -> QKeySequence.SequenceMatch:
+        """Ignore bindings while the filter row owns the keyboard."""
+        if self._filter_active:
+            return QKeySequence.SequenceMatch.NoMatch
+        return super().handle(e, dry_run=dry_run)
 
 
 class HintKeyParser(basekeyparser.BaseKeyParser):
