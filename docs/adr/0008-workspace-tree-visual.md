@@ -78,8 +78,9 @@ For a first version we keep the native skeleton and skin it.
 ### 1. PIN panel
 
 Config-driven widget. Controlled by `pinned_tabs.style = icon | line`.
-Default is `icon`. Style switching is **config-only**; there is no UI control or
-right-click submenu for toggling it.
+Default is `icon`. The value persists in config; there is no GUI control or
+right-click submenu for toggling it. `:pintab-style-toggle` flips the setting
+at runtime (see § Decisions).
 
 **Icon mode** (`icon`):
 
@@ -547,25 +548,41 @@ builds side-by-side during the migration window.
 
 ## Commands (new, in `bindings.default:`)
 
+The registered names are authoritative. qutebrowser's existing reload command
+is `reload`; the ADR's earlier tab-prefixed spelling was wrong. `tab-move`,
+`tab-close`, `tab-only`, `tab-clone`, and `reload` are existing qutebrowser
+commands, not new workspace commands. Binding facts (which mode binds which
+command) live in `qutebrowser/config/configdata.yml`; see § "Binding
+classification".
+
 | Command | Behavior |
 |---|---|
-| `group-create <name>` | New group in the active workspace. |
-| `group-rename <old> <new>` | Rename a group. |
-| `group-delete <name>` | Delete group; tabs become standalone. Confirm if non-empty. |
+| `workspace-create <name>` | Create a workspace. Refuses a duplicate name (case-insensitive); it becomes active only when no workspace exists yet. |
+| `workspace-list` | List all workspaces; `*` marks the active one and archived workspaces carry `(archived)`. |
+| `workspace-rename <old> <new>` | Rename a workspace; refuses a name already used by another workspace (case-insensitive). |
+| `workspace-delete <name>` | Delete a workspace after confirmation; deleting the active workspace is refused. |
+| `workspace-archive <name>` / `workspace-unarchive <name>` | Archive / unarchive a workspace (hidden from the WorkspaceIndicator, kept on disk). |
+| `workspace-switch <name>` | Switch the active workspace. |
+| `workspace-next` / `workspace-prev` | Cycle to the next / previous non-archived workspace, wrapping around. |
+| `vp-workspace-export [<path>]` / `vp-workspace-import [<path>]` | Export all workspaces to a versioned JSON document / import one add-only. (VP-A3, ADR 0009) |
+| `vp-group-new <name>` | New Group in the active workspace. Group names are unique across all workspaces (case-insensitive). (VP-F2) |
+| `vp-group-rename <target> <new-name>` | Rename a group. |
+| `vp-group-pin <target>` / `vp-group-unpin <target>` | Pin / unpin a group so it sorts first. |
+| `vp-group-archive <target>` / `vp-group-restore <target>` | Archive / restore a group (hidden from the normal list, kept on disk). |
+| `vp-group-delete <target>` | Delete group; tabs become standalone. Empty groups delete immediately; non-empty groups confirm first. (VP-F2) |
+| `vp-group-close <target>` | Close every OPEN tab in the group; entries auto-flip to `SUSPENDED`. Group preserved. (VP-D3) |
+| `vp-group-reopen <target>` | Reopen every SUSPENDED tab; reuse live tabs by URL, else open a new tab in the current window. (VP-D4) |
 | `group-list` | List groups in the active workspace. |
-| `group-pin <target>` / `group-unpin <target>` | Pin / unpin a group so it sorts first. |
-| `group-archive <target>` / `group-restore <target>` | Archive / restore a group (hidden from the normal list, kept on disk). |
 | `tab-move-to-group <tab_id> <group_name>` | Move tab into a group; use `root` for standalone. Overrides auto-group rules. |
 | `tab-move <from> <to> [<group_name>]` | Existing move command; can update both `parent_id` and `group_id` in one move. |
 | `tab-collect [<group>]` | Collect the current tab into a group; when *group* is omitted, lands in the Inbox default. (VP-F1, VP-F5) |
 | `vp-collect-all [<group>]` | Collect every collectable tab in the current window into a group; Inbox default. (VP-F1, VP-F5) |
-| `vp-group-new <name>` | New Group in the active workspace. (VP-F2) |
-| `vp-group-rename` / `pin` / `unpin` / `archive` / `restore` / `delete` | Manage a Group. (VP-F2) |
-| `vp-group-close <target>` | Close every OPEN tab in the group; entries auto-flip to `SUSPENDED`. Group preserved. (VP-D3) |
-| `vp-group-reopen <target>` | Reopen every SUSPENDED tab; reuse live tabs by URL, else `tabopen` in the current window. (VP-D4) |
 | `vp-status-set <target> <status>` | Set the reading status (`FRESH`/`ACTIVE`/`DONE`) of a tab. (VP-F3) |
 | `vp-status-cycle <target>` | Cycle FRESH → ACTIVE → DONE → FRESH. (VP-F3) |
 | `vp-cleanup-done [days]` | Remove DONE+SUSPENDED tabs older than *days* (30–180, default from `content.vertical_panel.auto_cleanup_days`). Silent on N=0. (VP-F3) |
+| `vp-suspend-stale [days]` | Flip OPEN tabs marked DONE and untouched for *days* to `SUSPENDED`; the live browser tab is left alone. Default from `content.vertical_panel.auto_suspend_done_days`. |
+| `vp-suggestion-stale` | Print the current smart-suggestion list, omitting groups inside the ignore cooldown. |
+| `vp-suggestion-ignore` | Mark all currently-suggested groups as ignored for 7 days. |
 | `vp-select-mode` | Toggle multi-select mode in the TabTree. (VP-F4) |
 | `vp-select-toggle <tab_id>` | Toggle a single tab's selection. (VP-F4) |
 | `vp-select-all` / `vp-select-none` | Bulk select. (VP-F4) |
@@ -575,6 +592,12 @@ builds side-by-side during the migration window.
 | `vp-batch-open-window` | Open the selected tabs in a single new window; reuse live tabs by URL. (VP-F4) |
 | `vp-batch-open-tabs` | Open the selected tabs as new tabs in the current window. (VP-F4) |
 | `auto-group-reapply` | Re-run `auto_group_rules` on every tab in the active workspace. |
+| `pintab-add <target>` / `pintab-remove <target>` | Pin a tab entry / unpin it without closing the live tab. The PIN panel and TabTree are disjoint. |
+| `pintab-move <from> <to>` | Reorder a pinned entry within the PIN panel. |
+| `pintab-style-toggle` | Flip `pinned_tabs.style` between `icon` and `line` at runtime; see § Decisions. |
+| `panel-filter` | Open the transient Search & Filter row at the top of the TabTree. |
+| `vertical-panel-toggle` | Toggle VerticalPanel visibility; no tab/group target. |
+| `reload` | Existing qutebrowser reload command; not a new workspace command. |
 
 ## Per-decision specifics
 
@@ -801,9 +824,23 @@ they register in `bindings.default:`.
 
 | Class | Registered in | Example commands | Target semantics |
 |---|---|---|---|
-| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tab-close`, `tab-only`, `tab-clone`, `tab-reload`, `tab-collect`, `vp-status-set`, `vp-status-cycle`, `vp-select-toggle` | In both modes the target is the webview's active tab. Outside selection mode the TabTree's current row is kept identical to it: clicking a row and J/K both switch the webview (J/K keeps focus in the tree), so the two cannot diverge. Selection mode is the exception — see § "Current row vs selected set" below. |
-| **Panel-state operations** | `bindings.default.workspace_panel:` only | `workspace-add`, `workspace-rename`, `workspace-delete`, `workspace-archive`, `workspace-unarchive`, `workspace-next`, `workspace-prev`, `workspace-switch`, `pintab-style-toggle`, `group-create`, `group-rename`, `group-delete`, `group-list`, `vp-group-new`, `vp-group-rename`, `vp-group-pin`, `vp-group-unpin`, `vp-group-archive`, `vp-group-restore`, `vp-group-delete`, `vp-group-close`, `vp-group-reopen`, `vp-collect-all`, `vp-cleanup-done`, `vp-select-mode`, `vp-select-all`, `vp-select-none`, `vp-batch-move`, `vp-batch-status`, `vp-batch-delete`, `vp-batch-open-window`, `vp-batch-open-tabs`, `auto-group-reapply` | Operate on the active workspace / selected group / pinned-tab list. Have no meaning from `normal:` because they have no active-tab target. |
+| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tab-close`, `tab-only`, `tab-clone`, `reload`, `tab-collect`, `vp-status-set`, `vp-status-cycle`, `vp-select-toggle` | In both modes the target is the webview's active tab. Outside selection mode the TabTree's current row is kept identical to it: clicking a row and J/K both switch the webview (J/K keeps focus in the tree), so the two cannot diverge. Selection mode is the exception — see § "Current row vs selected set" below. |
+| **Panel-state operations** | `bindings.default.workspace_panel:` only | `workspace-create`, `workspace-list`, `workspace-rename`, `workspace-delete`, `workspace-archive`, `workspace-unarchive`, `workspace-switch`, `workspace-next`, `workspace-prev`, `vp-workspace-export`, `vp-workspace-import`, `pintab-style-toggle`, `vp-group-new`, `vp-group-rename`, `vp-group-pin`, `vp-group-unpin`, `vp-group-archive`, `vp-group-restore`, `vp-group-delete`, `vp-group-close`, `vp-group-reopen`, `group-list`, `vp-collect-all`, `vp-cleanup-done`, `vp-suspend-stale`, `vp-suggestion-stale`, `vp-suggestion-ignore`, `vp-select-mode`, `vp-select-all`, `vp-select-none`, `vp-batch-move`, `vp-batch-status`, `vp-batch-delete`, `vp-batch-open-window`, `vp-batch-open-tabs`, `auto-group-reapply`, `panel-filter` | Operate on the active workspace / selected group / pinned-tab list. Have no meaning from `normal:` because they have no active-tab target. |
 | **Global operations** | `bindings.default.normal:` only | `vertical-panel-toggle` | Toggle panel visibility; no tab/group target. |
+
+**Previously unclassified commands.** `workspace-list`, `vp-suspend-stale`,
+`vp-suggestion-stale`, and `vp-suggestion-ignore` are **panel-state
+operations**. Each reads or mutates the active workspace (or its groups /
+suggestions) and has neither an active-tab target nor a global-panel target,
+so panel-state is the only fit. None of the four has a default binding today;
+they are reachable via `:` from either mode. If a default binding is added, it
+belongs in `bindings.default.workspace_panel:`.
+
+**Source of truth.** These class tables are hand-maintained. The authoritative
+record of which command is bound in which mode is `bindings.default.normal` and
+`bindings.default.workspace_panel` in
+`qutebrowser/config/configdata.yml`; re-check both tables whenever a command or
+default binding changes.
 
 **Registration rule for Phase 5**: every new command MUST be classified
 into exactly one of the three classes above in `configdata.yml`, and
@@ -890,17 +927,29 @@ it.
    Default to letting Qt auto-scale via `AA_UseHighDpiPixmaps`; only manual
    `setDevicePixelRatio` if visual tests show artifacts.
 
-7. **Bindings** go into `bindings.default: → normal:` section in
-   `configdata.yml` (~line 3676-4009). Names follow `workspace-*` /
-   `pintab-*` / `group-*` / `tab-*` convention. New bindings are expected for:
+7. **Bindings** live in two buckets in `configdata.yml`:
+   `bindings.default.normal:` and `bindings.default.workspace_panel:` (the
+   latter introduced with `KeyMode.workspace_panel`). Names follow
+   `workspace-*` / `pintab-*` / `vp-group-*` / `tab-*` convention; the `vp-`
+   prefix is required for group/selection/batch/suggestion commands which
+   would otherwise collide with qutebrowser's existing namespaces. The command
+   set is expected to cover:
 
-   - `workspace-add`, `workspace-rename`, `workspace-delete`, `workspace-archive`,
-     `workspace-unarchive`, `workspace-next`, `workspace-prev`, `workspace-switch
-     <name>`.
+   - `workspace-create`, `workspace-list`, `workspace-rename`,
+     `workspace-delete`, `workspace-archive`, `workspace-unarchive`,
+     `workspace-switch <name>`, `workspace-next`, `workspace-prev`.
+   - `vp-workspace-export`, `vp-workspace-import`.
    - `pintab-add`, `pintab-remove`, `pintab-move`, `pintab-style-toggle`.
-   - `group-create`, `group-rename`, `group-delete`, `group-list`.
-   - `tab-move-to-group`, `tab-move <from> <to> [<group_name>]`.
-   - Panel visibility: `vertical-panel-toggle`.
+   - `vp-group-new`, `vp-group-rename`, `vp-group-pin`, `vp-group-unpin`,
+     `vp-group-archive`, `vp-group-restore`, `vp-group-delete`,
+     `vp-group-close`, `vp-group-reopen`, `group-list`.
+   - `tab-move-to-group`, `tab-move <from> <to> [<group_name>]`,
+     `tab-collect`, `vp-collect-all`.
+   - Status / cleanup / suggestions: `vp-status-set`, `vp-status-cycle`,
+     `vp-cleanup-done`, `vp-suspend-stale`, `vp-suggestion-stale`,
+     `vp-suggestion-ignore`.
+   - Panel visibility and filter: `vertical-panel-toggle`, `panel-filter`.
+   - `reload` is qutebrowser's existing reload command, not a new binding.
 
 8. **VerticalPanel focus & key binding model** — the VerticalPanel and
    the browser area are two `QSplitter`-pinned panels; physical focus is
@@ -953,7 +1002,16 @@ All spike decisions are closed. None remain open before v0.1 implementation.
   inside a group, otherwise top-level standalone.
 - **Pin panel collapse on empty** — collapse to 0 px.
 - **WorkspaceIndicator active style** — accent border + sunken.
-- **Pin style toggle UX** — config-only via `pinned_tabs.style`.
+- **Pin style toggle UX** — **`:pintab-style-toggle` stays**, bound to `gS` in
+  `bindings.default.workspace_panel:`. It writes `pinned_tabs.style` (the
+  single persisted source of truth) between `icon` and `line`; there is no GUI
+  widget or right-click submenu. The earlier "config-only" wording was wrong:
+  style is config-backed, not config-only. `configdata.yml`'s description
+  still says "Style switching is config-only; there is no UI toggle" and should
+  be reworded to "no GUI control; `:pintab-style-toggle` switches at runtime"
+  in a follow-up (that file is outside this ADR change). Removing the command
+  or its binding would be a behaviour change, so it is not done here; the
+  wording follow-up is flagged for a human decision.
 - **Empty-group deletion** — empty groups (`+0`) are deleted **without
   confirmation**; non-empty groups require a confirm prompt and null the
   members' `group_id`.

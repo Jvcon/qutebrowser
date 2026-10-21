@@ -2768,8 +2768,9 @@ pinned_tabs.style:
     Display style for the vertical panel's pinned-tab list (Phase 2).
     `icon` renders 24×24 favicons in a 2×3 grid (ADR 0008 § "1. PIN
     panel" — Icon mode). `line` renders a vertical list with a 16×16
-    favicon and the elided title per row (Line mode). Style switching
-    is config-only; there is no UI toggle.
+    favicon and the elided title per row (Line mode). The value is
+    persisted in the config file; switch it at runtime with
+    `:pintab-style-toggle`. There is no GUI control in the panel.
 
 verticalpanel.width:
   default: 220
