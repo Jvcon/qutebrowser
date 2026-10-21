@@ -16,7 +16,7 @@ from qutebrowser.api import cmdutils
 from qutebrowser.mainwindow import tabtree
 from qutebrowser.mainwindow.pinpanel import PINNED_TAB_MIME
 from qutebrowser.qt.core import QMimeData, QModelIndex, Qt, QUrl
-from qutebrowser.workspaces import commands
+from qutebrowser.workspaces import commands, portability
 from qutebrowser.workspaces.manager import BYTES_PER_TAB, WorkspaceManager
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
@@ -1909,3 +1909,25 @@ class TestCollectAllInbox:
         commands.vp_collect_all()
 
         assert messages == ['No collectable tabs in this window.']
+
+
+class TestWorkspaceExport:
+
+    """VP-A3 export half: ``:vp-workspace-export``."""
+
+    def test_vp_workspace_export_default_path(
+            self,
+            tmp_path: pathlib.Path,
+            fake_manager: FakeManager,
+            messages: list[str],
+            monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake_manager.add_workspace('research')
+        monkeypatch.setattr(commands.standarddir, 'data', lambda: str(tmp_path))
+        monkeypatch.setattr(portability, '_manager', lambda: fake_manager)
+
+        commands.vp_workspace_export()
+
+        expected = (tmp_path / 'workspaces-export.json').resolve()
+        assert expected.exists()
+        assert messages == [f"Exported workspaces to {expected}"]

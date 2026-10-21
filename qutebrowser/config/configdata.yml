@@ -4175,6 +4175,7 @@ bindings.default:
       gwa: cmd-set-text -s :workspace-archive
       gwu: cmd-set-text -s :workspace-unarchive
       gws: cmd-set-text -s :workspace-switch
+      gwe: cmd-set-text -s :vp-workspace-export
       ggl: group-list
       ggn: cmd-set-text -s :vp-group-new
       ggr: cmd-set-text -s :vp-group-rename

@@ -186,3 +186,32 @@ into a warning without preventing the loss.
 - ADR 0008 — vertical panel architecture
 - Issue #25 — VP-A1 window affinity, whose `window_affinity` is excluded here
   as machine-local
+
+## Implementation status
+
+- Export (`:vp-workspace-export <path>`): implemented, see #27.
+- Import (`:vp-workspace-import <path>`): not yet implemented; same issue
+  tracks the next PR.
+
+### Implementation notes
+
+Carry / exclude decisions made during implementation of the export half
+that are **not** in the table above:
+
+- **`WorkspaceTab.favicon`** is carried (base64 ASCII string already in
+  the model, so the cost is a few KB per document) so an imported
+  document does not have to re-fetch site icons just to render the
+  panel. Symmetric with how `PinnedTab.favicon` is already carried.
+- **`pinned`** lives at the **document root**, not under each workspace.
+  `WorkspaceManager.list_pinned()` is profile-scoped, and a per-workspace
+  copy would duplicate the list N times and force the importer to URL-
+  dedup just to undo that duplication.
+- **Standalone tabs** (`group_id is None`) are emitted in a workspace-
+  level `entries` list. The original issue table only describes the
+  per-group `entries` key, but dropping them would silently lose data.
+
+### Known limitations (tracked for follow-ups)
+
+- `Workspace.created_at` is always `null` in the export today, because
+  the model has no such field. Tracked in #40; will be lifted to the
+  model and through the import path together.

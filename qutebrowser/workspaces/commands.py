@@ -13,19 +13,22 @@ effects — the ``@cmdutils.register`` decorators run at import time — from
 """
 
 import base64
+import pathlib
 import uuid
 from collections.abc import Callable
 from typing import Any, Optional
 
 from qutebrowser.api import cmdutils
 from qutebrowser.config import config
-from qutebrowser.utils import message, objreg
+from qutebrowser.utils import message, objreg, standarddir
 from qutebrowser.utils.utils import format_size
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import (READING_STATUSES, TabMetadata,
                                             WorkspaceManager)
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
+from qutebrowser.workspaces.portability import (DEFAULT_EXPORT_FILENAME,
+                                                export_to_path)
 
 #: Name of the default group collect commands land in when none is given.
 INBOX_GROUP_NAME = 'Inbox'
@@ -1343,3 +1346,28 @@ def workspace_unarchive(name: str) -> None:
         return
     manager.unarchive_workspace(workspace.id)
     message.info(f"Unarchived workspace '{name}'.")
+
+
+@cmdutils.register(name='vp-workspace-export')
+@cmdutils.argument('path', metavar='path')
+def vp_workspace_export(path: str = '') -> None:
+    """Export every workspace to a versioned JSON document.
+
+    This file contains your browsing history (URLs and titles). Treat it as
+    private. Its contents are not logged by default; only the resolved
+    destination path is reported.
+
+    Args:
+        path: Destination file, or a directory to write
+            ``workspaces-export.json`` into. When omitted, the document is
+            written to the qutebrowser data directory.
+    """
+    if not path:
+        target = pathlib.Path(standarddir.data()) / DEFAULT_EXPORT_FILENAME
+    else:
+        target = pathlib.Path(path).expanduser()
+        if target.is_dir():
+            target = target / DEFAULT_EXPORT_FILENAME
+
+    resolved = export_to_path(target)
+    message.info(f"Exported workspaces to {resolved}")
