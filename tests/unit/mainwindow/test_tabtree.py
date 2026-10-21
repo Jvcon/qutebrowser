@@ -577,13 +577,16 @@ class TestAutoLocate:
         model.set_highlighted_tab_id(20)
         latest = model._highlight_timer
 
-        assert first is not None and second is not None
+        assert first is not None
+        assert second is not None
         assert latest is not None
         assert first is not second
         assert second is not latest
         # The superseded timers were cancelled and scheduled for deletion.
-        assert first.active is False and first.deleted is True
-        assert second.active is False and second.deleted is True
+        assert first.active is False
+        assert first.deleted is True
+        assert second.active is False
+        assert second.deleted is True
         assert latest.active is True
         assert model._highlighted_tab_id == 20
 
@@ -594,6 +597,29 @@ class TestAutoLocate:
         # Advancing the live timer clears the latest A once.
         latest.timeout.emit()
         assert model._highlighted_tab_id is None
+
+    def test_highlight_callbacks_capture_each_tab_id(
+            self, model, monkeypatch):
+        """Each timer callback carries its own tab id, not a shared cell."""
+        monkeypatch.setattr(tabtree, 'QTimer', _FakeQTimer)
+        cleared = []
+        monkeypatch.setattr(model, '_clear_highlight', cleared.append)
+
+        model.set_highlighted_tab_id(20)
+        first = model._highlight_timer
+        model.set_highlighted_tab_id(21)
+        second = model._highlight_timer
+
+        assert first is not None
+        assert second is not None
+        # Starting the second highlight cancelled the first timer; force
+        # both live so we can observe the captured ids directly.
+        first.active = True
+        second.active = True
+        first.timeout.emit()
+        second.timeout.emit()
+
+        assert cleared == [20, 21]
 
     def test_focus_group_and_tab_expands_and_returns_index(self, model, group_id):
         """focus_group_and_tab expands the group and returns the tab index."""
@@ -1168,6 +1194,38 @@ class TestTabTree:
 
         tree._delegate.selection_toggled.emit(idx)
         assert tree.model().selected_tab_ids() == set()
+
+    def test_selection_toggle_moves_current_row(self, qtbot):
+        """Ctrl-click moves the current row without changing what is selected."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        tree.set_selection_mode(True)
+
+        # Start on a row the user did not click.
+        tree.view().setCurrentIndex(tree._model.index(1, 0))
+        target = tree._model.index(3, 0)  # standalone tab id 21
+
+        tree._delegate.selection_toggled.emit(target)
+
+        assert tree.view().currentIndex() == target
+        assert tree.model().selected_tab_ids() == {21}
+
+    def test_selection_toggle_anchor_supports_shift_range(self, qtbot):
+        """A Ctrl-click anchor still drives a following Shift-click range."""
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        tree.set_selection_mode(True)
+
+        anchor = tree._model.index(2, 0)  # standalone tab id 20
+        target = tree._model.index(3, 0)  # standalone tab id 21
+
+        tree._delegate.selection_toggled.emit(anchor)
+        tree._delegate.selection_range_requested.emit(target)
+
+        assert tree.view().currentIndex() == target
+        assert tree.model().selected_tab_ids() == {20, 21}
 
     def test_focus_group_and_tab_scrolls_and_highlights(self, qtbot):
         """The host scrolls to group + tab and highlights once."""

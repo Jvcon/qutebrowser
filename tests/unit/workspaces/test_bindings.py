@@ -8,8 +8,10 @@ import shlex
 
 import pytest
 
-# To run cmdutils.register decorators
+# To run cmdutils.register decorators (including component commands like
+# :reload, which are not loaded by importing qutebrowser.app alone).
 from qutebrowser import app  # pylint: disable=unused-import
+from qutebrowser.components import misccommands  # noqa: F401
 from qutebrowser.config import configdata
 from qutebrowser.misc import objects
 
@@ -18,21 +20,56 @@ def _panel_bindings(config_stub):
     return configdata.DATA['bindings.default'].default['workspace_panel']
 
 
+def _mode_command_names(config_stub, mode: str) -> set[str]:
+    bindings = configdata.DATA['bindings.default'].default[mode]
+    names = {_bound_command_name(command) for command in bindings.values()}
+    return {name for name in names if name}
+
+
 def _bound_command_name(command: str) -> str:
     """Get the command a binding ultimately invokes.
 
     A ``cmd-set-text`` binding pre-fills the command line with the real
-    command after the leading colon.
+    command after the leading colon. Bindings which merely open the command
+    line (``cmd-set-text :``) have no command name and return an empty
+    string.
     """
     parts = shlex.split(command)
     if parts[0] == 'cmd-set-text':
         for part in parts[1:]:
             if part.startswith(':'):
-                return shlex.split(part[1:])[0]
+                cmd = shlex.split(part[1:])
+                return cmd[0] if cmd else ''
     return parts[0]
 
 
+# qutebrowser spells the ADR's ``tab-reload`` command ``reload``.
+ACTIVE_TAB_COMMANDS = [
+    'tab-close',
+    'tab-only',
+    'tab-clone',
+    'tab-move',
+    'reload',
+    'tab-move-to-group',
+    'tab-collect',
+    'vp-status-set',
+    'vp-status-cycle',
+    'vp-select-toggle',
+]
+
+
 @pytest.mark.parametrize('key, expected', [
+    ('d', 'tab-close'),
+    ('<Ctrl-W>', 'tab-close'),
+    ('co', 'tab-only'),
+    ('gc', 'cmd-set-text -s :tab-collect'),
+    ('gG', 'cmd-set-text -s :tab-move-to-group'),
+    ('gC', 'tab-clone'),
+    ('gm', 'tab-move'),
+    ('gs', 'cmd-set-text -s :vp-status-set'),
+    ('gv', 'cmd-set-text -s :vp-status-cycle'),
+    ('gz', 'cmd-set-text -s :vp-select-toggle'),
+    ('r', 'reload'),
     ('gS', 'pintab-style-toggle'),
     ('gwc', 'cmd-set-text -s :workspace-create'),
     ('gwr', 'cmd-set-text -s :workspace-rename'),
@@ -60,6 +97,13 @@ def test_panel_binding_resolves(config_stub, key, expected):
     bindings = _panel_bindings(config_stub)
     assert bindings[key] == expected
     assert _bound_command_name(bindings[key]) in objects.commands
+
+
+@pytest.mark.parametrize('command', ACTIVE_TAB_COMMANDS)
+def test_active_tab_command_is_dual_registered(config_stub, command):
+    """Each active-tab command is bound in both normal and workspace_panel."""
+    assert command in _mode_command_names(config_stub, 'normal')
+    assert command in _mode_command_names(config_stub, 'workspace_panel')
 
 
 def test_panel_filter_binding(config_stub):

@@ -3863,6 +3863,11 @@ bindings.default:
       K: tab-prev
       <Ctrl-PgUp>: tab-prev
       gC: tab-clone
+      gc: cmd-set-text -s :tab-collect
+      gG: cmd-set-text -s :tab-move-to-group
+      gs: cmd-set-text -s :vp-status-set
+      gv: cmd-set-text -s :vp-status-cycle
+      gz: cmd-set-text -s :vp-select-toggle
       r: reload
       <F5>: reload
       R: reload -f
@@ -4149,6 +4154,17 @@ bindings.default:
       <Escape>: mode-leave
     workspace_panel:
       <Escape>: mode-leave
+      d: tab-close
+      <Ctrl-W>: tab-close
+      co: tab-only
+      gc: cmd-set-text -s :tab-collect
+      gG: cmd-set-text -s :tab-move-to-group
+      gC: tab-clone
+      gm: tab-move
+      gs: cmd-set-text -s :vp-status-set
+      gv: cmd-set-text -s :vp-status-cycle
+      gz: cmd-set-text -s :vp-select-toggle
+      r: reload
       gp: cmd-set-text -s :pintab-add
       gP: cmd-set-text -s :pintab-remove
       gM: cmd-set-text -s :pintab-move

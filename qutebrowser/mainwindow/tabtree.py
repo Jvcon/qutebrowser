@@ -483,7 +483,8 @@ class TabTreeModel(QAbstractItemModel):
         if timeout_ms > 0 and tab_id is not None:
             timer = QTimer(self)
             timer.setSingleShot(True)
-            timer.timeout.connect(lambda: self._clear_highlight(tab_id))
+            timer.timeout.connect(
+                lambda tid=tab_id: self._clear_highlight(tid))
             timer.start(timeout_ms)
             self._highlight_timer = timer
 
@@ -2141,6 +2142,9 @@ class TabTree(QWidget):
             return
         selected = tab_id in self._model.selected_tab_ids()
         self._model.set_selected(tab_id, not selected)
+        # Keep the current row on the row the user just acted on, matching
+        # plain clicks and J/K range extension.
+        self._view.setCurrentIndex(index)
         # Remember the last plain toggle as the anchor for a later
         # Shift-click range extension.
         self._selection_anchor = index
