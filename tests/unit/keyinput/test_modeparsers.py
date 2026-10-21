@@ -211,3 +211,34 @@ class TestWorkspacePanelKeyParser:
         for info in chain:
             keyparser.handle(info.to_event())
         assert commandrunner.commands == [('message-info panel-down', None)]
+
+    def test_filter_active_passes_escape_through(self, keyparser,
+                                                 commandrunner):
+        """While the filter row is open, Escape is not handled as a binding."""
+        keyparser.set_filter_active(True)
+        assert keyparser.passthrough is True
+        info = keyutils.KeyInfo(
+            Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+        match = keyparser.handle(info.to_event())
+        assert match == QKeySequence.SequenceMatch.NoMatch
+        assert not commandrunner.commands
+
+    def test_filter_inactive_handles_escape(self, config_stub, keyparser,
+                                            commandrunner):
+        """After the filter closes, Escape is dispatched normally again."""
+        config_stub.val.bindings.commands = {
+            'workspace_panel': {'<Escape>': 'message-info leave'},
+        }
+        keyparser._read_config()
+        info = keyutils.KeyInfo(
+            Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+
+        keyparser.set_filter_active(True)
+        assert keyparser.handle(info.to_event()) == (
+            QKeySequence.SequenceMatch.NoMatch)
+        assert not commandrunner.commands
+
+        keyparser.set_filter_active(False)
+        assert keyparser.handle(info.to_event()) == (
+            QKeySequence.SequenceMatch.ExactMatch)
+        assert commandrunner.commands == [('message-info leave', None)]

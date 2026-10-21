@@ -5,6 +5,7 @@
 """Tests for qutebrowser.mainwindow.workspacebridge."""
 
 import datetime
+import logging
 from unittest import mock
 
 import pytest
@@ -560,6 +561,91 @@ class TestWorkspaceBridge:
 
         assert workspace_tab.title == 'Original'
 
+    def test_removed_workspace_entry_is_not_recreated(
+            self, browser, manager, bridge):
+        """A tab moved to the PIN panel must not re-enter the workspace.
+
+        ``pintab_add`` removes the workspace entry; the bridge's
+        already-registered fast path must stop later URL/status signals (and
+        a re-sync pass) from calling ``_ensure_entry`` again.
+        """
+        tab = _open_tab(browser, MockTab(1))
+        workspace = manager.get_active()
+        assert workspace is not None
+        manager.remove_tab(workspace.id, 1)
+
+        tab.title_changed.emit('Still pinned')
+        tab.url_changed.emit(QUrl('https://example.com/'))
+        tab.load_started.emit()
+        bridge._sync_existing_tabs()
+
+        assert manager.find_tab_by_id(workspace.id, 1) is None
+        assert workspace.tabs == []
+
+
+class TestAutoGroupRulesBridge:
+
+    """ADR 0008 § 5: the bridge evaluates rules on open and URL change."""
+
+    RULES = [
+        {'pattern': r'https://github\.com/.*', 'group': 'github',
+         'priority': 10},
+    ]
+
+    def test_new_tab_with_url_is_grouped_on_open(
+            self, browser, manager, bridge, config_stub):
+        config_stub.set_obj('auto_group_rules', self.RULES)
+
+        _open_tab(browser, MockTab(1, url=QUrl('https://github.com/a')))
+
+        workspace = manager.get_active()
+        group = manager.list_groups(workspace.id)[0]
+        assert group.name == 'github'
+        assert workspace.tabs[0].group_id == group.group_id
+
+    def test_url_change_is_grouped(
+            self, browser, manager, bridge, config_stub):
+        config_stub.set_obj('auto_group_rules', self.RULES)
+        tab = _open_tab(browser, MockTab(1))
+
+        tab.url_changed.emit(QUrl('https://github.com/a'))
+
+        workspace = manager.get_active()
+        group = manager.list_groups(workspace.id)[0]
+        assert workspace.tabs[0].group_id == group.group_id
+
+    def test_manual_move_survives_until_url_changes(
+            self, browser, manager, bridge, config_stub):
+        config_stub.set_obj('auto_group_rules', self.RULES)
+        tab = _open_tab(browser, MockTab(1, url=QUrl('https://github.com/a')))
+        workspace = manager.get_active()
+        github = manager.list_groups(workspace.id)[0]
+        manual = manager.create_group(workspace.id, 'manual')
+        manager.move_tab_to_group(workspace.id, 1, manual.group_id)
+
+        # Same URL: the manual override survives.
+        tab.url_changed.emit(QUrl('https://github.com/a'))
+        assert workspace.tabs[0].group_id == manual.group_id
+
+        # New URL: the rule applies again.
+        tab.url_changed.emit(QUrl('https://github.com/b'))
+        assert workspace.tabs[0].group_id == github.group_id
+
+    def test_invalid_regex_does_not_break_open(
+            self, browser, manager, bridge, config_stub, caplog):
+        config_stub.set_obj('auto_group_rules', [
+            {'pattern': '(', 'group': 'broken'},
+        ])
+
+        with caplog.at_level(logging.WARNING, logger='workspaces'):
+            _open_tab(browser, MockTab(
+                1, url=QUrl('https://example.com/')))
+
+        workspace = manager.get_active()
+        assert [tab.tab_id for tab in workspace.tabs] == [1]
+        assert workspace.tabs[0].group_id is None
+        assert manager.list_groups(workspace.id) == []
+
 
 class TestAutoLocate:
 
@@ -995,6 +1081,8 @@ class TestBridgeSuspendedActivation:
         assert calls == [(entry, 0)]
         assert browser.widget.currentWidget() is live
         assert live._focused is True
+
+
 def _stale_group(manager, name='stale', days_ago=10):
     """Create an active workspace with one stale Group (VP-A2)."""
     workspace = manager.get_active() or manager.add_workspace('w')

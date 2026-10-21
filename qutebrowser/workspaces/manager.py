@@ -13,6 +13,7 @@ objects and pinned tabs, exposes CRUD operations over them, and emits
 
 import dataclasses
 import datetime
+import re
 import time
 import uuid
 from collections.abc import Iterable, Mapping
@@ -22,7 +23,7 @@ import yaml
 
 from qutebrowser.qt.core import QObject, QTimer, QUrl, pyqtSignal
 
-from qutebrowser.config import config
+from qutebrowser.config import config, configexc
 from qutebrowser.utils import log, objreg, qtutils
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
@@ -90,6 +91,64 @@ def _vertical_panel_setting(name: str, default: Any) -> Any:
     except AttributeError:
         return default
     return getattr(panel, name, default)
+
+
+def _auto_group_rules() -> list[Mapping[str, Any]]:
+    """Return the configured ``auto_group_rules`` entries.
+
+    Returns an empty list when the config is unavailable (headless tests,
+    startup before config init) so rule evaluation never breaks tab
+    registration.
+    """
+    try:
+        rules = config.instance.get('auto_group_rules')
+    except (AttributeError, configexc.NoOptionError):
+        # ``config.instance`` is None before config init (headless tests) or
+        # the option might be missing in a stubbed config module.
+        return []
+    return [rule for rule in (rules or []) if isinstance(rule, Mapping)]
+
+
+def _matching_auto_group_rule(url: str) -> Optional[str]:
+    """Return the first matching rule's group name for *url*, if any.
+
+    Rules are ordered by ``priority`` descending; equal priorities keep
+    their declaration order.  Invalid regexes are logged and skipped so a
+    bad rule can never break the tab-open flow (ADR 0008 § 5).
+    """
+    if not url:
+        return None
+
+    ordered: list[tuple[int, int, str, str]] = []
+    for index, rule in enumerate(_auto_group_rules()):
+        pattern = rule.get('pattern')
+        group = rule.get('group')
+        priority = rule.get('priority', 0)
+        if not isinstance(pattern, str) or not pattern:
+            log.workspaces.warning(
+                "auto_group_rules: skipping rule without a pattern: %r",
+                rule)
+            continue
+        if not isinstance(group, str) or not group:
+            log.workspaces.warning(
+                "auto_group_rules: skipping rule without a group: %r", rule)
+            continue
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            log.workspaces.warning(
+                "auto_group_rules: skipping rule with invalid priority: %r",
+                rule)
+            continue
+        ordered.append((priority, index, pattern, group))
+
+    ordered.sort(key=lambda item: (-item[0], item[1]))
+    for _priority, _index, pattern, group in ordered:
+        try:
+            if re.search(pattern, url):
+                return group
+        except re.error as e:
+            log.workspaces.warning(
+                "auto_group_rules: skipping invalid regex %r: %s", pattern, e)
+    return None
 
 
 def _latest_group_activity(
@@ -182,6 +241,10 @@ class WorkspaceManager(QObject):
         self._active_id: Optional[uuid.UUID] = None
         self._pinned: list[PinnedTab] = []
         self._auto_suspend_timer: Optional[QTimer] = None
+        # Tabs whose group was placed manually via :tab-move-to-group.  A
+        # marker is dropped when the tab's URL changes, at which point the
+        # auto-group rules may apply again (ADR 0008 § 5 "Override").
+        self._auto_group_overrides: set[tuple[uuid.UUID, int]] = set()
 
     # --- load/save ---
 
@@ -376,6 +439,114 @@ class WorkspaceManager(QObject):
     def list_groups(self, workspace_id: uuid.UUID) -> list[Group]:
         """Return all groups in a workspace."""
         return list(self._workspaces[workspace_id].groups)
+
+    # --- auto-group rules (ADR 0008 § 5) ---
+
+    @staticmethod
+    def _rule_group(workspace: Workspace, name: str) -> Group:
+        """Return the existing group *name* or create an unfolded one.
+
+        Lookup is case-insensitive so a rule naming ``github`` reuses a
+        manually created ``GitHub`` instead of creating a duplicate.
+        """
+        for group in workspace.groups:
+            if group.name.lower() == name.lower():
+                return group
+        group = Group(group_id=uuid.uuid4(), name=name, folded=False)
+        workspace.groups.append(group)
+        log.workspaces.debug(
+            "auto_group_rules: created group %r in workspace %s",
+            name, workspace.id)
+        return group
+
+    def _apply_auto_group_rule(
+            self,
+            workspace: Workspace,
+            tab: WorkspaceTab,
+    ) -> bool:
+        """Apply the first matching rule to *tab*; return whether it moved.
+
+        Only ``group_id`` is touched, so an existing ``parent_id`` is
+        preserved.  A tab whose URL matches no rule is left exactly as it
+        was (the user's manual placement is never stripped).
+        """
+        group_name = _matching_auto_group_rule(tab.url)
+        if group_name is None:
+            return False
+        group = self._rule_group(workspace, group_name)
+        if tab.group_id == group.group_id:
+            return False
+        tab.assign_group(group.group_id)
+        return True
+
+    def apply_auto_group_rules(
+            self,
+            workspace_id: uuid.UUID,
+            tab_id: int,
+            *,
+            url_changed: bool = False,
+    ) -> bool:
+        """Evaluate ``auto_group_rules`` for a single tab.
+
+        Called by the bridge when a tab opens and whenever its URL changes.
+        When *url_changed* is True a manual placement made through
+        :meth:`move_tab_to_group` is forgotten, so the rules may apply again
+        (ADR 0008 § 5 "Override").
+
+        Returns:
+            True if the tab was assigned to a (possibly newly created)
+            group, False when nothing changed or a manual override is still
+            in effect.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return False
+        tab = next(
+            (entry for entry in workspace.tabs if entry.tab_id == tab_id),
+            None,
+        )
+        if tab is None:
+            return False
+
+        key = (workspace_id, tab_id)
+        if url_changed:
+            self._auto_group_overrides.discard(key)
+        if key in self._auto_group_overrides:
+            return False
+
+        if not self._apply_auto_group_rule(workspace, tab):
+            return False
+        self.changed.emit()
+        return True
+
+    def reapply_auto_group_rules(self, workspace_id: uuid.UUID) -> int:
+        """Re-run ``auto_group_rules`` over every tab in *workspace_id*.
+
+        This is the ``:auto-group-reapply`` backend, useful after editing
+        the rule list.  Tabs manually placed with
+        :meth:`move_tab_to_group` keep their override, and tabs which match
+        no rule keep their current placement.
+
+        Returns:
+            The number of tabs whose group membership changed.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            return 0
+
+        changed_count = 0
+        self.blockSignals(True)
+        try:
+            for tab in list(workspace.tabs):
+                if (workspace_id, tab.tab_id) in self._auto_group_overrides:
+                    continue
+                if self._apply_auto_group_rule(workspace, tab):
+                    changed_count += 1
+        finally:
+            self.blockSignals(False)
+        if changed_count:
+            self.changed.emit()
+        return changed_count
 
     # --- group running state (VP-D2) ---
 
@@ -588,31 +759,13 @@ class WorkspaceManager(QObject):
         workspace.groups.insert(new_index, group)
         self.changed.emit()
 
-    def purge_group(self, workspace_id: uuid.UUID,
-                    group_id: uuid.UUID) -> int:
-        """Permanently delete a group and every tab belonging to it.
-
-        Unlike :meth:`delete_group` (which makes members standalone), this
-        cascades: every :class:`~qutebrowser.workspaces.model.WorkspaceTab`
-        whose ``group_id`` matches is removed as well.
-
-        Returns:
-            The number of tabs that were removed.
-        """
-        workspace = self._workspaces[workspace_id]
-        removed_tabs = [tab for tab in workspace.tabs
-                        if tab.group_id == group_id]
-        workspace.tabs = [tab for tab in workspace.tabs
-                          if tab.group_id != group_id]
-        workspace.groups = [group for group in workspace.groups
-                            if group.group_id != group_id]
-        self.changed.emit()
-        return len(removed_tabs)
-
     # --- tab membership ---
 
     def add_tab(self, workspace_id: uuid.UUID, tab: WorkspaceTab) -> None:
         """Add a tab entry to a workspace."""
+        # A recycled runtime tab id must not inherit an old manual-override
+        # marker from the tab that previously used it.
+        self._auto_group_overrides.discard((workspace_id, tab.tab_id))
         self._workspaces[workspace_id].tabs.append(tab)
         self.changed.emit()
 
@@ -625,6 +778,7 @@ class WorkspaceManager(QObject):
         workspace = self._workspaces[workspace_id]
         workspace.tabs = [tab for tab in workspace.tabs
                           if tab.tab_id != tab_id]
+        self._auto_group_overrides.discard((workspace_id, tab_id))
         for tab in workspace.tabs:
             if tab.parent_id == tab_id:
                 tab.clear_parent()
@@ -632,7 +786,15 @@ class WorkspaceManager(QObject):
 
     def move_tab_to_group(self, workspace_id: uuid.UUID, tab_id: int,
                           group_id: Optional[uuid.UUID]) -> None:
-        """Move a tab into a group (or to standalone when group_id is None)."""
+        """Move a tab into a group (or to standalone when group_id is None).
+
+        A manual move overrides ``auto_group_rules`` for that tab until its
+        URL changes again (ADR 0008 § 5 "Override").
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if (workspace is not None
+                and any(tab.tab_id == tab_id for tab in workspace.tabs)):
+            self._auto_group_overrides.add((workspace_id, tab_id))
         self._mutate_group_or_tab(
             workspace_id, tab_id, lambda tab: tab.assign_group(group_id))
 
@@ -646,7 +808,7 @@ class WorkspaceManager(QObject):
         longer ancestor cycles) are rejected for the same reason.
 
         Only ``parent_id`` is touched: a tab's ``group_id`` is an orthogonal
-        relation and is preserved (ADR 0008 § 3/§ "auto-group-rules").
+        relation and is preserved (ADR 0008 § 3/§ "auto_group_rules").
         """
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
@@ -724,6 +886,8 @@ class WorkspaceManager(QObject):
         for tab in workspace.tabs:
             if tab.tab_id in id_set:
                 tab.assign_group(group_id)
+                self._auto_group_overrides.add(
+                    (workspace_id, tab.tab_id))
                 moved += 1
         if moved:
             log.workspaces.debug(
@@ -767,6 +931,8 @@ class WorkspaceManager(QObject):
             return 0
         workspace.tabs = [tab for tab in workspace.tabs
                           if tab.tab_id not in id_set]
+        for tab_id in id_set:
+            self._auto_group_overrides.discard((workspace_id, tab_id))
         for tab in workspace.tabs:
             if tab.parent_id in id_set:
                 tab.clear_parent()
@@ -1342,6 +1508,10 @@ class WorkspaceManager(QObject):
             return False
         old_id = tab.tab_id
         tab.tab_id = new_tab_id
+        override_key = (workspace_id, old_id)
+        if override_key in self._auto_group_overrides:
+            self._auto_group_overrides.discard(override_key)
+            self._auto_group_overrides.add((workspace_id, new_tab_id))
         for child in workspace.tabs:
             if child.parent_id == old_id:
                 child.parent_id = new_tab_id

@@ -13,19 +13,22 @@ effects — the ``@cmdutils.register`` decorators run at import time — from
 """
 
 import base64
+import pathlib
 import uuid
 from collections.abc import Callable
 from typing import Any, Optional
 
 from qutebrowser.api import cmdutils
 from qutebrowser.config import config
-from qutebrowser.utils import message, objreg
+from qutebrowser.utils import message, objreg, standarddir
 from qutebrowser.utils.utils import format_size
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import (READING_STATUSES, TabMetadata,
                                             WorkspaceManager)
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
+from qutebrowser.workspaces.portability import (DEFAULT_EXPORT_FILENAME,
+                                                export_to_path)
 
 #: Name of the default group collect commands land in when none is given.
 INBOX_GROUP_NAME = 'Inbox'
@@ -519,11 +522,11 @@ def vp_group_restore(target: str) -> None:
 @cmdutils.register(name='vp-group-delete')
 @cmdutils.argument('target', metavar='target')
 def vp_group_delete(target: str) -> None:
-    """Permanently delete a Group and all its TabEntries.
+    """Delete a Group, making its TabEntries standalone.
 
     Non-empty groups require confirmation; empty groups are deleted
-    immediately (ADR 0008 § Decisions). Unlike ``:vp-group-archive``, this
-    cannot be undone.
+    immediately (ADR 0008 § Decisions). Unlike ``:vp-group-archive``, the
+    group itself cannot be restored afterwards.
 
     Args:
         target: The name or UUID of the group.
@@ -547,13 +550,15 @@ def _make_group_delete_action(
     workspace: Workspace,
     group: Group,
 ) -> Callable[[], None]:
-    """Return the callback which cascade-deletes *group* after confirmation."""
+    """Return the callback which deletes *group* after confirmation."""
     name = group.name
     group_id = group.group_id
 
     def delete() -> None:
-        removed = manager.purge_group(workspace.id, group_id)
-        message.info(f"Deleted group '{name}' ({removed} tabs).")
+        count = manager.group_total_count(workspace.id, group_id)
+        manager.delete_group(workspace.id, group_id)
+        message.info(
+            f"Deleted group '{name}'; {count} tab(s) became standalone.")
 
     return delete
 
@@ -1120,6 +1125,22 @@ def _cycle_workspace(step: int) -> None:
 # Group management / tab placement (ADR 0008 § "Commands" and § 5).
 
 
+@cmdutils.register(name='auto-group-reapply')
+def auto_group_reapply() -> None:
+    """Re-run ``auto_group_rules`` on every tab in the active workspace.
+
+    Use this after editing the rule list: the rules are normally evaluated
+    only when a tab opens or its URL changes.  Tabs matching no rule keep
+    their current placement, and manually created groups named by a rule
+    are reused rather than duplicated.
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+    changed = manager.reapply_auto_group_rules(workspace.id)
+    message.info(
+        f"Re-applied auto-group rules: {changed} tab(s) updated.")
+
+
 @cmdutils.register(name='group-list')
 def group_list() -> None:
     """List all groups in the active workspace."""
@@ -1258,8 +1279,12 @@ def pintab_add(target: str, win_id: int = 0) -> None:
     manager = _manager()
     workspace = _active_workspace(manager)
     entry = _resolve_status_target(manager, workspace, target)
+    # Resolve and read the entry *before* moving it out of the workspace.
     pinned = _pinned_from_entry(manager, workspace, entry, win_id)
     manager.add_pinned(pinned)
+    # ADR 0008: the PIN panel and the TabTree are disjoint, so the tab must
+    # stop being a workspace entry once it is pinned.
+    manager.remove_tab(workspace.id, entry.tab_id)
     message.info(f"Pinned tab {entry.tab_id}.")
 
 
@@ -1321,3 +1346,28 @@ def workspace_unarchive(name: str) -> None:
         return
     manager.unarchive_workspace(workspace.id)
     message.info(f"Unarchived workspace '{name}'.")
+
+
+@cmdutils.register(name='vp-workspace-export')
+@cmdutils.argument('path', metavar='path')
+def vp_workspace_export(path: str = '') -> None:
+    """Export every workspace to a versioned JSON document.
+
+    This file contains your browsing history (URLs and titles). Treat it as
+    private. Its contents are not logged by default; only the resolved
+    destination path is reported.
+
+    Args:
+        path: Destination file, or a directory to write
+            ``workspaces-export.json`` into. When omitted, the document is
+            written to the qutebrowser data directory.
+    """
+    if not path:
+        target = pathlib.Path(standarddir.data()) / DEFAULT_EXPORT_FILENAME
+    else:
+        target = pathlib.Path(path).expanduser()
+        if target.is_dir():
+            target = target / DEFAULT_EXPORT_FILENAME
+
+    resolved = export_to_path(target)
+    message.info(f"Exported workspaces to {resolved}")

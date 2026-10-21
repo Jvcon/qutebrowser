@@ -13,8 +13,10 @@ from typing import Optional
 import pytest
 
 from qutebrowser.api import cmdutils
-from qutebrowser.qt.core import QUrl
-from qutebrowser.workspaces import commands
+from qutebrowser.mainwindow import tabtree
+from qutebrowser.mainwindow.pinpanel import PINNED_TAB_MIME
+from qutebrowser.qt.core import QMimeData, QModelIndex, Qt, QUrl
+from qutebrowser.workspaces import commands, portability
 from qutebrowser.workspaces.manager import BYTES_PER_TAB, WorkspaceManager
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
@@ -38,7 +40,7 @@ class FakeManager:
         self.renamed: list[tuple[uuid.UUID, str]] = []
         self.archived: list[uuid.UUID] = []
         self.deleted: list[uuid.UUID] = []
-        self.purged: list[uuid.UUID] = []
+        self.deleted_groups: list[uuid.UUID] = []
         self.reading_status_sets: list[tuple[set[int], str]] = []
         self.cleanups: list[tuple[uuid.UUID, int]] = []
         self.cleanup_result = 0
@@ -55,6 +57,8 @@ class FakeManager:
         self.close_group_result: tuple[int, int] = (0, 0)
         self.reopened_groups: list[tuple[uuid.UUID, uuid.UUID, int]] = []
         self.reopen_group_result: tuple[int, int, int] = (0, 0, 0)
+        self.reapplied: list[uuid.UUID] = []
+        self.reapply_result = 0
         self.pinned: list = []
 
     def add_workspace(self, name: str) -> Workspace:
@@ -127,6 +131,10 @@ class FakeManager:
                 tab.group_id = group_id
                 return
 
+    def reapply_auto_group_rules(self, workspace_id: uuid.UUID) -> int:
+        self.reapplied.append(workspace_id)
+        return self.reapply_result
+
     def rename_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID,
                      new_name: str) -> None:
         self._find_group(workspace_id, group_id).rename(new_name)
@@ -151,17 +159,15 @@ class FakeManager:
         return [group for group in self._workspaces[workspace_id].groups
                 if group.archived]
 
-    def purge_group(self, workspace_id: uuid.UUID,
-                    group_id: uuid.UUID) -> int:
+    def delete_group(self, workspace_id: uuid.UUID,
+                     group_id: uuid.UUID) -> None:
         workspace = self._workspaces[workspace_id]
-        removed = [tab for tab in workspace.tabs
-                   if tab.group_id == group_id]
-        workspace.tabs = [tab for tab in workspace.tabs
-                          if tab.group_id != group_id]
         workspace.groups = [group for group in workspace.groups
                             if group.group_id != group_id]
-        self.purged.append(group_id)
-        return len(removed)
+        for tab in workspace.tabs:
+            if tab.group_id == group_id:
+                tab.clear_group()
+        self.deleted_groups.append(group_id)
 
     def group_total_count(self, workspace_id: uuid.UUID,
                           group_id: uuid.UUID) -> int:
@@ -271,6 +277,14 @@ class FakeManager:
 
     def add_tab(self, workspace_id: uuid.UUID, tab: WorkspaceTab) -> None:
         self._workspaces[workspace_id].tabs.append(tab)
+
+    def remove_tab(self, workspace_id: uuid.UUID, tab_id: int) -> None:
+        workspace = self._workspaces[workspace_id]
+        workspace.tabs = [tab for tab in workspace.tabs
+                          if tab.tab_id != tab_id]
+        for tab in workspace.tabs:
+            if tab.parent_id == tab_id:
+                tab.clear_parent()
 
     # --- pinned tabs ---
 
@@ -735,6 +749,27 @@ class TestWorkspaceUnarchive:
             commands.workspace_unarchive('nope')
 
 
+class TestAutoGroupReapply:
+
+    def test_reapplies_on_active_workspace(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        other = fake_manager.add_workspace('other')
+        fake_manager.set_active(workspace.id)
+        fake_manager.reapply_result = 2
+
+        commands.auto_group_reapply()
+
+        assert fake_manager.reapplied == [workspace.id]
+        assert workspace.id != other.id
+        assert messages == ['Re-applied auto-group rules: 2 tab(s) updated.']
+
+    def test_no_active_workspace_raises(
+            self, fake_manager: FakeManager) -> None:
+        with pytest.raises(cmdutils.CommandError, match='No active workspace'):
+            commands.auto_group_reapply()
+
+
 class TestGroupList:
 
     def test_lists_groups(
@@ -823,22 +858,43 @@ class TestPintabCommands:
             open_status='OPEN'))
         return workspace
 
-    def test_add_pins_entry(self, fake_manager, messages):
-        self._workspace_with_tab(fake_manager)
+    def test_add_pins_entry_and_removes_workspace_entry(
+            self, fake_manager, messages):
+        workspace = self._workspace_with_tab(fake_manager)
 
         commands.pintab_add('1')
 
         assert [entry.tab_id for entry in fake_manager.list_pinned()] == [1]
+        assert workspace.tabs == []
         assert messages == ['Pinned tab 1.']
 
     def test_add_resolves_url(self, fake_manager, messages):
-        self._workspace_with_tab(fake_manager)
+        workspace = self._workspace_with_tab(fake_manager)
 
         commands.pintab_add('https://example.com/')
 
         assert [entry.tab_id for entry in fake_manager.list_pinned()] == [1]
+        assert workspace.tabs == []
 
-    def test_remove_unpins_without_touching_tab(
+    def test_add_then_drop_into_tree_has_single_entry(
+            self, fake_manager, qtbot):
+        """A pinned entry dropped back into the tree is not duplicated."""
+        workspace = self._workspace_with_tab(fake_manager)
+        commands.pintab_add('1')
+        model = tabtree.TabTreeModel(fake_manager)
+        assert model.rowCount(QModelIndex()) == 0
+
+        mime = QMimeData()
+        mime.setData(PINNED_TAB_MIME, b'1')
+        assert model.dropMimeData(
+            mime, Qt.DropAction.CopyAction, -1, -1, QModelIndex())
+
+        entries = [tab for tab in workspace.tabs if tab.tab_id == 1]
+        assert len(entries) == 1
+        assert entries[0].open_status == 'OPEN'
+        assert fake_manager.list_pinned() == []
+
+    def test_remove_unpins_without_restoring_workspace_entry(
             self, fake_manager, messages):
         workspace = self._workspace_with_tab(fake_manager)
         commands.pintab_add('1')
@@ -846,7 +902,7 @@ class TestPintabCommands:
         commands.pintab_remove('1')
 
         assert fake_manager.list_pinned() == []
-        assert [tab.tab_id for tab in workspace.tabs] == [1]
+        assert workspace.tabs == []
         assert messages[-1] == 'Unpinned tab 1.'
 
     def test_remove_unknown_raises(self, fake_manager):
@@ -973,7 +1029,7 @@ class TestGroupCommands:
 
         assert messages == ["Group 'g' is not archived."]
 
-    def test_delete_confirms_then_purges(
+    def test_delete_confirms_then_makes_members_standalone(
             self,
             fake_manager: FakeManager,
             confirmations: list[Callable[[], None]],
@@ -990,10 +1046,12 @@ class TestGroupCommands:
         assert len(confirmations) == 1
         confirmations[0]()
 
-        assert fake_manager.purged == [group.group_id]
+        assert fake_manager.deleted_groups == [group.group_id]
         assert workspace.groups == []
-        assert [tab.tab_id for tab in workspace.tabs] == [2]
-        assert messages == ["Deleted group 'g' (1 tabs)."]
+        assert [tab.tab_id for tab in workspace.tabs] == [1, 2]
+        assert workspace.tabs[0].group_id is None
+        assert messages == [
+            "Deleted group 'g'; 1 tab(s) became standalone."]
 
     def test_delete_empty_group_skips_confirmation(
             self,
@@ -1007,9 +1065,10 @@ class TestGroupCommands:
         commands.vp_group_delete('g')
 
         assert confirmations == []
-        assert fake_manager.purged == [group.group_id]
+        assert fake_manager.deleted_groups == [group.group_id]
         assert workspace.groups == []
-        assert messages == ["Deleted group 'g' (0 tabs)."]
+        assert messages == [
+            "Deleted group 'g'; 0 tab(s) became standalone."]
 
     def test_delete_missing_raises(self, fake_manager: FakeManager) -> None:
         fake_manager.add_workspace('w')
@@ -1850,3 +1909,25 @@ class TestCollectAllInbox:
         commands.vp_collect_all()
 
         assert messages == ['No collectable tabs in this window.']
+
+
+class TestWorkspaceExport:
+
+    """VP-A3 export half: ``:vp-workspace-export``."""
+
+    def test_vp_workspace_export_default_path(
+            self,
+            tmp_path: pathlib.Path,
+            fake_manager: FakeManager,
+            messages: list[str],
+            monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        fake_manager.add_workspace('research')
+        monkeypatch.setattr(commands.standarddir, 'data', lambda: str(tmp_path))
+        monkeypatch.setattr(portability, '_manager', lambda: fake_manager)
+
+        commands.vp_workspace_export()
+
+        expected = (tmp_path / 'workspaces-export.json').resolve()
+        assert expected.exists()
+        assert messages == [f"Exported workspaces to {expected}"]

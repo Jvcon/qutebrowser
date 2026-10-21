@@ -2741,6 +2741,24 @@ url.yank_ignored_parameters:
 
 ## verticalpanel
 
+auto_group_rules:
+  type:
+    name: List
+    valtype: AutoGroupRule
+    none_ok: true
+  default: []
+  desc: >-
+    URL patterns which automatically place tabs into groups (ADR 0008 § 5
+    "Auto-group rules"). Each rule is a dict with a `pattern` (regular
+    expression matched against the full URL), a `group` (group name,
+    auto-created with `folded: false` when missing) and an optional integer
+    `priority` (default 0). Rules are evaluated by descending priority, then
+    declaration order; the first match wins and only sets the tab's
+    `group_id` (its `parent_id` is preserved). Tabs which match no rule keep
+    their current placement. After editing the list, run
+    `:auto-group-reapply` to update the tabs already in the active
+    workspace.
+
 pinned_tabs.style:
   type:
     name: String
@@ -3845,6 +3863,11 @@ bindings.default:
       K: tab-prev
       <Ctrl-PgUp>: tab-prev
       gC: tab-clone
+      gc: cmd-set-text -s :tab-collect
+      gG: cmd-set-text -s :tab-move-to-group
+      gs: cmd-set-text -s :vp-status-set
+      gv: cmd-set-text -s :vp-status-cycle
+      gz: cmd-set-text -s :vp-select-toggle
       r: reload
       <F5>: reload
       R: reload -f
@@ -4131,9 +4154,42 @@ bindings.default:
       <Escape>: mode-leave
     workspace_panel:
       <Escape>: mode-leave
+      d: tab-close
+      <Ctrl-W>: tab-close
+      co: tab-only
+      gc: cmd-set-text -s :tab-collect
+      gG: cmd-set-text -s :tab-move-to-group
+      gC: tab-clone
+      gm: tab-move
+      gs: cmd-set-text -s :vp-status-set
+      gv: cmd-set-text -s :vp-status-cycle
+      gz: cmd-set-text -s :vp-select-toggle
+      r: reload
       gp: cmd-set-text -s :pintab-add
       gP: cmd-set-text -s :pintab-remove
       gM: cmd-set-text -s :pintab-move
+      gS: pintab-style-toggle
+      gwc: cmd-set-text -s :workspace-create
+      gwr: cmd-set-text -s :workspace-rename
+      gwd: cmd-set-text -s :workspace-delete
+      gwa: cmd-set-text -s :workspace-archive
+      gwu: cmd-set-text -s :workspace-unarchive
+      gws: cmd-set-text -s :workspace-switch
+      gwe: cmd-set-text -s :vp-workspace-export
+      ggl: group-list
+      ggn: cmd-set-text -s :vp-group-new
+      ggr: cmd-set-text -s :vp-group-rename
+      ggp: cmd-set-text -s :vp-group-pin
+      ggP: cmd-set-text -s :vp-group-unpin
+      gga: cmd-set-text -s :vp-group-archive
+      ggR: cmd-set-text -s :vp-group-restore
+      ggd: cmd-set-text -s :vp-group-delete
+      ggc: cmd-set-text -s :vp-group-close
+      ggo: cmd-set-text -s :vp-group-reopen
+      gX: vp-cleanup-done
+      gbm: cmd-set-text -s :vp-batch-move
+      gbs: cmd-set-text -s :vp-batch-status
+      "/": panel-filter
       <Ctrl-Space>: vp-select-mode
       <Ctrl-A>: vp-select-all
       <Ctrl-N>: vp-select-none
@@ -4141,6 +4197,7 @@ bindings.default:
       <Ctrl-Return>: vp-batch-open-tabs
       <Ctrl-Shift-Return>: vp-batch-open-window
       <Ctrl-C>: vp-collect-all
+      gr: auto-group-reapply
       "]": workspace-next
       "[": workspace-prev
   type:

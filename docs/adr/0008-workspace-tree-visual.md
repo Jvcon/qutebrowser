@@ -173,7 +173,7 @@ self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
 ```
 
-Both **groups** (from `auto-group-rules` or manual creation) and **parent-child
+Both **groups** (from `auto_group_rules` or manual creation) and **parent-child
 chains** (from tab-opening behavior) contribute to the TabTree's nesting. A tab
 may be a member of a group AND have a parent tab; both nestings are displayed
 simultaneously in the tree. The model's `group_id` and `parent_id` fields are
@@ -261,13 +261,18 @@ in workspace YAML.
 
 A config-driven way to assign newly opened tabs to groups automatically based
 on URL pattern matching. Rules live in `configdata.yml` under
-`auto-group-rules` and are evaluated whenever a tab opens or its URL changes.
+`auto_group_rules` and are evaluated whenever a tab opens or its URL changes.
+
+> **Naming note**: the key uses underscores (`auto_group_rules`) rather than
+> the originally proposed hyphenated `auto-group-rules`. `configfiles.py`
+> writes option names verbatim as Python attribute names in generated
+> `config.py`, and hyphens are not valid Python identifiers.
 
 **Config schema**:
 
 ```yaml
 # configdata.yml
-auto-group-rules:
+auto_group_rules:
   - pattern: <regex>          # URL regex (matched against full URL)
     group: <string>           # group name; auto-created in the workspace if missing
     priority: <int>           # default 0; higher wins; then declaration order
@@ -276,7 +281,7 @@ auto-group-rules:
 **Example**:
 
 ```yaml
-auto-group-rules:
+auto_group_rules:
   - pattern: 'https?://github\.com/.*'
     group: github
     priority: 10
@@ -310,7 +315,7 @@ auto-group-rules:
 
 **Command**:
 
-- `auto-group-reapply` — re-runs `auto-group-rules` against every tab in the
+- `auto-group-reapply` — re-runs `auto_group_rules` against every tab in the
   active workspace. Useful after editing the rule list.
 
 ## Wireframes
@@ -319,7 +324,7 @@ All widths are the full 220 px column.
 
 ### a. Default state — icon mode, NO groups, flat tab list (parent-child only)
 
-> *Default state shows no group headers. With `auto-group-rules:` matching tabs
+> *Default state shows no group headers. With `auto_group_rules:` matching tabs
 > (e.g., `https://github.com/* → github`), new tabs would auto-assign to a
 > `github` group on creation. The wireframe below depicts the no-rules case.*
 
@@ -436,7 +441,7 @@ archived: false                 # true hides the workspace from WorkspaceIndicat
 groups:
   - group_id: <uuid>
     name: github
-    folded: false               # auto-created by auto-group-rules
+    folded: false               # auto-created by auto_group_rules
     pinned: false               # optional; pinned groups sort first
     archived: false             # optional; per-group archive (orthogonal to workspace archived)
     created_at: <iso8601>       # optional; auto-stamped in __post_init__
@@ -478,7 +483,7 @@ tabs:
     # ...
   - tab_id: <int>
     parent_id: null
-    group_id: <uuid>            # auto-assigned by auto-group-rules
+    group_id: <uuid>            # auto-assigned by auto_group_rules
     # ...
 ```
 
@@ -569,7 +574,7 @@ builds side-by-side during the migration window.
 | `vp-batch-delete` (or `-!` to skip confirm) | Delete the selected tabs. (VP-F4) |
 | `vp-batch-open-window` | Open the selected tabs in a single new window; reuse live tabs by URL. (VP-F4) |
 | `vp-batch-open-tabs` | Open the selected tabs as new tabs in the current window. (VP-F4) |
-| `auto-group-reapply` | Re-run `auto-group-rules` on every tab in the active workspace. |
+| `auto-group-reapply` | Re-run `auto_group_rules` on every tab in the active workspace. |
 
 ## Per-decision specifics
 
@@ -796,7 +801,7 @@ they register in `bindings.default:`.
 
 | Class | Registered in | Example commands | Target semantics |
 |---|---|---|---|
-| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tab-close`, `tab-only`, `tab-clone`, `tab-reload`, `tab-collect`, `vp-status-set`, `vp-status-cycle`, `vp-select-toggle` | In `normal:`, the target is the webview's active tab. In `workspace_panel:`, the target is the TabTree's selected row (which may be a different tab). |
+| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tab-close`, `tab-only`, `tab-clone`, `tab-reload`, `tab-collect`, `vp-status-set`, `vp-status-cycle`, `vp-select-toggle` | In both modes the target is the webview's active tab. Outside selection mode the TabTree's current row is kept identical to it: clicking a row and J/K both switch the webview (J/K keeps focus in the tree), so the two cannot diverge. Selection mode is the exception — see § "Current row vs selected set" below. |
 | **Panel-state operations** | `bindings.default.workspace_panel:` only | `workspace-add`, `workspace-rename`, `workspace-delete`, `workspace-archive`, `workspace-unarchive`, `workspace-next`, `workspace-prev`, `workspace-switch`, `pintab-style-toggle`, `group-create`, `group-rename`, `group-delete`, `group-list`, `vp-group-new`, `vp-group-rename`, `vp-group-pin`, `vp-group-unpin`, `vp-group-archive`, `vp-group-restore`, `vp-group-delete`, `vp-group-close`, `vp-group-reopen`, `vp-collect-all`, `vp-cleanup-done`, `vp-select-mode`, `vp-select-all`, `vp-select-none`, `vp-batch-move`, `vp-batch-status`, `vp-batch-delete`, `vp-batch-open-window`, `vp-batch-open-tabs`, `auto-group-reapply` | Operate on the active workspace / selected group / pinned-tab list. Have no meaning from `normal:` because they have no active-tab target. |
 | **Global operations** | `bindings.default.normal:` only | `vertical-panel-toggle` | Toggle panel visibility; no tab/group target. |
 
@@ -804,6 +809,38 @@ they register in `bindings.default:`.
 into exactly one of the three classes above in `configdata.yml`, and
 **active-tab operations MUST appear in both `normal:` and
 `workspace_panel:`** so the same key works from either focus.
+
+### Current row vs selected set
+
+Outside selection mode, the TabTree's current row
+(`QTreeView.currentIndex()`) and the webview's active tab are the same tab.
+Clicking a row emits `tabtree.activated` and J/K emits
+`tabtree.keyboard_activated`; both call `_activate_tab_id()`, which switches
+the webview's active tab (J/K keeps focus in the tree). Outside selection
+mode, J/K without selection falls back to `_move_selection()`, another plain
+tab switch. Therefore the current row cannot point at a tab other than the
+webview's active tab.
+
+`vp-select-mode` is a TabTree-model toggle
+(`TabTreeModel._selection_mode`), **not** a qutebrowser `KeyMode`. It does
+not affect the webview. Its only effect is to change what Ctrl/Shift-click
+and J/K mean in the tree. In selection mode J/K moves the current row and
+extends the set without switching the webview, so the current row can then
+differ from the webview's active tab. Two independent notions coexist:
+
+- the **current row** (`_view.currentIndex()`), which is always exactly one
+  row;
+- the **selected set** (`model.selected_tab_ids()`, a `set[int]`), which is
+  non-empty only in selection mode and is consumed only by the `vp-batch-*`
+  commands.
+
+Enabling selection mode deliberately selects nothing; disabling it clears
+the set.
+
+**Decision:** in selection mode, single-target active-tab commands act on
+the **current row**, not on the selected set. This is deliberate: the set is
+the input for batch operations only, and `vp-batch-*` is the way to act on
+it.
 
 ## Reconciliation notes — qutebrowser-specific
 
@@ -907,7 +944,7 @@ All spike decisions are closed. None remain open before v0.1 implementation.
 
 - **Search scope** filters both PIN + TabTree.
 - **Groups are opt-in** (no hard requirement).
-- **Group semantics** — auto-group via `auto-group-rules` config, while
+- **Group semantics** — auto-group via `auto_group_rules` config, while
   parent-child chains also shape the tree; both relations coexist.
 - **Parent-child auto vs explicit** — `parent_id` is **auto-set** when a tab
   opens from another tab (link click, `:open`, `window.open`); this preserves
