@@ -66,18 +66,34 @@ clear message rather than partially applied.
 (`itertools.count(0)` in `qutebrowser/browser/browsertab.py`). Two machines
 will therefore assign the same ids to different tabs. Any id is local.
 
-The interchange format consequently omits `tab_id` entirely and re-addresses
-entries by **normalized URL**, which is stable across machines, already the
-key used for duplicate detection in `reopen_group`, and gives de-duplication
-for free. Two entries with the same URL collapse to one on import.
+The interchange format consequently omits `tab_id` from each entry and
+re-addresses entries by **normalized URL**, which is stable across
+machines, already the key used for duplicate detection in `reopen_group`,
+and gives de-duplication for free. Two entries with the same URL collapse
+to one on import.
 
 `Workspace.id` and `Group.group_id` are `uuid.uuid4()` and *are* globally
 unique, so they are carried across unchanged and keep referential integrity
 for `group_id` on each entry.
 
 `parent_id` is a reference to a local `tab_id`, so it is **remapped during
-import** through the same URL key. A child whose parent is not present in the
-imported document is promoted to a top-level entry rather than dropped.
+import** through the same URL key. To make this possible without breaking
+the § 3 rule against per-entry machine-local fields, the exporter writes a
+small structural map at the document root:
+
+```jsonc
+"tabs_index": {
+  "1": "https://example.com/parent",
+  "2": "https://example.com/child"
+}
+```
+
+The importer reads `tabs_index` first, falls back to inline `tab_id` on
+each entry for hand-written or older documents, and promotes a child to
+top level only when its parent is genuinely not present in the document
+anywhere.
+
+### 3. Fields deliberately excluded
 
 ### 3. Fields deliberately excluded
 
@@ -190,8 +206,11 @@ into a warning without preventing the loss.
 ## Implementation status
 
 - Export (`:vp-workspace-export <path>`): implemented, see #27.
-- Import (`:vp-workspace-import <path>`): not yet implemented; same issue
-  tracks the next PR.
+- Import (`:vp-workspace-import <path>`): implemented, see #42. It is
+  additive and idempotent, rejects newer `schema_version` values before
+  applying anything, reuses existing groups by `group_id`, skips entries by
+  normalized URL and remaps/promotes `parent_id` children. A best-effort
+  rollback through public `WorkspaceManager` APIs reverts a partial apply.
 
 ### Implementation notes
 
@@ -209,6 +228,8 @@ that are **not** in the table above:
 - **Standalone tabs** (`group_id is None`) are emitted in a workspace-
   level `entries` list. The original issue table only describes the
   per-group `entries` key, but dropping them would silently lose data.
+- **`tabs_index`** lives at the document root and is the source of truth
+  for `parent_id` remap on import. See § 2.
 
 ### Known limitations (tracked for follow-ups)
 

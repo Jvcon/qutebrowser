@@ -70,6 +70,26 @@ class FakeManager:
         self.added.append(workspace)
         return workspace
 
+    def add_workspace_with_id(
+            self,
+            workspace_id: uuid.UUID,
+            name: str,
+            *,
+            archived: bool = False,
+            last_active: Optional[str] = None,
+    ) -> Workspace:
+        workspace = Workspace(
+            id=workspace_id,
+            name=name,
+            last_active=last_active or '2026-01-01T00:00:00+00:00',
+            archived=archived,
+        )
+        self._workspaces[workspace.id] = workspace
+        if self._active_id is None:
+            self._active_id = workspace.id
+        self.added.append(workspace)
+        return workspace
+
     def get_workspace_by_name(self, name: str) -> Optional[Workspace]:
         name_lower = name.lower()
         for workspace in self._workspaces.values():
@@ -130,6 +150,23 @@ class FakeManager:
             if tab.tab_id == tab_id:
                 tab.group_id = group_id
                 return
+
+    def set_parent(self, workspace_id: uuid.UUID, tab_id: int,
+                   parent_tab_id: Optional[int]) -> None:
+        workspace = self._workspaces[workspace_id]
+        tab = next(
+            (entry for entry in workspace.tabs if entry.tab_id == tab_id),
+            None)
+        if tab is None:
+            return
+        if parent_tab_id is None:
+            tab.clear_parent()
+            return
+        if parent_tab_id == tab_id:
+            return
+        if not any(entry.tab_id == parent_tab_id for entry in workspace.tabs):
+            return
+        tab.parent_id = parent_tab_id
 
     def reapply_auto_group_rules(self, workspace_id: uuid.UUID) -> int:
         self.reapplied.append(workspace_id)

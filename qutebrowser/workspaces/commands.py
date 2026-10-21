@@ -28,7 +28,8 @@ from qutebrowser.workspaces.manager import (READING_STATUSES, TabMetadata,
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
 from qutebrowser.workspaces.portability import (DEFAULT_EXPORT_FILENAME,
-                                                export_to_path)
+                                                export_to_path,
+                                                import_from_path)
 
 #: Name of the default group collect commands land in when none is given.
 INBOX_GROUP_NAME = 'Inbox'
@@ -1371,3 +1372,38 @@ def vp_workspace_export(path: str = '') -> None:
 
     resolved = export_to_path(target)
     message.info(f"Exported workspaces to {resolved}")
+
+
+@cmdutils.register(name='vp-workspace-import')
+@cmdutils.argument('path', metavar='path')
+def vp_workspace_import(path: str = '') -> None:
+    """Import workspaces from an export document.
+
+    Reads a versioned JSON document produced by `:vp-workspace-export`.
+
+    Add-only: existing local objects are preserved; the document adds
+    whatever does not collide by id or by URL.
+
+    This document contains URLs and titles of pages you have visited.
+    Its contents are not logged; only a summary line is reported.
+
+    Args:
+        path: Source file. When omitted, read the default export file
+            from the qutebrowser data directory.
+    """
+    target = (
+        pathlib.Path(standarddir.data()) / DEFAULT_EXPORT_FILENAME
+        if not path else
+        pathlib.Path(path).expanduser()
+    )
+    report = import_from_path(target)
+    message.info(
+        f"Imported: +{report.added_workspaces} workspace(s), "
+        f"+{report.added_entries} entry/entries, "
+        f"skipped {report.skipped_entries} entry/entries "
+        f"(URL collision), "
+        f"skipped {report.skipped_workspaces} workspace(s) "
+        f"(id already local), "
+        f"promoted {report.orphan_promotions} orphaned child(ren) "
+        f"to top-level."
+    )

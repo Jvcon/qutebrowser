@@ -77,6 +77,7 @@ ACTIVE_TAB_COMMANDS = [
     ('gwa', 'cmd-set-text -s :workspace-archive'),
     ('gwu', 'cmd-set-text -s :workspace-unarchive'),
     ('gws', 'cmd-set-text -s :workspace-switch'),
+    ('gwi', 'cmd-set-text -s :vp-workspace-import'),
     ('ggl', 'group-list'),
     ('ggn', 'cmd-set-text -s :vp-group-new'),
     ('ggr', 'cmd-set-text -s :vp-group-rename'),
