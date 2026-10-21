@@ -889,6 +889,10 @@ class WorkspaceBridge(QObject):
             favicon=favicon or None,
             fetched=bool(favicon),
         )
+        # Evaluate on tab open.  The assignment is idempotent, so a
+        # subsequent url_changed signal for the same URL produces no churn.
+        self._manager.apply_auto_group_rules(  # type: ignore[union-attr]
+            workspace_id, tab_id)
 
         self._attach_tab(tab)
         self._push(tab_id)
@@ -958,13 +962,21 @@ class WorkspaceBridge(QObject):
 
     def _on_url_changed(self, tab_id: int, url: QUrl) -> None:
         url_str = url.toString()
-        self._state_for(tab_id).url = url_str
+        state = self._state_for(tab_id)
+        url_changed = state.url != url_str
+        state.url = url_str
         workspace_id = self._active_workspace_id()
         if workspace_id is not None:
             source = url.host().lower()
             self._manager.update_tab_metadata(  # type: ignore[union-attr]
                 workspace_id, tab_id, url=url_str or None,
                 source=source or None)
+            # Re-evaluate the auto-group rules only when the URL actually
+            # changed; a repeated signal for the same URL must not clear a
+            # manual :tab-move-to-group override.
+            if url_changed:
+                self._manager.apply_auto_group_rules(  # type: ignore[union-attr]
+                    workspace_id, tab_id, url_changed=True)
         self._push(tab_id)
 
     def _on_icon_changed(self, tab_id: int, icon: QIcon) -> None:

@@ -1122,6 +1122,22 @@ def _cycle_workspace(step: int) -> None:
 # Group management / tab placement (ADR 0008 § "Commands" and § 5).
 
 
+@cmdutils.register(name='auto-group-reapply')
+def auto_group_reapply() -> None:
+    """Re-run ``auto_group_rules`` on every tab in the active workspace.
+
+    Use this after editing the rule list: the rules are normally evaluated
+    only when a tab opens or its URL changes.  Tabs matching no rule keep
+    their current placement, and manually created groups named by a rule
+    are reused rather than duplicated.
+    """
+    manager = _manager()
+    workspace = _active_workspace(manager)
+    changed = manager.reapply_auto_group_rules(workspace.id)
+    message.info(
+        f"Re-applied auto-group rules: {changed} tab(s) updated.")
+
+
 @cmdutils.register(name='group-list')
 def group_list() -> None:
     """List all groups in the active workspace."""

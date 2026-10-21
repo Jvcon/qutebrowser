@@ -173,7 +173,7 @@ self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 self.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
 ```
 
-Both **groups** (from `auto-group-rules` or manual creation) and **parent-child
+Both **groups** (from `auto_group_rules` or manual creation) and **parent-child
 chains** (from tab-opening behavior) contribute to the TabTree's nesting. A tab
 may be a member of a group AND have a parent tab; both nestings are displayed
 simultaneously in the tree. The model's `group_id` and `parent_id` fields are
@@ -261,13 +261,18 @@ in workspace YAML.
 
 A config-driven way to assign newly opened tabs to groups automatically based
 on URL pattern matching. Rules live in `configdata.yml` under
-`auto-group-rules` and are evaluated whenever a tab opens or its URL changes.
+`auto_group_rules` and are evaluated whenever a tab opens or its URL changes.
+
+> **Naming note**: the key uses underscores (`auto_group_rules`) rather than
+> the originally proposed hyphenated `auto-group-rules`. `configfiles.py`
+> writes option names verbatim as Python attribute names in generated
+> `config.py`, and hyphens are not valid Python identifiers.
 
 **Config schema**:
 
 ```yaml
 # configdata.yml
-auto-group-rules:
+auto_group_rules:
   - pattern: <regex>          # URL regex (matched against full URL)
     group: <string>           # group name; auto-created in the workspace if missing
     priority: <int>           # default 0; higher wins; then declaration order
@@ -276,7 +281,7 @@ auto-group-rules:
 **Example**:
 
 ```yaml
-auto-group-rules:
+auto_group_rules:
   - pattern: 'https?://github\.com/.*'
     group: github
     priority: 10
@@ -310,7 +315,7 @@ auto-group-rules:
 
 **Command**:
 
-- `auto-group-reapply` — re-runs `auto-group-rules` against every tab in the
+- `auto-group-reapply` — re-runs `auto_group_rules` against every tab in the
   active workspace. Useful after editing the rule list.
 
 ## Wireframes
@@ -319,7 +324,7 @@ All widths are the full 220 px column.
 
 ### a. Default state — icon mode, NO groups, flat tab list (parent-child only)
 
-> *Default state shows no group headers. With `auto-group-rules:` matching tabs
+> *Default state shows no group headers. With `auto_group_rules:` matching tabs
 > (e.g., `https://github.com/* → github`), new tabs would auto-assign to a
 > `github` group on creation. The wireframe below depicts the no-rules case.*
 
@@ -436,7 +441,7 @@ archived: false                 # true hides the workspace from WorkspaceIndicat
 groups:
   - group_id: <uuid>
     name: github
-    folded: false               # auto-created by auto-group-rules
+    folded: false               # auto-created by auto_group_rules
     pinned: false               # optional; pinned groups sort first
     archived: false             # optional; per-group archive (orthogonal to workspace archived)
     created_at: <iso8601>       # optional; auto-stamped in __post_init__
@@ -478,7 +483,7 @@ tabs:
     # ...
   - tab_id: <int>
     parent_id: null
-    group_id: <uuid>            # auto-assigned by auto-group-rules
+    group_id: <uuid>            # auto-assigned by auto_group_rules
     # ...
 ```
 
@@ -569,7 +574,7 @@ builds side-by-side during the migration window.
 | `vp-batch-delete` (or `-!` to skip confirm) | Delete the selected tabs. (VP-F4) |
 | `vp-batch-open-window` | Open the selected tabs in a single new window; reuse live tabs by URL. (VP-F4) |
 | `vp-batch-open-tabs` | Open the selected tabs as new tabs in the current window. (VP-F4) |
-| `auto-group-reapply` | Re-run `auto-group-rules` on every tab in the active workspace. |
+| `auto-group-reapply` | Re-run `auto_group_rules` on every tab in the active workspace. |
 
 ## Per-decision specifics
 
@@ -907,7 +912,7 @@ All spike decisions are closed. None remain open before v0.1 implementation.
 
 - **Search scope** filters both PIN + TabTree.
 - **Groups are opt-in** (no hard requirement).
-- **Group semantics** — auto-group via `auto-group-rules` config, while
+- **Group semantics** — auto-group via `auto_group_rules` config, while
   parent-child chains also shape the tree; both relations coexist.
 - **Parent-child auto vs explicit** — `parent_id` is **auto-set** when a tab
   opens from another tab (link click, `:open`, `window.open`); this preserves

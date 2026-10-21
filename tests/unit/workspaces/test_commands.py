@@ -57,6 +57,8 @@ class FakeManager:
         self.close_group_result: tuple[int, int] = (0, 0)
         self.reopened_groups: list[tuple[uuid.UUID, uuid.UUID, int]] = []
         self.reopen_group_result: tuple[int, int, int] = (0, 0, 0)
+        self.reapplied: list[uuid.UUID] = []
+        self.reapply_result = 0
         self.pinned: list = []
 
     def add_workspace(self, name: str) -> Workspace:
@@ -128,6 +130,10 @@ class FakeManager:
             if tab.tab_id == tab_id:
                 tab.group_id = group_id
                 return
+
+    def reapply_auto_group_rules(self, workspace_id: uuid.UUID) -> int:
+        self.reapplied.append(workspace_id)
+        return self.reapply_result
 
     def rename_group(self, workspace_id: uuid.UUID, group_id: uuid.UUID,
                      new_name: str) -> None:
@@ -741,6 +747,27 @@ class TestWorkspaceUnarchive:
         fake_manager.add_workspace('old')
         with pytest.raises(cmdutils.CommandError, match='No workspace'):
             commands.workspace_unarchive('nope')
+
+
+class TestAutoGroupReapply:
+
+    def test_reapplies_on_active_workspace(
+            self, fake_manager: FakeManager, messages: list[str]) -> None:
+        workspace = fake_manager.add_workspace('w')
+        other = fake_manager.add_workspace('other')
+        fake_manager.set_active(workspace.id)
+        fake_manager.reapply_result = 2
+
+        commands.auto_group_reapply()
+
+        assert fake_manager.reapplied == [workspace.id]
+        assert workspace.id != other.id
+        assert messages == ['Re-applied auto-group rules: 2 tab(s) updated.']
+
+    def test_no_active_workspace_raises(
+            self, fake_manager: FakeManager) -> None:
+        with pytest.raises(cmdutils.CommandError, match='No active workspace'):
+            commands.auto_group_reapply()
 
 
 class TestGroupList:

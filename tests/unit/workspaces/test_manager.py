@@ -5,6 +5,7 @@
 """Tests for qutebrowser.workspaces.manager."""
 
 import datetime
+import logging
 import uuid
 from types import SimpleNamespace
 
@@ -116,6 +117,217 @@ class TestGroups:
         assert manager.list_groups(workspace.id) == []
         assert workspace.tabs[0].group_id is None
         assert workspace.tabs[1].group_id is None
+
+
+class TestAutoGroupRules:
+
+    """ADR 0008 § 5: config-driven auto-group rules."""
+
+    @staticmethod
+    def _set_rules(config_stub, rules):
+        config_stub.set_obj('auto_group_rules', rules)
+
+    def _tab(self, manager, workspace_id, *, tab_id=1, url='',
+             **kwargs):
+        tab = WorkspaceTab(tab_id=tab_id, url=url, **kwargs)
+        manager.add_tab(workspace_id, tab)
+        return tab
+
+    def test_priority_descending_first_match_wins(
+            self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        tab = self._tab(manager, workspace.id,
+                        url='https://github.com/qutebrowser')
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'low',
+             'priority': 1},
+            {'pattern': r'https://github\.com/.*', 'group': 'high',
+             'priority': 10},
+        ])
+
+        manager.apply_auto_group_rules(workspace.id, tab.tab_id)
+
+        group = manager.list_groups(workspace.id)[0]
+        assert group.name == 'high'
+        assert tab.group_id == group.group_id
+
+    def test_equal_priority_uses_declaration_order(
+            self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        tab = self._tab(manager, workspace.id,
+                        url='https://example.com/page')
+        self._set_rules(config_stub, [
+            {'pattern': r'https://example\.com/.*', 'group': 'first'},
+            {'pattern': r'https://example\.com/.*', 'group': 'second'},
+        ])
+
+        manager.apply_auto_group_rules(workspace.id, tab.tab_id)
+
+        assert tab.group_id == manager.list_groups(workspace.id)[0].group_id
+        assert manager.list_groups(workspace.id)[0].name == 'first'
+
+    def test_missing_group_is_created_unfolded(self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        tab = self._tab(manager, workspace.id,
+                        url='https://github.com/qutebrowser')
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'github'},
+        ])
+
+        assert manager.apply_auto_group_rules(workspace.id, tab.tab_id)
+
+        groups = manager.list_groups(workspace.id)
+        assert len(groups) == 1
+        assert groups[0].name == 'github'
+        assert groups[0].folded is False
+        assert tab.group_id == groups[0].group_id
+
+    def test_existing_manual_group_is_reused(self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        manual = manager.create_group(workspace.id, 'GitHub')
+        manual.folded = True
+        tab = self._tab(manager, workspace.id,
+                        url='https://github.com/qutebrowser')
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'github'},
+        ])
+
+        manager.apply_auto_group_rules(workspace.id, tab.tab_id)
+
+        assert manager.list_groups(workspace.id) == [manual]
+        assert manual.folded is True
+        assert tab.group_id == manual.group_id
+
+    def test_parent_id_is_preserved(self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        tab = self._tab(manager, workspace.id,
+                        url='https://github.com/qutebrowser',
+                        parent_id=42)
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'github'},
+        ])
+
+        manager.apply_auto_group_rules(workspace.id, tab.tab_id)
+
+        assert tab.parent_id == 42
+        assert tab.group_id is not None
+
+    def test_non_matching_tab_is_left_untouched(
+            self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        manual = manager.create_group(workspace.id, 'manual')
+        tab = self._tab(manager, workspace.id, url='https://example.com/',
+                        group_id=manual.group_id)
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'github'},
+        ])
+
+        assert not manager.apply_auto_group_rules(workspace.id, tab.tab_id)
+
+        assert manager.list_groups(workspace.id) == [manual]
+        assert tab.group_id == manual.group_id
+
+    def test_invalid_regex_logged_and_skipped(
+            self, manager, config_stub, caplog):
+        workspace = manager.add_workspace('w')
+        tab = self._tab(manager, workspace.id,
+                        url='https://example.com/page')
+        self._set_rules(config_stub, [
+            {'pattern': '(', 'group': 'broken', 'priority': 100},
+            {'pattern': r'https://example\.com/.*', 'group': 'ok'},
+        ])
+
+        with caplog.at_level(logging.WARNING, logger='workspaces'):
+            assert manager.apply_auto_group_rules(
+                workspace.id, tab.tab_id)
+
+        assert 'invalid regex' in caplog.text
+        assert [group.name for group in manager.list_groups(workspace.id)] \
+            == ['ok']
+        assert tab.group_id == manager.list_groups(workspace.id)[0].group_id
+
+    def test_manual_move_survives_until_url_changes(
+            self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        tab = self._tab(manager, workspace.id,
+                        url='https://github.com/qutebrowser')
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'github'},
+        ])
+        manager.apply_auto_group_rules(workspace.id, tab.tab_id)
+        github = manager.list_groups(workspace.id)[0]
+
+        manual = manager.create_group(workspace.id, 'manual')
+        manager.move_tab_to_group(workspace.id, tab.tab_id, manual.group_id)
+
+        # A repeat evaluation without a URL change keeps the manual choice.
+        assert not manager.apply_auto_group_rules(
+            workspace.id, tab.tab_id, url_changed=False)
+        assert tab.group_id == manual.group_id
+
+        # The URL changed, so the override is dropped and the rule applies.
+        manager.update_tab_metadata(
+            workspace.id, tab.tab_id, url='https://github.com/other')
+        assert manager.apply_auto_group_rules(
+            workspace.id, tab.tab_id, url_changed=True)
+        assert tab.group_id == github.group_id
+
+    def test_reapply_runs_over_every_tab(self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        first = self._tab(manager, workspace.id, tab_id=1,
+                          url='https://github.com/a')
+        second = self._tab(manager, workspace.id, tab_id=2,
+                           url='https://docs.example.com/b')
+        standalone = self._tab(manager, workspace.id, tab_id=3,
+                               url='https://example.com/c')
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'github',
+             'priority': 10},
+            {'pattern': r'https://docs\.example\.com/.*', 'group': 'docs',
+             'priority': 5},
+        ])
+
+        updated = manager.reapply_auto_group_rules(workspace.id)
+
+        assert updated == 2
+        by_name = {group.name: group for group in
+                   manager.list_groups(workspace.id)}
+        assert first.group_id == by_name['github'].group_id
+        assert second.group_id == by_name['docs'].group_id
+        assert standalone.group_id is None
+
+    def test_reapply_keeps_manual_placements(self, manager, config_stub):
+        workspace = manager.add_workspace('w')
+        tab = self._tab(manager, workspace.id,
+                        url='https://github.com/a')
+        manual = manager.create_group(workspace.id, 'manual')
+        manager.move_tab_to_group(workspace.id, tab.tab_id, manual.group_id)
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'github'},
+        ])
+
+        updated = manager.reapply_auto_group_rules(workspace.id)
+
+        assert updated == 0
+        assert tab.group_id == manual.group_id
+        assert [group.name for group in manager.list_groups(workspace.id)] \
+            == ['manual']
+
+    def test_assignment_is_persisted(self, manager, config_stub, pers):
+        workspace = manager.add_workspace('w')
+        tab = self._tab(manager, workspace.id,
+                        url='https://github.com/qutebrowser')
+        self._set_rules(config_stub, [
+            {'pattern': r'https://github\.com/.*', 'group': 'github'},
+        ])
+        manager.apply_auto_group_rules(workspace.id, tab.tab_id)
+
+        manager.save()
+
+        loaded = pers[0].load(workspace.id)
+        assert len(loaded.groups) == 1
+        assert loaded.groups[0].name == 'github'
+        assert loaded.tabs[0].group_id == loaded.groups[0].group_id
 
 
 class TestGroupLifecycle:
@@ -1532,8 +1744,8 @@ class TestBatchOperations:
         count = manager.set_reading_status(workspace.id, [1, 2], 'done')
 
         assert count == 2
-        assert getattr(workspace.tabs[0], 'reading_status') == 'DONE'
-        assert getattr(workspace.tabs[1], 'reading_status') == 'DONE'
+        assert workspace.tabs[0].reading_status == 'DONE'
+        assert workspace.tabs[1].reading_status == 'DONE'
         assert changes
 
     def test_set_reading_status_invalid_raises(self, manager):

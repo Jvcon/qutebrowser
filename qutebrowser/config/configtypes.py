@@ -1356,6 +1356,78 @@ class Regex(BaseType):
         return utils.get_repr(self, none_ok=self.none_ok, flags=self.flags)
 
 
+class AutoGroupRule(BaseType):
+
+    """A single ``auto_group_rules`` entry.
+
+    An entry is a dict with the keys ``pattern`` (URL regex), ``group``
+    (target group name) and an optional integer ``priority`` (default 0).
+    The regex itself is intentionally *not* compiled here: an invalid rule
+    must not prevent the setting from loading, it is logged and skipped by
+    the workspace manager when the rules are evaluated
+    (ADR 0008 § 5 "Auto-group rules").
+    """
+
+    _keys = frozenset({'pattern', 'group', 'priority'})
+
+    def get_name(self) -> str:
+        return 'AutoGroupRule'
+
+    def from_str(self, value: str) -> dict | None:
+        self._basic_str_validation(value)
+        if not value:
+            return None
+        try:
+            yaml_val = utils.yaml_load(value)
+        except yaml.YAMLError as e:
+            raise configexc.ValidationError(value, str(e))
+        self.to_py(yaml_val)
+        return yaml_val
+
+    def to_py(self, value: dict | usertypes.Unset) -> dict | usertypes.Unset:
+        self._basic_py_validation(value, dict)
+        if isinstance(value, usertypes.Unset):
+            return value
+        if not value:
+            return value
+
+        unknown = set(value) - self._keys
+        if unknown:
+            raise configexc.ValidationError(
+                value, "unexpected keys: {}".format(', '.join(sorted(unknown))))
+
+        pattern = value.get('pattern')
+        group = value.get('group')
+        if not isinstance(pattern, str) or not pattern:
+            raise configexc.ValidationError(
+                value, "pattern must be a non-empty string")
+        if not isinstance(group, str) or not group:
+            raise configexc.ValidationError(
+                value, "group must be a non-empty string")
+
+        priority = value.get('priority', 0)
+        if isinstance(priority, bool) or not isinstance(priority, int):
+            raise configexc.ValidationError(
+                value, "priority must be an integer")
+
+        return {'pattern': pattern, 'group': group, 'priority': priority}
+
+    def to_str(self, value: dict) -> str:
+        if not value:
+            return ''
+        return json.dumps(value, sort_keys=True)
+
+    def to_doc(self, value: dict, indent: int = 0) -> str:
+        utils.unused(indent)
+        if not value:
+            return 'empty'
+        escaped = html.escape(self.to_str(value)).replace(']', '\\]')
+        return '+pass:[{}]+'.format(escaped)
+
+    def __repr__(self) -> str:
+        return utils.get_repr(self, none_ok=self.none_ok)
+
+
 class Dict(BaseType):
 
     """A dictionary of values.

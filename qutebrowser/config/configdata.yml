@@ -2741,6 +2741,24 @@ url.yank_ignored_parameters:
 
 ## verticalpanel
 
+auto_group_rules:
+  type:
+    name: List
+    valtype: AutoGroupRule
+    none_ok: true
+  default: []
+  desc: >-
+    URL patterns which automatically place tabs into groups (ADR 0008 § 5
+    "Auto-group rules"). Each rule is a dict with a `pattern` (regular
+    expression matched against the full URL), a `group` (group name,
+    auto-created with `folded: false` when missing) and an optional integer
+    `priority` (default 0). Rules are evaluated by descending priority, then
+    declaration order; the first match wins and only sets the tab's
+    `group_id` (its `parent_id` is preserved). Tabs which match no rule keep
+    their current placement. After editing the list, run
+    `:auto-group-reapply` to update the tabs already in the active
+    workspace.
+
 pinned_tabs.style:
   type:
     name: String
@@ -4141,6 +4159,7 @@ bindings.default:
       <Ctrl-Return>: vp-batch-open-tabs
       <Ctrl-Shift-Return>: vp-batch-open-window
       <Ctrl-C>: vp-collect-all
+      gr: auto-group-reapply
       "]": workspace-next
       "[": workspace-prev
   type:
