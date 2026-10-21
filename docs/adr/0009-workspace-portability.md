@@ -69,8 +69,16 @@ will therefore assign the same ids to different tabs. Any id is local.
 The interchange format consequently omits `tab_id` from each entry and
 re-addresses entries by **normalized URL**, which is stable across
 machines, already the key used for duplicate detection in `reopen_group`,
-and gives de-duplication for free. Two entries with the same URL collapse
-to one on import.
+and gives de-duplication for free. Two entries with the same normalized URL
+collapse to one entry on import. The de-duplication scope is the whole
+**workspace**, not the group: a URL denotes the same page whichever group
+holds it, and a group-scoped rule would import the same page twice as soon
+as a document placed it in two groups, or duplicate a URL which already
+exists locally in a different group (issue #49). The surviving entry is the
+first occurrence: a pre-existing local entry always wins because import is
+additive (§ 4), and otherwise the earliest entry in document order keeps its
+group. `parent_id` remapping therefore resolves to the surviving entry even
+when the duplicate was written under a different group.
 
 `Workspace.id` and `Group.group_id` are `uuid.uuid4()` and *are* globally
 unique, so they are carried across unchanged and keep referential integrity
@@ -115,8 +123,13 @@ the content, not machine state, and losing them would lose the user's triage.
 Import adds the document's workspaces and entries to the current state. It
 does not delete, rename or overwrite existing local objects.
 
-- An entry whose URL is already present locally is **skipped**, and the count
-  of skips is reported.
+- An entry whose URL is already present anywhere in the target workspace is
+  **skipped**, and the count of skips is reported. Because URL de-duplication
+  is workspace-scoped (§ 2), "already present" includes entries in a
+  different group and standalone entries.
+- A duplicate URL which the document itself contributes twice is reported as
+  a **merge** rather than a skip, so the three outcomes (added / merged /
+  skipped-because-local) stay distinguishable in the import report.
 - A group whose `group_id` already exists locally is reused; entries land in
   it.
 - A workspace whose `id` already exists locally is skipped wholesale.
@@ -208,8 +221,9 @@ into a warning without preventing the loss.
 - Export (`:vp-workspace-export <path>`): implemented, see #27.
 - Import (`:vp-workspace-import <path>`): implemented, see #42. It is
   additive and idempotent, rejects newer `schema_version` values before
-  applying anything, reuses existing groups by `group_id`, skips entries by
-  normalized URL and remaps/promotes `parent_id` children. A best-effort
+  applying anything, reuses existing groups by `group_id`, merges/skips
+  entries by normalized URL across the whole target workspace (#49) and
+  remaps/promotes `parent_id` children. A best-effort
   rollback through public `WorkspaceManager` APIs reverts a partial apply.
 
 ### Implementation notes

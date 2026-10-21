@@ -59,12 +59,27 @@ class ImportReport:
 
     added_workspaces: int = 0
     added_entries: int = 0
-    #: Document entry whose normalized URL already existed in the target.
+    #: Document entry collapsed into an entry which an earlier part of the
+    #: same document already contributed (normalized-URL merge).
+    merged_entries: int = 0
+    #: Document entry dropped because the target workspace already contained
+    #: an entry with the same normalized URL *before* this import ran.
+    #: Distinct from :attr:`merged_entries`: nothing was imported here, so
+    #: the user's local curation wins.
     skipped_entries: int = 0
     #: Document workspace whose ``id`` was already present locally.
     skipped_workspaces: int = 0
+    added_pinned: int = 0
+    #: Document pinned tab whose normalized URL was already pinned locally
+    #: or added earlier by this same document.
+    skipped_pinned: int = 0
     #: Child whose ``parent_id`` could not be resolved locally.
     orphan_promotions: int = 0
+
+    @property
+    def total_collapsed_entries(self) -> int:
+        """Entries not added, for reports which want a single number."""
+        return self.merged_entries + self.skipped_entries
 
 
 def _manager() -> Any:
@@ -329,14 +344,26 @@ def _entry_source_id(entry: dict[str, Any]) -> Optional[int]:
 
 def _find_url_entry(
         workspace: Workspace,
-        group_id: Optional[uuid.UUID],
         url: str,
 ) -> Optional[WorkspaceTab]:
-    """Return a local entry in *group_id* with normalized *url*, if any."""
+    """Return a local entry anywhere in *workspace* with normalized *url*.
+
+    The de-duplication scope is the **workspace**, not the group
+    (ADR 0009 § 2): the interchange format re-addresses entries by URL, and a
+    URL identifies the same page whichever group it happens to sit in.  A
+    group-local scope would import the same page twice as soon as the
+    document places it in two groups, and would duplicate a URL which
+    already exists locally in a different group.
+
+    The surviving entry is always the *first* one encountered: either the
+    pre-existing local entry (which import never mutates, ADR 0009 § 4), or
+    the first entry of the document in document order (groups in the order
+    they appear, then workspace-level standalone entries).
+    """
     if not url:
         return None
     for tab in workspace.tabs:
-        if tab.group_id == group_id and _normalize_url(tab.url) == url:
+        if _normalize_url(tab.url) == url:
             return tab
     return None
 
@@ -482,17 +509,39 @@ def _import_entry(
         report: ImportReport,
         added_tab_keys: list[tuple[uuid.UUID, int]],
         added_source_tabs: dict[int, tuple[uuid.UUID, int]],
+        seen_urls: dict[uuid.UUID, set[str]],
         pending_parents: list[
             tuple[uuid.UUID, WorkspaceTab, Any, Optional[int]]],
         next_tab_id: int,
 ) -> int:
-    """Add one document entry, or count it as a URL collision."""
+    """Add one document entry, or account for a URL collision.
+
+    ``seen_urls`` records the normalized URLs this document has already
+    contributed to each target workspace, so a collision can be attributed
+    correctly: a URL seen earlier in *this* document is a merge
+    (:attr:`ImportReport.merged_entries`), while a URL which only existed
+    locally before the import is a skip
+    (:attr:`ImportReport.skipped_entries`).
+    """
     url = _entry_url(entry_doc)
     source_id = _entry_source_id(entry_doc)
-    existing = _find_url_entry(workspace, group_id, url)
+
+    already_seen = False
+    if url:
+        seen = seen_urls.setdefault(workspace.id, set())
+        already_seen = url in seen
+        seen.add(url)
+
+    existing = _find_url_entry(workspace, url)
     if existing is not None:
-        report.skipped_entries += 1
+        if already_seen:
+            report.merged_entries += 1
+        else:
+            report.skipped_entries += 1
         if source_id is not None:
+            # The ``parent_id`` remap must resolve to the surviving entry,
+            # which may live in a different group than the document placed
+            # this duplicate in.
             added_source_tabs[source_id] = (workspace.id, existing.tab_id)
         return next_tab_id
 
@@ -555,17 +604,22 @@ def _import_pinned_entries(
         manager: Any,
         pinned_doc: list[Any],
         *,
+        report: ImportReport,
         added_pinned_ids: list[int],
         next_pinned_id: int,
 ) -> int:
-    """Add document pinned tabs, silently skipping URL collisions."""
+    """Add document pinned tabs, counting URL collisions in *report*.
+
+    Pinned tabs are profile-scoped and have no groups, so the whole pinned
+    list of the profile is the de-duplication scope.
+    """
     for pinned_entry in pinned_doc:
         pinned_entry = _require_dict(pinned_entry, 'pinned entry')
         url = _entry_url(pinned_entry)
         if url and any(
                 _normalize_url(tab.url) == url
                 for tab in manager.list_pinned()):
-            # Pinned tabs are profile-scoped; dedup is silent.
+            report.skipped_pinned += 1
             continue
         pinned = PinnedTab(
             tab_id=next_pinned_id,
@@ -576,6 +630,7 @@ def _import_pinned_entries(
         )
         manager.add_pinned(pinned)
         added_pinned_ids.append(pinned.tab_id)
+        report.added_pinned += 1
         next_pinned_id += 1
     return next_pinned_id
 
@@ -619,6 +674,9 @@ def import_from_path(path: Path) -> ImportReport:
     added_pinned_ids: list[int] = []
     # source tab_id -> (workspace containing the new local tab, local id)
     added_source_tabs: dict[int, tuple[uuid.UUID, int]] = {}
+    # target workspace id -> normalized URLs this document already contributed
+    # to it (used to tell a document-internal merge from a local skip).
+    seen_urls: dict[uuid.UUID, set[str]] = {}
     # (target workspace, added tab, document parent_id, source tab_id)
     pending_parents: list[
         tuple[uuid.UUID, WorkspaceTab, Any, Optional[int]]
@@ -683,6 +741,7 @@ def import_from_path(path: Path) -> ImportReport:
                         report=report,
                         added_tab_keys=added_tab_keys,
                         added_source_tabs=added_source_tabs,
+                        seen_urls=seen_urls,
                         pending_parents=pending_parents,
                         next_tab_id=next_tab_id,
                     )
@@ -697,6 +756,7 @@ def import_from_path(path: Path) -> ImportReport:
                     report=report,
                     added_tab_keys=added_tab_keys,
                     added_source_tabs=added_source_tabs,
+                    seen_urls=seen_urls,
                     pending_parents=pending_parents,
                     next_tab_id=next_tab_id,
                 )
@@ -706,6 +766,7 @@ def import_from_path(path: Path) -> ImportReport:
         _import_pinned_entries(
             manager,
             pinned_doc,
+            report=report,
             added_pinned_ids=added_pinned_ids,
             next_pinned_id=next_pinned_id,
         )

@@ -1406,10 +1406,15 @@ def vp_workspace_import(path: str = '') -> None:
     message.info(
         f"Imported: +{report.added_workspaces} workspace(s), "
         f"+{report.added_entries} entry/entries, "
+        f"merged {report.merged_entries} duplicate URL(s) "
+        f"(within the document), "
         f"skipped {report.skipped_entries} entry/entries "
-        f"(URL collision), "
+        f"(URL already present locally), "
         f"skipped {report.skipped_workspaces} workspace(s) "
         f"(id already local), "
+        f"+{report.added_pinned} pinned tab(s), "
+        f"skipped {report.skipped_pinned} pinned tab(s) "
+        f"(URL already pinned), "
         f"promoted {report.orphan_promotions} orphaned child(ren) "
         f"to top-level."
     )

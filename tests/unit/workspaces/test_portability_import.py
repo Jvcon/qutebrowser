@@ -135,9 +135,203 @@ def test_import_dedupes_entry_by_url(tmp_path, monkeypatch) -> None:
 
     workspace = manager.list_all_workspaces()[0]
     assert report.added_entries == 1
-    assert report.skipped_entries == 1
+    # The duplicate came from the same document, so it is a merge, not a
+    # skip of a pre-existing local entry (issue #49).
+    assert report.merged_entries == 1
+    assert report.skipped_entries == 0
     assert [tab.url for tab in workspace.tabs] == ['http://example.com/Path']
     assert workspace.tabs[0].group_id == uuid.UUID(group['group_id'])
+
+
+def test_import_merges_same_url_across_groups(tmp_path, monkeypatch) -> None:
+    """URL de-duplication is workspace-scoped, not group-scoped (#49)."""
+    manager = FakeManager()
+    _wire(monkeypatch, manager)
+    first_group = _group_doc(name='first', entries=[
+        _entry_doc('https://example.com/shared', title='First'),
+    ])
+    second_group = _group_doc(name='second', entries=[
+        _entry_doc('https://example.com/shared', title='Second'),
+    ])
+    path = _write(tmp_path, _document(workspaces=[_workspace_doc(
+        groups=[first_group, second_group])]))
+
+    report = portability.import_from_path(path)
+
+    workspace = manager.list_all_workspaces()[0]
+    assert [tab.url for tab in workspace.tabs] == [
+        'https://example.com/shared']
+    # First occurrence wins: the entry keeps the first group it appeared in.
+    assert workspace.tabs[0].group_id == uuid.UUID(first_group['group_id'])
+    assert workspace.tabs[0].title == 'First'
+    assert report.added_entries == 1
+    assert report.merged_entries == 1
+    assert report.skipped_entries == 0
+
+
+def test_import_merges_group_entry_into_standalone_entry(
+        tmp_path, monkeypatch) -> None:
+    """Groups are imported before standalone entries, so the group wins."""
+    manager = FakeManager()
+    _wire(monkeypatch, manager)
+    group = _group_doc(entries=[
+        _entry_doc('https://example.com/shared', title='Grouped'),
+    ])
+    path = _write(tmp_path, _document(workspaces=[_workspace_doc(
+        groups=[group],
+        entries=[_entry_doc('https://example.com/shared', title='Standalone')],
+    )]))
+
+    report = portability.import_from_path(path)
+
+    workspace = manager.list_all_workspaces()[0]
+    assert len(workspace.tabs) == 1
+    assert workspace.tabs[0].group_id == uuid.UUID(group['group_id'])
+    assert report.merged_entries == 1
+
+
+def test_import_skips_local_url_from_another_group(
+        tmp_path, monkeypatch) -> None:
+    """A local URL in a different group must be skipped, not duplicated."""
+    manager = FakeManager()
+    _wire(monkeypatch, manager)
+    local_workspace = manager.add_workspace('local')
+    local_group_a = manager.create_group(local_workspace.id, 'a')
+    local_group_b = manager.create_group(local_workspace.id, 'b')
+    manager.add_tab(local_workspace.id, WorkspaceTab(
+        tab_id=1,
+        group_id=local_group_a.group_id,
+        url='https://example.com/shared',
+        title='Local',
+    ))
+    # The document's group reuses the *other* local group, so the entry
+    # targets the local workspace and collides with group a's entry.
+    imported_group = _group_doc(
+        group_id=local_group_b.group_id,
+        name='b',
+        entries=[_entry_doc('https://example.com/shared', title='Imported')],
+    )
+    path = _write(tmp_path, _document(
+        workspaces=[_workspace_doc(groups=[imported_group])]))
+
+    report = portability.import_from_path(path)
+
+    matching = [tab for tab in local_workspace.tabs
+                if tab.url == 'https://example.com/shared']
+    assert len(matching) == 1
+    assert matching[0].tab_id == 1
+    assert matching[0].group_id == local_group_a.group_id
+    assert matching[0].title == 'Local'
+    assert report.added_entries == 0
+    assert report.merged_entries == 0
+    assert report.skipped_entries == 1
+
+
+def test_import_report_separates_merge_from_local_skip(
+        tmp_path, monkeypatch) -> None:
+    manager = FakeManager()
+    _wire(monkeypatch, manager)
+    local_workspace = manager.add_workspace('local')
+    local_group = manager.create_group(local_workspace.id, 'local')
+    manager.add_tab(local_workspace.id, WorkspaceTab(
+        tab_id=1,
+        group_id=local_group.group_id,
+        url='https://example.com/local',
+        title='Local',
+    ))
+    # Group id reuses the local group so the entries target the local
+    # workspace: one local collision, one new entry and two in-document
+    # duplicates.
+    imported_group = _group_doc(
+        group_id=local_group.group_id,
+        name='local',
+        entries=[
+            _entry_doc('https://example.com/local'),
+            _entry_doc('https://example.com/new'),
+            _entry_doc('https://example.com/new'),
+            _entry_doc('https://example.com/new'),
+        ],
+    )
+    path = _write(tmp_path, _document(workspaces=[_workspace_doc(
+        groups=[imported_group])]))
+
+    report = portability.import_from_path(path)
+
+    assert report.added_entries == 1
+    assert report.skipped_entries == 1
+    assert report.merged_entries == 2
+    assert report.total_collapsed_entries == 3
+    assert sorted(tab.url for tab in local_workspace.tabs) == [
+        'https://example.com/local', 'https://example.com/new']
+
+
+def test_import_keeps_same_url_in_different_workspaces(
+        tmp_path, monkeypatch) -> None:
+    """Workspace-level dedup must not merge across document workspaces."""
+    manager = FakeManager()
+    _wire(monkeypatch, manager)
+    first = _workspace_doc(name='first', groups=[_group_doc(
+        entries=[_entry_doc('https://example.com/shared')])])
+    second = _workspace_doc(name='second', groups=[_group_doc(
+        entries=[_entry_doc('https://example.com/shared')])])
+    path = _write(tmp_path, _document(workspaces=[first, second]))
+
+    report = portability.import_from_path(path)
+
+    assert report.added_workspaces == 2
+    assert report.added_entries == 2
+    assert report.merged_entries == 0
+    assert report.skipped_entries == 0
+
+
+def test_import_merged_entry_is_parent_target(tmp_path, monkeypatch) -> None:
+    """``parent_id`` of a merged duplicate resolves to the surviving entry."""
+    manager = FakeManager()
+    _wire(monkeypatch, manager)
+    parent_url = 'https://example.com/parent'
+    first_group = _group_doc(name='first', entries=[
+        _entry_doc(parent_url, tab_id=1, title='Parent'),
+    ])
+    second_group = _group_doc(name='second', entries=[
+        _entry_doc(parent_url, tab_id=2, title='Duplicate parent'),
+        _entry_doc('https://example.com/child', tab_id=3, parent_id=2),
+    ])
+    path = _write(tmp_path, _document(workspaces=[_workspace_doc(
+        groups=[first_group, second_group])]))
+
+    report = portability.import_from_path(path)
+
+    workspace = manager.list_all_workspaces()[0]
+    parents = [tab for tab in workspace.tabs if tab.url == parent_url]
+    children = [tab for tab in workspace.tabs
+                if tab.url == 'https://example.com/child']
+    assert len(parents) == 1
+    assert len(children) == 1
+    assert children[0].parent_id == parents[0].tab_id
+    assert report.added_entries == 2
+    assert report.merged_entries == 1
+    assert report.orphan_promotions == 0
+
+
+def test_import_pinned_report_counts_added_and_skipped(
+        tmp_path, monkeypatch) -> None:
+    manager = FakeManager()
+    _wire(monkeypatch, manager)
+    pinned = [
+        {'title': 'Pinned', 'url': 'https://example.com/pinned'},
+        {'title': 'Pinned duplicate',
+         'url': '  HTTPS://Example.com/pinned'},
+    ]
+    path = _write(tmp_path, _document(pinned=pinned))
+
+    first = portability.import_from_path(path)
+    second = portability.import_from_path(path)
+
+    assert first.added_pinned == 1
+    assert first.skipped_pinned == 1
+    assert second.added_pinned == 0
+    assert second.skipped_pinned == 2
+    assert len(manager.list_pinned()) == 1
 
 
 def test_import_promotes_orphan_parent_to_top_level(
@@ -387,3 +581,111 @@ def test_import_null_workspace_created_at_stamps_now(
     loaded = manager.list_all_workspaces()[0]
     assert loaded.created_at is not None
     datetime.datetime.fromisoformat(loaded.created_at)
+
+
+class TestRealManager:
+    """End-to-end import against the real manager, not the FakeManager.
+
+    Every other test in this module drives ``test_commands.FakeManager``,
+    which mirrors the manager API but does not run ``add_tab`` /
+    ``create_group`` / ``set_parent`` for real and never touches YAML.
+    These tests close that gap for the workspace-scoped URL de-duplication
+    introduced by issue #49: the merged state must survive
+    ``save()``/``load()`` through the real persistence layer.
+    """
+
+    @staticmethod
+    def _manager(tmp_path):
+        from qutebrowser.workspaces.manager import WorkspaceManager
+        from qutebrowser.workspaces.persistence import (
+            PinnedPersistence, WorkspacePersistence)
+
+        manager = WorkspaceManager(
+            WorkspacePersistence(base_path=tmp_path / 'workspaces'),
+            PinnedPersistence(path=tmp_path / 'profile' / 'pinned.yml'))
+        manager.load()
+        return manager
+
+    @staticmethod
+    def _reloaded(tmp_path):
+        """Re-read the workspace state from disk, like a restart would."""
+        from qutebrowser.workspaces.manager import WorkspaceManager
+        from qutebrowser.workspaces.persistence import (
+            PinnedPersistence, WorkspacePersistence)
+
+        manager = WorkspaceManager(
+            WorkspacePersistence(base_path=tmp_path / 'workspaces'),
+            PinnedPersistence(path=tmp_path / 'profile' / 'pinned.yml'))
+        manager.load()
+        return manager
+
+    def test_cross_group_dedup_survives_a_restart(
+            self, tmp_path, monkeypatch) -> None:
+        manager = self._manager(tmp_path)
+        monkeypatch.setattr(portability, '_manager', lambda: manager)
+        first = _group_doc(name='first', entries=[
+            _entry_doc('https://example.com/shared', title='First')])
+        second = _group_doc(name='second', entries=[
+            _entry_doc('https://example.com/shared', title='Second')])
+        path = _write(tmp_path, _document(workspaces=[_workspace_doc(
+            groups=[first, second])]))
+
+        report = portability.import_from_path(path)
+        manager.save()
+
+        assert report.added_entries == 1
+        assert report.merged_entries == 1
+        assert report.skipped_entries == 0
+
+        workspace = manager.list_all_workspaces()[0]
+        assert [tab.url for tab in workspace.tabs] == [
+            'https://example.com/shared']
+        assert workspace.tabs[0].group_id == uuid.UUID(first['group_id'])
+
+        # The de-duplicated state must be what a restart reads back, not
+        # just what the in-memory model holds.
+        restarted = self._reloaded(tmp_path)
+        reloaded = restarted.list_all_workspaces()[0]
+        assert [tab.url for tab in reloaded.tabs] == [
+            'https://example.com/shared']
+        assert reloaded.tabs[0].group_id == uuid.UUID(first['group_id'])
+        assert reloaded.tabs[0].title == 'First'
+
+    def test_local_entry_in_a_reused_group_is_skipped(
+            self, tmp_path, monkeypatch) -> None:
+        """A pre-existing local entry wins, even when it is in another group.
+
+        ``groups_by_id`` is pre-populated from every local group
+        (``portability.py:661-665``), so a document which reuses a
+        ``group_id`` that already exists locally adds its entries into that
+        local group. That is the one production path where a local URL
+        collision is reachable at all -- a fresh workspace has no local
+        tabs, and a local workspace id makes the whole workspace skipped.
+        """
+        manager = self._manager(tmp_path)
+        local = manager.add_workspace('local')
+        group = manager.create_group(local.id, 'reused')
+        manager.add_tab(local.id, WorkspaceTab(
+            tab_id=7, url='https://example.com/shared', title='Local'))
+        manager.move_tab_to_group(local.id, 7, group.group_id)
+        monkeypatch.setattr(portability, '_manager', lambda: manager)
+
+        # New workspace id, but the document reuses the local group id.
+        group_doc = _group_doc(group_id=group.group_id, name='reused',
+                               entries=[
+                                   _entry_doc(
+                                       'https://example.com/shared',
+                                       title='FromDocument')])
+        path = _write(tmp_path, _document(workspaces=[_workspace_doc(
+            groups=[group_doc])]))
+
+        report = portability.import_from_path(path)
+
+        assert report.added_workspaces == 1
+        assert report.added_entries == 0
+        assert report.merged_entries == 0
+        # The URL was already present locally, so it is a skip, not a merge.
+        assert report.skipped_entries == 1
+
+        local_workspace = manager.get_workspace(local.id)
+        assert [tab.title for tab in local_workspace.tabs] == ['Local']
