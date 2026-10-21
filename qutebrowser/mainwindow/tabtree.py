@@ -122,6 +122,16 @@ class Status(enum.IntFlag):
     SUSPENDED = 8
 
 
+def _free_tab_id(occupied: set[int], preferred: int) -> int:
+    """Return *preferred* when free, else the smallest unused positive id."""
+    if preferred not in occupied:
+        return preferred
+    candidate = 1
+    while candidate in occupied:
+        candidate += 1
+    return candidate
+
+
 #: Constant group-row role values (everything not derived from live state).
 _GROUP_STATIC_ROLES = {
     KindRole: Kind.Group,
@@ -772,6 +782,21 @@ class TabTreeModel(QAbstractItemModel):
             None,
         )
 
+    @staticmethod
+    def _has_live_tab(url: str) -> bool:
+        """Return whether a live browser tab currently shows *url*.
+
+        Reuses the bridge's window-registry scan so a pinned drop agrees with
+        what :func:`qutebrowser.mainwindow.workspacebridge.reopen_tab` treats
+        as live.  The import is local because ``workspacebridge`` imports
+        this module at load time.
+        """
+        if not url:
+            return False
+        from qutebrowser.mainwindow.workspacebridge import (
+            _find_live_tab_by_url)
+        return _find_live_tab_by_url(url) is not None
+
     def _drop_target_group(
             self,
             index: QModelIndex,
@@ -861,15 +886,27 @@ class TabTreeModel(QAbstractItemModel):
             base64.b64encode(pinned.favicon).decode('ascii')
             if pinned.favicon else None
         )
+        # A pinned entry can outlive its browser tab (for example after a
+        # restart, when only ``pinned.yml`` remembers it).  Never fabricate
+        # an OPEN row: with no live tab the entry is stored SUSPENDED and
+        # later reopens through the regular D1 path (``_activate_tab_id`` ->
+        # ``workspacebridge.reopen_tab``).  A live tab, on the other hand,
+        # means the dropped entry really is OPEN.
+        open_status = 'OPEN' if self._has_live_tab(pinned.url) else 'SUSPENDED'
+        # A pinned runtime id can collide with an existing workspace entry
+        # (e.g. after an import).  ``add_tab`` does not reject duplicates, so
+        # pick a genuinely free id rather than putting two rows under one id.
+        occupied = {tab.tab_id for tab in workspace.tabs}
+        tab_id = _free_tab_id(occupied, pinned.tab_id)
         entry = WorkspaceTab(
-            tab_id=pinned.tab_id,
+            tab_id=tab_id,
             parent_id=parent_tab_id,
             group_id=group_id,
             title=pinned.title,
             url=pinned.url,
             source=QUrl(pinned.url).host().lower(),
             favicon=favicon,
-            open_status='OPEN',
+            open_status=open_status,
         )
         # Unpin first, then add the regular entry.  Both calls emit
         # ``changed``; the target ids above survive the intermediate reset.

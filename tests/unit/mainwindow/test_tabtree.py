@@ -33,7 +33,7 @@ from qutebrowser.qt.widgets import (
     QTreeView,
 )
 
-from qutebrowser.mainwindow import tabtree
+from qutebrowser.mainwindow import tabtree, workspacebridge
 from qutebrowser.mainwindow.pinpanel import PINNED_TAB_MIME
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
@@ -1325,6 +1325,51 @@ class TestPinnedDrop:
 
         assert not tree.model().canDropMimeData(
             mime, Qt.DropAction.CopyAction, -1, -1, QModelIndex())
+
+    def test_drop_without_live_tab_is_suspended(
+            self, drop_setup, monkeypatch):
+        """A pinned entry with no live tab must not become a fake OPEN row."""
+        tree, _manager, workspace = drop_setup
+        monkeypatch.setattr(
+            workspacebridge, '_find_live_tab_by_url', lambda url: None)
+
+        assert tree.model().dropMimeData(
+            self._mime(), Qt.DropAction.CopyAction, -1, -1, QModelIndex())
+
+        entry = next(tab for tab in workspace.tabs if tab.tab_id == 99)
+        assert entry.open_status == 'SUSPENDED'
+
+    def test_drop_with_live_tab_is_open(self, drop_setup, monkeypatch):
+        """A pinned entry backed by a live tab stays OPEN after the drop."""
+        tree, _manager, workspace = drop_setup
+        monkeypatch.setattr(
+            workspacebridge, '_find_live_tab_by_url',
+            lambda url: (0, object(), object()))
+
+        assert tree.model().dropMimeData(
+            self._mime(), Qt.DropAction.CopyAction, -1, -1, QModelIndex())
+
+        entry = next(tab for tab in workspace.tabs if tab.tab_id == 99)
+        assert entry.open_status == 'OPEN'
+
+    def test_drop_with_colliding_tab_id_uses_free_id(
+            self, drop_setup, monkeypatch):
+        """A drop must not put two workspace rows under the same tab id."""
+        tree, _manager, workspace = drop_setup
+        workspace.tabs.append(WorkspaceTab(
+            tab_id=99, url='https://other.example/', open_status='OPEN'))
+        monkeypatch.setattr(
+            workspacebridge, '_find_live_tab_by_url', lambda url: None)
+
+        assert tree.model().dropMimeData(
+            self._mime(), Qt.DropAction.CopyAction, -1, -1, QModelIndex())
+
+        tab_ids = [tab.tab_id for tab in workspace.tabs]
+        assert len(tab_ids) == len(set(tab_ids))
+        dropped = next(
+            tab for tab in workspace.tabs
+            if tab.url == 'https://example.com/')
+        assert dropped.tab_id != 99
 
     def test_drop_target_role_highlights_row(self, drop_setup):
         tree, _manager, _workspace = drop_setup

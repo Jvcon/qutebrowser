@@ -71,10 +71,12 @@ from qutebrowser.mainwindow.tabtree import Status, TabTreeModel
 from qutebrowser.utils import log, objreg, qtutils
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import WorkspaceManager
-from qutebrowser.workspaces.model import Group, Workspace, WorkspaceTab
+from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
+                                          WorkspaceTab)
 
 if TYPE_CHECKING:
     from qutebrowser.browser.browsertab import AbstractTab
+    from qutebrowser.mainwindow.pinpanel import PINPanel
     from qutebrowser.mainwindow.tabbedbrowser import TabbedBrowser
     from qutebrowser.mainwindow.tabtree import TabTree
     from qutebrowser.qt.gui import QIcon
@@ -380,6 +382,8 @@ class WorkspaceBridge(QObject):
         _model: The tab tree model to feed display data, or None.
         _tab_tree: The TabTree host used for auto-locate on tab switch, or
             None when the bridge was built without one.
+        _pin_panel: The VerticalPanel's PIN panel, when available; its
+            ``activated`` / ``unpinned`` signals are wired to this bridge.
         _tab_index: ``QTabWidget`` index -> ``tab.tab_id`` cache.
         _tab_state: ``tab.tab_id`` -> :class:`_TabState`.
         _attached: ``tab_id`` set of tabs whose signals are already wired.
@@ -395,6 +399,7 @@ class WorkspaceBridge(QObject):
             model: Optional[TabTreeModel],
             *,
             tab_tree: Optional[TabTree] = None,
+            pin_panel: Optional[PINPanel] = None,
             win_id: int = 0,
             parent: Optional[QWidget] = None,
             description_fetcher: Callable[..., None] | None = None,
@@ -422,8 +427,20 @@ class WorkspaceBridge(QObject):
         self.ignore_button: Optional[QPushButton] = None
         self._panel: Optional[QWidget] = (
             tab_tree.parentWidget() if tab_tree is not None else None)
+        self._pin_panel = pin_panel
+        if self._pin_panel is None and self._panel is not None:
+            # VerticalPanel owns the PIN panel; discover it through the
+            # TabTree's parent so no constructor change is needed in
+            # MainWindow.
+            self._pin_panel = getattr(self._panel, 'pin_panel', None)
         self._description_fetcher = (
             description_fetcher or tabentry_fetch.fetch_description)
+
+        # The PIN panel's signals must be wired even when the tab surface is
+        # unavailable, so connect before the inert-model early return.
+        if self._pin_panel is not None:
+            self._pin_panel.activated.connect(self._on_pin_activated)
+            self._pin_panel.unpinned.connect(self._on_pin_unpinned)
 
         if manager is None or model is None:
             # Tolerate headless / no-workspace startup: stay inert so the
@@ -1012,6 +1029,97 @@ class WorkspaceBridge(QObject):
         # ``PinStateRole`` bit directly so the row repaints even if this tab
         # is not (yet) attached to the per-tab signal pipeline.
         self._model.set_tab_pinned(tab_id, new_state)
+
+    # --- PIN panel -> browser direction ---
+
+    def _ensure_pin_entry(
+            self,
+            pinned: PinnedTab,
+    ) -> Optional[WorkspaceTab]:
+        """Return a workspace entry for *pinned*, creating a SUSPENDED one.
+
+        PIN-panel entries live outside the workspace (``pintab-add`` removes
+        their workspace row), so activating one may need to materialise the
+        entry again.  The returned entry is deliberately SUSPENDED: the
+        caller then hands it to :func:`reopen_tab`, which flips it to OPEN
+        once a live tab exists.
+
+        Returns ``None`` when the pinned runtime id is already taken by a
+        different workspace entry.  Fabricating a sentinel id would put two
+        entries under the same id (``add_tab`` does not guard against
+        duplicates), so that genuinely odd state is left to the canonical
+        ``_on_new_tab`` pipeline instead; see :meth:`_on_pin_activated`.
+        """
+        if self._manager is None:
+            return None
+        workspace_id = self._active_workspace_id()
+        if workspace_id is None:
+            workspace_id = self._ensure_active_workspace()
+        if workspace_id is None:
+            return None
+        entry = self._manager.find_tab_by_url(
+            workspace_id, pinned.url)
+        if entry is not None:
+            return entry
+
+        workspace = self._manager.get_workspace(workspace_id)
+        occupied = (
+            {tab.tab_id for tab in workspace.tabs} if workspace else set())
+        if pinned.tab_id in occupied:
+            log.workspaces.debug(
+                "_ensure_pin_entry: tab id %s is already in use for a "
+                "different URL; not fabricating an entry", pinned.tab_id)
+            return None
+        entry = WorkspaceTab(
+            tab_id=pinned.tab_id,
+            title=pinned.title,
+            url=pinned.url,
+            source=QUrl(pinned.url).host().lower(),
+            open_status='SUSPENDED',
+        )
+        self._manager.add_tab(workspace_id, entry)
+        return entry
+
+    def _on_pin_activated(self, pinned: PinnedTab) -> None:
+        """Focus or reopen the tab behind a PIN-panel left-click.
+
+        A live same-URL tab is focused and the entry is marked OPEN by
+        :func:`reopen_tab`; otherwise that helper opens the URL.  This is
+        the same reopen path used for a SUSPENDED tree row in
+        :meth:`_activate_tab_id`, so the PIN panel and a pinned drop behave
+        identically.
+
+        When the pinned id collides with a different workspace entry,
+        :meth:`_ensure_pin_entry` declines to create a row.  A transient
+        (unregistered) entry is then passed to the same reopen helper: a
+        new tab's real runtime id comes from the canonical ``_on_new_tab``
+        pipeline, so no duplicate or sentinel id ever reaches the workspace.
+        """
+        if not pinned.url:
+            return
+        entry = self._ensure_pin_entry(pinned)
+        if entry is not None:
+            reopen_tab(entry, win_id=self._win_id)
+            return
+        transient = WorkspaceTab(
+            tab_id=pinned.tab_id,
+            title=pinned.title,
+            url=pinned.url,
+            source=QUrl(pinned.url).host().lower(),
+            open_status='SUSPENDED',
+        )
+        _reopen_single_tab(None, transient, win_id=self._win_id)
+
+    def _on_pin_unpinned(self, tab_id: int) -> None:
+        """Drop a PIN-panel entry without closing the underlying tab.
+
+        ``remove_pinned`` emits ``pinned_changed``, which refreshes the PIN
+        panel (and collapses it when the list becomes empty).  The browser
+        tab and its workspace row are intentionally left untouched.
+        """
+        if self._manager is None:
+            return
+        self._manager.remove_pinned(tab_id)
 
     def _register_tab(
             self,

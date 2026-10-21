@@ -13,9 +13,9 @@ import pytest
 from qutebrowser.qt.core import QModelIndex, QObject, Qt, QUrl, pyqtSignal
 from qutebrowser.qt.gui import QIcon, QPixmap
 
-from qutebrowser.mainwindow import tabtree, workspacebridge
+from qutebrowser.mainwindow import pinpanel, tabtree, workspacebridge
 from qutebrowser.workspaces.manager import WorkspaceManager
-from qutebrowser.workspaces.model import WorkspaceTab
+from qutebrowser.workspaces.model import PinnedTab, WorkspaceTab
 
 
 class MockAudio(QObject):
@@ -1105,6 +1105,105 @@ class TestBridgeSuspendedActivation:
         assert calls == [(entry, 0)]
         assert browser.widget.currentWidget() is live
         assert live._focused is True
+
+
+class TestPinPanelWiring:
+
+    """The PIN panel's ``activated`` / ``unpinned`` signals are wired (#47)."""
+
+    @pytest.fixture
+    def pin_setup(
+            self, browser, manager, model, config_stub, qtbot):
+        config_stub.val.pinned_tabs.style = 'line'
+        panel = pinpanel.PINPanel(win_id=0, manager=manager)
+        qtbot.add_widget(panel)
+        bridge = workspacebridge.WorkspaceBridge(
+            browser, manager, model, pin_panel=panel)
+        pinned = PinnedTab(
+            tab_id=3, title='Pinned', url='https://example.com/')
+        manager.add_pinned(pinned)
+        return bridge, panel, manager, pinned
+
+    def test_activated_opens_suspended_entry_via_reopen(
+            self, pin_setup, monkeypatch):
+        """Left-click reuses the D4 reopen path, creating a SUSPENDED entry."""
+        bridge, panel, manager, pinned = pin_setup
+        calls = []
+
+        def fake_reopen(entry, *, win_id=0):
+            calls.append((entry, win_id))
+            return None
+
+        monkeypatch.setattr(workspacebridge, 'reopen_tab', fake_reopen)
+
+        panel.activated.emit(pinned)
+
+        assert len(calls) == 1
+        entry, win_id = calls[0]
+        assert win_id == 0
+        assert entry.url == pinned.url
+        assert entry.open_status == 'SUSPENDED'
+        workspace = bridge._manager.get_active()
+        assert entry in workspace.tabs
+
+    def test_activated_reuses_existing_workspace_entry(
+            self, pin_setup, monkeypatch):
+        """An existing entry with the same URL is reused, not duplicated."""
+        bridge, panel, manager, pinned = pin_setup
+        workspace = manager.get_active() or manager.add_workspace('ws')
+        existing = WorkspaceTab(
+            tab_id=10, url=pinned.url, open_status='SUSPENDED')
+        manager.add_tab(workspace.id, existing)
+        calls = []
+        monkeypatch.setattr(
+            workspacebridge, 'reopen_tab',
+            lambda entry, *, win_id=0: calls.append(entry))
+
+        panel.activated.emit(pinned)
+
+        assert calls == [existing]
+        assert [tab.tab_id for tab in workspace.tabs].count(10) == 1
+
+    def test_activated_colliding_id_does_not_fabricate_entry(
+            self, pin_setup, monkeypatch):
+        """A pinned id already in use must not create a duplicate row."""
+        bridge, panel, manager, pinned = pin_setup
+        workspace = manager.get_active() or manager.add_workspace('ws')
+        manager.add_tab(workspace.id, WorkspaceTab(
+            tab_id=pinned.tab_id,
+            url='https://other.example/',
+            open_status='OPEN',
+        ))
+        reopened = []
+        monkeypatch.setattr(
+            workspacebridge, '_reopen_single_tab',
+            lambda ws, entry, *, win_id=0: reopened.append((ws, entry)))
+
+        panel.activated.emit(pinned)
+
+        # No fabricated entry: the canonical _on_new_tab pipeline owns the
+        # real runtime id.  The transient reopen entry is not stored.
+        assert [tab.tab_id for tab in workspace.tabs] == [pinned.tab_id]
+        assert len(reopened) == 1
+        assert reopened[0][0] is None
+        assert reopened[0][1].tab_id == pinned.tab_id
+        assert reopened[0][1].url == pinned.url
+
+    def test_unpinned_removes_pin_without_closing_tab(
+            self, browser, pin_setup):
+        """Middle-click unpins and refreshes the panel, keeping the tab."""
+        bridge, panel, manager, pinned = pin_setup
+        live = MockTab(3, url=QUrl('https://example.com/'))
+        _open_tab(browser, live)
+
+        panel.unpinned.emit(pinned.tab_id)
+
+        assert manager.list_pinned() == []
+        assert browser.widget.count() == 1
+        assert browser.widget.currentWidget() is live
+        # The panel refreshes from ``pinned_changed`` and collapses when
+        # the last pinned entry is gone.
+        assert panel.isHidden()
 
 
 def _stale_group(manager, name='stale', days_ago=10):

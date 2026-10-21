@@ -930,7 +930,11 @@ class TestPintabCommands:
 
         entries = [tab for tab in workspace.tabs if tab.tab_id == 1]
         assert len(entries) == 1
-        assert entries[0].open_status == 'OPEN'
+        # No live browser tab backs this entry in this unit test, so the drop
+        # must store it SUSPENDED rather than fabricate an OPEN row (issue
+        # #47). The OPEN case is covered against a live tab in
+        # tests/unit/mainwindow/test_tabtree.py.
+        assert entries[0].open_status == 'SUSPENDED'
         assert fake_manager.list_pinned() == []
 
     def test_remove_unpins_without_restoring_workspace_entry(
