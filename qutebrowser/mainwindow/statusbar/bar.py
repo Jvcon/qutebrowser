@@ -177,6 +177,26 @@ class StatusBar(QWidget):
         self.txt = textbase.TextBase()
         self._stack.addWidget(self.txt)
 
+        # Active workspace name (issue #5). This is intentionally a plain,
+        # always-present label rather than a new `statusbar.widgets` entry:
+        # the workspace is context for every page, not an optional segment.
+        self.workspace = textbase.TextBase()
+        self.workspace.setObjectName('statusbar-workspace')
+        self._hbox.addWidget(self.workspace)
+        self._workspace_manager = None
+        try:
+            self._workspace_manager = objreg.get('workspace-manager')
+        except (KeyError, objreg.RegistryUnavailableError):
+            pass
+        if self._workspace_manager is None:
+            self.workspace.hide()
+        else:
+            self._workspace_manager.changed.connect(
+                self._update_workspace_text)
+            self._workspace_manager.active_workspace_changed.connect(
+                self._update_workspace_text)
+            self._update_workspace_text()
+
         self.cmd.show_cmd.connect(self._show_cmd_widget)
         self.cmd.hide_cmd.connect(self._hide_cmd_widget)
         self._hide_cmd_widget()
@@ -381,6 +401,18 @@ class StatusBar(QWidget):
         """Set a normal (persistent) text in the status bar."""
         log.message.debug(text)
         self.txt.setText(text)
+
+    def _update_workspace_text(self, *_args):
+        """Show the active workspace name next to the URL (issue #5)."""
+        if self._workspace_manager is None:
+            return
+        workspace = self._workspace_manager.get_active()
+        if workspace is None:
+            self.workspace.setText('')
+            self.workspace.hide()
+            return
+        self.workspace.setText(workspace.name)
+        self.workspace.show()
 
     @pyqtSlot(usertypes.KeyMode)
     def on_mode_entered(self, mode):

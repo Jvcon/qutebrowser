@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from qutebrowser.api import cmdutils
 from qutebrowser.config import config
-from qutebrowser.utils import message, objreg, standarddir
+from qutebrowser.utils import log, message, objreg, standarddir
 from qutebrowser.utils.utils import format_size
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import (READING_STATUSES, TabMetadata,
@@ -1077,8 +1077,14 @@ def workspace_switch(name: str) -> None:
     workspace = _lookup(name, manager)
     active = manager.get_active()
     if active is not None and active.id == workspace.id:
+        # Cheap path: the manager also short-circuits, but returning here
+        # avoids re-stamping last_active / rewriting _state.yml.
+        log.workspaces.debug(
+            "workspace-switch: %r is already active", workspace.name)
         message.info(f"Already on workspace '{workspace.name}'.")
         return
+    # The manager owns the whole switch: tree/model rebuild (via ``changed``)
+    # and focus/scroll restore (via ``active_workspace_changed``).
     manager.set_active(workspace.id)
     message.info(f"Switched to workspace '{workspace.name}'.")
 

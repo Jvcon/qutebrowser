@@ -433,6 +433,13 @@ class WorkspaceBridge(QObject):
         tabbed_browser.new_tab.connect(self._on_new_tab)
         tabbed_browser.current_tab_changed.connect(
             self._on_current_tab_changed)
+        # A workspace switch rebuilds the tab surface through the manager's
+        # ``changed`` signal (TabTree/WorkspaceIndicator) and then asks us to
+        # restore the target workspace's last-active tab. Both signals are
+        # synchronous, so by the time this slot runs the model already shows
+        # the new workspace.
+        manager.active_workspace_changed.connect(
+            self._on_active_workspace_changed)
         removed = getattr(tabbed_browser.widget, 'tabRemoved', None)
         if removed is not None and hasattr(removed, 'connect'):
             # Only true signals can be connected; the real QTabWidget's
@@ -456,6 +463,11 @@ class WorkspaceBridge(QObject):
         self._sync_existing_tabs()
         self._sync_active_tab()
         QTimer.singleShot(0, self._sync_existing_tabs)
+        # Cold-restart restore: the manager has already read _state.yml, so
+        # once the initial tabs are registered, jump to the active
+        # workspace's persisted last-active tab. Deferred so startup is never
+        # blocked on tab / session restoration.
+        QTimer.singleShot(0, self.restore_active_workspace)
         QTimer.singleShot(0, self.refresh_suggestions)
 
     # --- registration ---
@@ -674,10 +686,19 @@ class WorkspaceBridge(QObject):
         Besides updating the active row it also asks the tree to auto-locate
         the newly focused tab (VP-D5): expand and scroll its group, then
         briefly highlight the tab.
+
+        This is the canonical record site for the per-workspace
+        last-active-tab map: every focus event updates the manager's
+        in-memory cache (no disk I/O) so a later workspace switch can restore
+        the tab the user was last on.
         """
         if self._model is None or sip.isdeleted(self._model):
             return
         new_id = tab.tab_id
+        workspace_id = self._active_workspace_id()
+        if workspace_id is not None:
+            self._manager.record_active_tab(  # type: ignore[union-attr]
+                new_id, workspace_id)
         current_id = self._model.active_tab_id()
         if new_id == current_id:
             # Guard against the feedback loop from a tree-driven switch.
@@ -685,6 +706,184 @@ class WorkspaceBridge(QObject):
         self._previous_active_tab_id = current_id
         self._model.set_active_tab_id(new_id)
         self._auto_locate(tab)
+
+    # --- workspace switch / focus restore ---
+
+    def restore_active_workspace(self) -> None:
+        """Restore the active workspace's persisted last-active tab.
+
+        Called once after start-up (deferred by ``QTimer.singleShot``) by
+        :meth:`__init__`, after the manager has loaded ``_state.yml``. This
+        is the cold-restart half of issue #5; it never blocks startup
+        because the restore itself is just a tab focus.
+        """
+        if self._manager is None or self._model is None:
+            return
+        workspace = self._manager.get_active()
+        if workspace is None:
+            return
+        restored_tab_id = self._manager.tab_id_for_workspace(workspace.id)
+        tab = self._resolve_restore_tab(workspace.id, restored_tab_id)
+        if tab is None:
+            return
+        self._focus_restored_tab(workspace.id, tab)
+
+    def _on_active_workspace_changed(
+            self,
+            workspace_id: uuid.UUID,
+            restored_tab_id: Optional[int],
+    ) -> None:
+        """React to :attr:`WorkspaceManager.active_workspace_changed`.
+
+        The manager has already rebuilt the tree/model (via ``changed``), so
+        this slot only has to:
+
+        * resolve the tab to focus (saved id, then URL match, then the first
+          OPEN tab of the target workspace);
+        * reset the target tab's per-view state before focusing it so zoom /
+          scroll cannot bleed across workspaces;
+        * focus the tab, mirror the focus into the tree's active row and
+          update the recorded last-active tab.
+
+        When the workspace has no live tab, the switch still succeeds: the
+        tree shows the workspace (with its SUSPENDED entries) and no focus
+        is forced onto another workspace's tab.
+        """
+        if (self._manager is None
+                or self._model is None
+                or sip.isdeleted(self._model)):
+            return
+        tab = self._resolve_restore_tab(workspace_id, restored_tab_id)
+        if tab is None:
+            self._select_tree_tab(None)
+            return
+        self._focus_restored_tab(workspace_id, tab)
+
+    def _focus_restored_tab(
+            self,
+            workspace_id: uuid.UUID,
+            tab: AbstractTab,
+    ) -> None:
+        """Focus *tab* and mirror that into the model / tree."""
+        self._reset_view_state(tab)
+        self._browser.widget.setCurrentWidget(tab)
+        try:
+            tab.setFocus(Qt.FocusReason.TabFocusReason)
+        except (AttributeError, RuntimeError):  # pragma: no cover - defensive
+            pass
+        self._model.set_active_tab_id(tab.tab_id)  # type: ignore[union-attr]
+        if self._manager is not None:
+            self._manager.record_active_tab(tab.tab_id, workspace_id)
+        self._select_tree_tab(tab.tab_id)
+        log.workspaces.debug(
+            "workspace switch: focused tab %s in workspace %s",
+            tab.tab_id, workspace_id)
+
+    def _resolve_restore_tab(
+            self,
+            workspace_id: uuid.UUID,
+            restored_tab_id: Optional[int],
+    ) -> Optional[AbstractTab]:
+        """Return the live tab to focus for *workspace_id*.
+
+        Fallback chain (documented because cold restarts cannot rely on
+        runtime tab ids being stable):
+
+        1. the live tab whose id equals ``restored_tab_id``;
+        2. the live tab whose URL equals the saved entry's URL (covers a
+           restored session where tab ids were reassigned);
+        3. the first OPEN entry of the workspace which still has a live tab;
+        4. ``None`` -- the caller leaves the browser focused where it is.
+
+        Note that the brief mentions a "last-active group" fallback; groups
+        do not pin a single tab, so the first OPEN member is the meaningful
+        equivalent here.
+        """
+        if self._manager is None:
+            return None
+        live_tabs = self._live_tabs()
+
+        if restored_tab_id is not None:
+            tab = live_tabs.get(restored_tab_id)
+            if tab is not None:
+                return tab
+            entry = self._manager.find_tab_by_id(
+                workspace_id, restored_tab_id)
+            if entry is not None and entry.url:
+                for tab in live_tabs.values():
+                    if self._live_url(tab) == entry.url:
+                        return tab
+
+        workspace = self._manager.get_workspace(workspace_id)
+        if workspace is None:
+            return None
+        for entry in workspace.tabs:
+            if entry.open_status != 'OPEN':
+                continue
+            tab = live_tabs.get(entry.tab_id)
+            if tab is not None:
+                return tab
+        return None
+
+    def _live_tabs(self) -> dict[int, AbstractTab]:
+        """Return every live tab keyed by tab id.
+
+        Merges the per-window registry with the ``QTabWidget`` contents so
+        the bridge also works in tests / embedders which do not populate the
+        registry.
+        """
+        tabs: dict[int, AbstractTab] = dict(self._tab_registry())
+        widget = self._browser.widget
+        try:
+            count = widget.count()
+        except (AttributeError, TypeError):  # pragma: no cover - defensive
+            return tabs
+        for idx in range(count):
+            tab = widget.widget(idx)
+            tab_id = getattr(tab, 'tab_id', None)
+            if tab is not None and tab_id is not None:
+                tabs.setdefault(tab_id, cast('AbstractTab', tab))
+        return tabs
+
+    @staticmethod
+    def _reset_view_state(tab: AbstractTab) -> None:
+        """Reapply *tab*'s own zoom and reset its scroll position.
+
+        Zoom and scroll are per-tab state, so switching to a different tab
+        already avoids inheriting the previous workspace's values. We still
+        reapply the target's zoom factor and jump its scroller back to the
+        top: the switch is a fresh workspace entry, and any stale scroll
+        offset from a recycled/reopened view must not leak in.
+        """
+        zoom = getattr(tab, 'zoom', None)
+        reapply = getattr(zoom, 'reapply', None)
+        if callable(reapply):
+            try:
+                reapply()
+            except Exception as e:  # noqa: BLE001 - best-effort view reset
+                log.workspaces.debug(
+                    "workspace switch: zoom reset failed: %s", e)
+        scroller = getattr(tab, 'scroller', None)
+        to_perc = getattr(scroller, 'to_perc', None)
+        if callable(to_perc):
+            try:
+                to_perc(0, 0)
+            except Exception as e:  # noqa: BLE001 - best-effort view reset
+                log.workspaces.debug(
+                    "workspace switch: scroll reset failed: %s", e)
+
+    def _select_tree_tab(self, tab_id: Optional[int]) -> None:
+        """Point the TreeView's current row at *tab_id* (or clear it)."""
+        if self._tab_tree is None or self._model is None:
+            return
+        view = self._tab_tree.view()
+        if tab_id is None:
+            view.setCurrentIndex(QModelIndex())
+            return
+        index = self._model.index_for_tab_id(tab_id)
+        if index.isValid():
+            view.setCurrentIndex(index)
+            view.scrollTo(index)
 
     def _auto_locate(self, tab: AbstractTab) -> None:
         """Emit ``group_focus_requested`` for the newly focused *tab*.

@@ -47,6 +47,28 @@ class MockTabData:
         self.pinned = pinned
 
 
+class MockZoom:
+
+    """Records ``reapply()`` calls made by the workspace-switch path."""
+
+    def __init__(self) -> None:
+        self.reapplied = 0
+
+    def reapply(self) -> None:
+        self.reapplied += 1
+
+
+class MockScroller:
+
+    """Records ``to_perc()`` calls made by the workspace-switch path."""
+
+    def __init__(self) -> None:
+        self.perc_calls: list[tuple[float | None, float | None]] = []
+
+    def to_perc(self, x=None, y=None) -> None:
+        self.perc_calls.append((x, y))
+
+
 class MockTab(QObject):
 
     """Minimal ``AbstractTab`` stand-in exposing the signals the bridge uses."""
@@ -73,6 +95,8 @@ class MockTab(QObject):
         self._url = url if url is not None else QUrl()
         self.data = MockTabData(pinned=pinned)
         self.audio = MockAudio()
+        self.zoom = MockZoom()
+        self.scroller = MockScroller()
         self._focused = False
 
     def title(self) -> str:
@@ -1162,3 +1186,97 @@ class TestSuggestionCard:
         ignore.assert_called_once_with(
             workspace.id, [str(group.group_id)])
         assert bridge.suggestion_card.isHidden()
+
+
+class TestActiveWorkspaceSwitch:
+
+    """Issue #5: a manager switch rebuilds the surface and restores focus."""
+
+    @staticmethod
+    def _two_workspaces(manager):
+        first = manager.add_workspace('a')
+        manager.add_tab(first.id, WorkspaceTab(
+            tab_id=1, url='https://a.example/', open_status='OPEN'))
+        second = manager.add_workspace('b')
+        manager.add_tab(second.id, WorkspaceTab(
+            tab_id=2, url='https://b.example/', open_status='OPEN'))
+        return first, second
+
+    def test_set_active_emits_signal_carried_by_bridge(
+            self, browser, manager, model, bridge):
+        first, second = self._two_workspaces(manager)
+        tab_a = MockTab(1, url=QUrl('https://a.example/'))
+        browser.widget.insert(tab_a, 0)
+        bridge._on_current_tab_changed(tab_a)
+        tab_b = MockTab(2, url=QUrl('https://b.example/'))
+        browser.widget.insert(tab_b, 1)
+
+        manager.set_active(second.id)
+
+        # B had no recorded tab yet: focus falls back to its first OPEN tab.
+        assert browser.widget.currentWidget() is tab_b
+        assert model.active_tab_id() == 2
+        assert manager.tab_id_for_workspace(second.id) == 2
+
+        manager.set_active(first.id)
+
+        assert browser.widget.currentWidget() is tab_a
+        assert model.active_tab_id() == 1
+        assert manager.tab_id_for_workspace(first.id) == 1
+
+    def test_no_state_leakage_on_switch(
+            self, browser, manager, model, bridge):
+        _first, second = self._two_workspaces(manager)
+        tab_a = MockTab(1, url=QUrl('https://a.example/'))
+        browser.widget.insert(tab_a, 0)
+        bridge._on_current_tab_changed(tab_a)
+        tab_b = MockTab(2, url=QUrl('https://b.example/'))
+        browser.widget.insert(tab_b, 1)
+
+        manager.set_active(second.id)
+        manager.set_active(manager.list_workspaces()[0].id)
+
+        assert browser.widget.currentWidget() is tab_a
+        assert model.active_tab_id() == 1
+        # Zoom is re-applied and scroll is reset on the restored tab.
+        assert tab_a.zoom.reapplied >= 1
+        assert tab_a.scroller.perc_calls
+        assert tab_a.scroller.perc_calls[-1] == (0, 0)
+
+    def test_restore_falls_back_to_url_when_tab_id_changed(
+            self, browser, manager, model, bridge):
+        """A cold start may reassign tab ids; the URL match wins."""
+        first = manager.add_workspace('a')
+        manager.add_tab(first.id, WorkspaceTab(
+            tab_id=1, url='https://a.example/', open_status='OPEN'))
+        manager.record_active_tab(1, first.id)
+        other = manager.add_workspace('b')
+
+        # The live tab for A got a new runtime id after a restart.
+        tab_a = MockTab(77, url=QUrl('https://a.example/'))
+        browser.widget.insert(tab_a, 0)
+
+        manager.set_active(other.id)
+        manager.set_active(first.id)
+
+        assert browser.widget.currentWidget() is tab_a
+        assert model.active_tab_id() == 77
+
+    def test_restore_skips_closed_tab(
+            self, browser, manager, model, bridge):
+        first = manager.add_workspace('a')
+        manager.add_tab(first.id, WorkspaceTab(
+            tab_id=99, url='https://closed.example/',
+            open_status='SUSPENDED'))
+        manager.add_tab(first.id, WorkspaceTab(
+            tab_id=3, url='https://open.example/', open_status='OPEN'))
+        manager.record_active_tab(99, first.id)
+        other = manager.add_workspace('b')
+        tab_open = MockTab(3, url=QUrl('https://open.example/'))
+        browser.widget.insert(tab_open, 0)
+
+        manager.set_active(other.id)
+        manager.set_active(first.id)
+
+        assert browser.widget.currentWidget() is tab_open
+        assert model.active_tab_id() == 3
