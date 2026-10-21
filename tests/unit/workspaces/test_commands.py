@@ -77,12 +77,14 @@ class FakeManager:
             *,
             archived: bool = False,
             last_active: Optional[str] = None,
+            created_at: Optional[str] = None,
     ) -> Workspace:
         workspace = Workspace(
             id=workspace_id,
             name=name,
             last_active=last_active or '2026-01-01T00:00:00+00:00',
             archived=archived,
+            created_at=created_at or '2026-01-01T00:00:00+00:00',
         )
         self._workspaces[workspace.id] = workspace
         if self._active_id is None:

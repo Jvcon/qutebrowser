@@ -4,6 +4,7 @@
 
 """Tests for the import half of qutebrowser.workspaces.portability."""
 
+import datetime
 import json
 import uuid
 
@@ -338,3 +339,51 @@ def test_import_round_trip_preserves_parent_tree(
     by_url = {t.url: t for t in tabs}
     assert by_url['https://example.com/child'].parent_id \
         == by_url['https://example.com/parent'].tab_id
+
+
+def test_import_round_trip_preserves_workspace_created_at(
+        tmp_path, monkeypatch) -> None:
+    """A round-tripped workspace must keep its original creation time.
+
+    Before issue #40 the field was a structural null; after #40 a real
+    timestamp is set on the model and forwarded by the exporter.
+    """
+    src = FakeManager()
+    _wire(monkeypatch, src)
+    src.add_workspace('legacy')
+    workspace = src.list_all_workspaces()[0]
+    workspace.created_at = '2026-02-03T04:05:06+00:00'
+
+    written_path = portability.export_to_path(tmp_path / 'rt-created.json')
+
+    document = json.loads(written_path.read_text(encoding='utf-8'))
+    assert document['workspaces'][0]['created_at'] == (
+        '2026-02-03T04:05:06+00:00'
+    )
+
+    dst = FakeManager()
+    _wire(monkeypatch, dst)
+    portability.import_from_path(written_path)
+    loaded = dst.list_all_workspaces()[0]
+    assert loaded.created_at == '2026-02-03T04:05:06+00:00'
+
+
+def test_import_null_workspace_created_at_stamps_now(
+        tmp_path, monkeypatch) -> None:
+    """Older documents with ``created_at: null`` import without crashing.
+
+    The freshly-imported workspace is stamped with a now-UTC timestamp so
+    the field is never silently broken-looking in the manager. Issue #40
+    made this path reachable in practice (legacy exports before the
+    field existed).
+    """
+    manager = FakeManager()
+    _wire(monkeypatch, manager)
+    group = _group_doc()
+    workspace_doc = _workspace_doc(groups=[group], created_at=None)
+    path = _write(tmp_path, _document(workspaces=[workspace_doc]))
+
+    portability.import_from_path(path)
+    loaded = manager.list_all_workspaces()[0]
+    assert loaded.created_at is not None
+    datetime.datetime.fromisoformat(loaded.created_at)
