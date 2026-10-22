@@ -811,7 +811,8 @@ Ctrl+W                Close selected tab
 Shift+Ctrl+W          Close active workspace (prompt if tabs are present)
 Shift+F2              Show close-branch hint for the selected tab
 /                     Open the filter row at the top of the TabTree and focus it (no-op if already open)
-g g                   Move focus to the next group header (or create one if none) — binding details TBD
+g h                   Move focus to the next group header, or pre-fill the create-group
+                       prompt if none exists — see the amendment below
 Esc                   If filter row is open, clear it and remove it; if filter empty and panel focused, return focus to webview
 Ctrl+\                Toggle VerticalPanel visibility
 ```
@@ -828,6 +829,27 @@ pinned tab; WorkspaceIndicator button = switch workspace.
 ```
 
 Press `w` or `t` to execute; any other key dismisses.
+
+> **Amended after implementation (#55).** `g g` proved **not implementable**.
+> `BindingTrie.matches()` returns an `ExactMatch` whenever the node the entered
+> sequence reaches carries a command; it does *not* prefer a longer
+> continuation. Binding `gg` in a bucket that also holds `ggl`, `ggn`, `ggr` and
+> the rest of the `gg*` family therefore fires on the second `g` and makes all
+> of them unreachable. Verified against the real trie: with `gg`, `ggl` and
+> `ggn` bound, `gg` resolves to `ExactMatch` and `ggl` can never be typed.
+> `g h` is the substitute and coexists with the family — `g`,`h` is an
+> `ExactMatch` while `g`,`g` stays a `PartialMatch`, so `ggl`/`ggn`/`ggr`
+> still resolve.
+>
+> "Next" means the next top-level group header after the current row's
+> top-level ancestor, wrapping to the first; with no group headers it
+> pre-fills `:vp-group-new ` through `status-command`. The name still has to be
+> typed, because `vp-group-new` requires one.
+>
+> `w` in the hint closes every OPEN tab in the **active** workspace, leaving
+> the entries SUSPENDED. That is this ADR's reading of "close workspace"; it is
+> deliberately *not* archive or delete. Note this is a different action from the
+> table's `Shift+Ctrl+W` "close active workspace", which is still unbound.
 
 ### Panel focus & mode model
 
@@ -931,8 +953,8 @@ they register in `bindings.default:`.
 
 | Class | Registered in | Example commands | Target semantics |
 |---|---|---|---|
-| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tab-close`, `tab-only`, `tab-clone`, `reload`, `tab-collect`, `vp-status-set`, `vp-status-cycle`, `vp-select-toggle` | In both modes the target is the webview's active tab. Outside selection mode the TabTree's current row is kept identical to it: clicking a row and J/K both switch the webview (J/K keeps focus in the tree), so the two cannot diverge. Selection mode is the exception — see § "Current row vs selected set" below. |
-| **Panel-state operations** | `bindings.default.workspace_panel:` only | `workspace-create`, `workspace-list`, `workspace-rename`, `workspace-delete`, `workspace-archive`, `workspace-unarchive`, `workspace-switch`, `workspace-next`, `workspace-prev`, `vp-workspace-export`, `vp-workspace-import`, `pintab-style-toggle`, `vp-group-new`, `vp-group-rename`, `vp-group-pin`, `vp-group-unpin`, `vp-group-archive`, `vp-group-restore`, `vp-group-delete`, `vp-group-close`, `vp-group-reopen`, `group-list`, `vp-collect-all`, `vp-cleanup-done`, `vp-suspend-stale`, `vp-suggestion-stale`, `vp-suggestion-ignore`, `vp-select-mode`, `vp-select-all`, `vp-select-none`, `vp-batch-move`, `vp-batch-status`, `vp-batch-delete`, `vp-batch-open-window`, `vp-batch-open-tabs`, `auto-group-reapply`, `panel-filter` | Operate on the active workspace / selected group / pinned-tab list. Have no meaning from `normal:` because they have no active-tab target. |
+| **Active-tab operations** | `bindings.default.normal:` **and** `bindings.default.workspace_panel:` | `pintab-add`, `pintab-remove`, `pintab-move`, `tab-move-to-group`, `tab-move`, `tabtree-move`, `tabtree-move-branch`, `tab-close`, `tab-only`, `tab-clone`, `tab-mute`, `reload`, `tab-collect`, `vp-status-set`, `vp-status-cycle`, `vp-select-toggle` | In both modes the target is the webview's active tab. Outside selection mode the TabTree's current row is kept identical to it: clicking a row and J/K both switch the webview (J/K keeps focus in the tree), so the two cannot diverge. Selection mode is the exception — see § "Current row vs selected set" below. |
+| **Panel-state operations** | `bindings.default.workspace_panel:` only | `workspace-create`, `workspace-list`, `workspace-rename`, `workspace-delete`, `workspace-archive`, `workspace-unarchive`, `workspace-switch`, `workspace-next`, `workspace-prev`, `vp-workspace-export`, `vp-workspace-import`, `pintab-style-toggle`, `vp-group-new`, `vp-group-next`, `vp-group-rename`, `vp-group-pin`, `vp-group-unpin`, `vp-group-archive`, `vp-group-restore`, `vp-group-delete`, `vp-group-close`, `vp-group-reopen`, `vp-close-branch-hint`, `group-list`, `vp-collect-all`, `vp-cleanup-done`, `vp-suspend-stale`, `vp-suggestion-stale`, `vp-suggestion-ignore`, `vp-select-mode`, `vp-select-all`, `vp-select-none`, `vp-batch-move`, `vp-batch-status`, `vp-batch-delete`, `vp-batch-open-window`, `vp-batch-open-tabs`, `auto-group-reapply`, `panel-filter` | Operate on the active workspace / selected group / pinned-tab list. Have no meaning from `normal:` because they have no active-tab target. |
 | **Global operations** | `bindings.default.normal:` only | `vertical-panel-toggle` | Toggle panel visibility; no tab/group target. |
 
 **Previously unclassified commands.** `workspace-list`, `vp-suspend-stale`,
@@ -1144,7 +1166,6 @@ accidental):
   asserted in unit tests; that a screen reader actually announces it needs a
   real desktop session.
 - Cross-panel tab order (PIN → TabTree → WorkspaceIndicator) is not wired.
-- `tab-mute` has no `workspace_panel` binding.
 
 **What Tier 3 would require** (out of scope for v0.1):
 
