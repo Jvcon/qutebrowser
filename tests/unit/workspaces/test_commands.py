@@ -1113,6 +1113,31 @@ class TestGroupCommands:
         assert messages == [
             "Deleted group 'g'; 0 tab(s) became standalone."]
 
+    def test_delete_confirm_says_tabs_are_kept(
+            self,
+            fake_manager: FakeManager,
+            monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        workspace = fake_manager.add_workspace('w')
+        group = fake_manager.create_group(workspace.id, 'g')
+        workspace.tabs.append(
+            WorkspaceTab(tab_id=1, group_id=group.group_id))
+        workspace.tabs.append(
+            WorkspaceTab(tab_id=2, group_id=group.group_id))
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            commands.message, 'confirm_async',
+            lambda **kwargs: captured.update(kwargs))
+
+        commands.vp_group_delete('g')
+
+        text = str(captured['text'])
+        assert "all its tabs" not in str(captured['title'])
+        assert "cannot be undone" not in text
+        assert "2 tab(s) as top-level tabs" in text
+        assert captured['default'] is False
+        assert callable(captured['yes_action'])
+
     def test_delete_missing_raises(self, fake_manager: FakeManager) -> None:
         fake_manager.add_workspace('w')
         with pytest.raises(cmdutils.CommandError, match='No group'):
@@ -1974,3 +1999,91 @@ class TestWorkspaceExport:
         expected = (tmp_path / 'workspaces-export.json').resolve()
         assert expected.exists()
         assert messages == [f"Exported workspaces to {expected}"]
+
+
+class TestTabTreeMoveCommands:
+
+    """``:tabtree-move`` and ``:tabtree-move-branch`` (ticket #6)."""
+
+    @pytest.fixture
+    def real_manager(self, pers, qapp, monkeypatch):
+        manager = WorkspaceManager(*pers)
+        monkeypatch.setattr(commands, '_manager', lambda: manager)
+        src = manager.add_workspace('src')
+        manager.add_workspace('dst')
+        for tab_id, parent in ((10, None), (11, 10), (12, 11), (20, None)):
+            manager.add_tab(src.id, WorkspaceTab(tab_id=tab_id,
+                                                 parent_id=parent))
+        return manager
+
+    @staticmethod
+    def _ids(manager, name):
+        ws = manager.get_workspace_by_name(name)
+        return {tab.tab_id: tab.parent_id for tab in ws.tabs}
+
+    def test_registered(self):
+        from qutebrowser.misc import objects
+        from qutebrowser import app  # pylint: disable=unused-import
+        assert 'tabtree-move' in objects.commands
+        assert 'tabtree-move-branch' in objects.commands
+
+    def test_move_single_tab(self, real_manager, messages):
+        commands.tabtree_move(20, 'dst')
+
+        assert self._ids(real_manager, 'src') == {10: None, 11: 10, 12: 11}
+        assert self._ids(real_manager, 'dst') == {20: None}
+        assert "Moved tab 20 to workspace 'dst'" in messages[-1]
+        assert real_manager.get_active().name == 'src'
+
+    def test_move_single_tab_promotes_children(self, real_manager, messages):
+        commands.tabtree_move(11, 'dst')
+
+        assert self._ids(real_manager, 'src') == {10: None, 12: 10, 20: None}
+        assert self._ids(real_manager, 'dst') == {11: None}
+
+    def test_move_branch_keeps_subtree(self, real_manager, messages):
+        commands.tabtree_move_branch(10, 'dst')
+
+        assert self._ids(real_manager, 'src') == {20: None}
+        assert self._ids(real_manager, 'dst') == {10: None, 11: 10, 12: 11}
+        assert "branch from tab 10" in messages[-1]
+
+    def test_move_single_does_not_move_branch(self, real_manager, messages):
+        commands.tabtree_move(10, 'dst')
+        assert self._ids(real_manager, 'dst') == {10: None}
+        assert self._ids(real_manager, 'src') == {11: None, 12: 11, 20: None}
+
+    def test_unknown_workspace_is_command_error(self, real_manager, messages):
+        with pytest.raises(cmdutils.CommandError,
+                           match="No workspace with the name 'nope'"):
+            commands.tabtree_move(20, 'nope')
+        assert 20 in self._ids(real_manager, 'src')
+
+    def test_unknown_tab_is_command_error(self, real_manager, messages):
+        with pytest.raises(cmdutils.CommandError, match='No tab with id 999'):
+            commands.tabtree_move(999, 'dst')
+        with pytest.raises(cmdutils.CommandError, match='No tab with id 999'):
+            commands.tabtree_move_branch(999, 'dst')
+
+    def test_move_into_own_workspace_is_command_error(
+            self, real_manager, messages):
+        with pytest.raises(cmdutils.CommandError, match='already in'):
+            commands.tabtree_move(20, 'src')
+        assert 20 in self._ids(real_manager, 'src')
+
+    def test_archived_target_is_command_error(self, real_manager, messages):
+        real_manager.archive_workspace(
+            real_manager.get_workspace_by_name('dst').id)
+        with pytest.raises(cmdutils.CommandError, match='archived'):
+            commands.tabtree_move(20, 'dst')
+        assert 20 in self._ids(real_manager, 'src')
+
+    def test_no_active_workspace_is_command_error(
+            self, real_manager, messages, monkeypatch):
+        monkeypatch.setattr(real_manager, 'get_active', lambda: None)
+        with pytest.raises(cmdutils.CommandError, match='No active workspace'):
+            commands.tabtree_move(20, 'dst')
+
+    def test_name_lookup_is_case_insensitive(self, real_manager, messages):
+        commands.tabtree_move(20, 'DST')
+        assert self._ids(real_manager, 'dst') == {20: None}

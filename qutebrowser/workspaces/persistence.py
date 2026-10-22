@@ -9,6 +9,7 @@ All workspace data lives under a per-profile directory::
     <data>/profiles/<name>/workspaces/
         <workspace-uuid>.yml      # per-workspace state
         _state.yml                # active_id (skipped by load_all)
+        _journal.yml              # crash journal, present only while running
         pinned.yml                # app-wide pinned tabs within this profile
 
 The two persistence classes (:class:`WorkspacePersistence`,
@@ -38,10 +39,14 @@ and removes the now-empty legacy directories. The migration is
 idempotent and emits a single info log line on first run.
 """
 
+import dataclasses
+import datetime
+import hashlib
+import json
 import pathlib
 import shutil
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
 import yaml
 
@@ -52,8 +57,19 @@ from qutebrowser.workspaces.model import PinnedTab, Profile, Workspace
 #: Name of the active-workspace state file inside the per-profile dir.
 STATE_FILENAME = '_state.yml'
 
+#: Name of the crash journal inside the per-profile dir (issue #7).
+JOURNAL_FILENAME = '_journal.yml'
+
+#: Schema version of the crash journal envelope.
+JOURNAL_FORMAT = 1
+
 #: Name of the default profile (used when no config override).
 DEFAULT_PROFILE_NAME = 'default'
+
+#: Exceptions which mean "this file is unreadable or malformed".  Corrupt
+#: workspace data must degrade to a warning, never abort startup.
+CORRUPT_DATA_ERRORS = (
+    yaml.YAMLError, KeyError, TypeError, ValueError, AttributeError, OSError)
 
 
 def _legacy_paths(data_dir: pathlib.Path) -> dict[str, pathlib.Path]:
@@ -204,11 +220,11 @@ class WorkspacePersistence:
         """
         workspaces = []
         for path in sorted(self.base_path.glob('*.yml')):
-            if path.name == STATE_FILENAME:
+            if not _is_workspace_file(path):
                 continue
             try:
                 workspaces.append(self.load(path.stem))
-            except (yaml.YAMLError, KeyError, ValueError, OSError) as e:
+            except CORRUPT_DATA_ERRORS as e:
                 log.message.warning(
                     f"Ignoring corrupt workspace file {path}: {e}")
         workspaces.sort(key=lambda ws: str(ws.id))
@@ -265,8 +281,13 @@ class WorkspacePersistence:
         empty: dict[uuid.UUID, Optional[int]] = {}
         if not self.state_path.exists():
             return None, empty
-        with self.state_path.open('r', encoding='utf-8') as f:
-            data = utils.yaml_load(f)
+        try:
+            with self.state_path.open('r', encoding='utf-8') as f:
+                data = utils.yaml_load(f)
+        except CORRUPT_DATA_ERRORS as e:
+            log.message.warning(
+                f"Ignoring corrupt workspace state {self.state_path}: {e}")
+            return None, empty
         if not isinstance(data, dict):
             return None, empty
 
@@ -279,23 +300,7 @@ class WorkspacePersistence:
                 log.message.warning(
                     f"Ignoring invalid active workspace id {raw!r}")
 
-        last_active_tabs: dict[uuid.UUID, Optional[int]] = {}
-        raw_tabs = data.get('last_active_tabs')
-        if isinstance(raw_tabs, dict):
-            for raw_id, raw_tab_id in raw_tabs.items():
-                try:
-                    workspace_id = uuid.UUID(str(raw_id))
-                except ValueError:
-                    log.message.warning(
-                        f"Ignoring invalid workspace id {raw_id!r} in "
-                        "last_active_tabs")
-                    continue
-                if raw_tab_id is not None and not isinstance(raw_tab_id, int):
-                    log.message.warning(
-                        f"Ignoring invalid last-active tab id {raw_tab_id!r} "
-                        f"for workspace {workspace_id}")
-                    continue
-                last_active_tabs[workspace_id] = raw_tab_id
+        last_active_tabs = _parse_last_active_tabs(data.get('last_active_tabs'))
         return active_id, last_active_tabs
 
     def load_state(self) -> Optional[uuid.UUID]:
@@ -362,11 +367,240 @@ class PinnedPersistence:
             utils.yaml_dump(data, f)
 
     def load(self) -> list[PinnedTab]:
-        """Load the pinned tab list (empty if no file exists yet)."""
+        """Load the pinned tab list (empty if no file exists yet).
+
+        A corrupt file or malformed entry is logged and skipped so a bad
+        pinned.yml never blocks startup.
+        """
         if not self.path.exists():
             return []
-        with self.path.open('r', encoding='utf-8') as f:
-            data = utils.yaml_load(f)
-        if data is None:
+        try:
+            with self.path.open('r', encoding='utf-8') as f:
+                data = utils.yaml_load(f)
+        except CORRUPT_DATA_ERRORS as e:
+            log.message.warning(f"Ignoring corrupt pinned tabs {self.path}: {e}")
             return []
-        return [PinnedTab.from_dict(d) for d in data.get('pinned', [])]
+        if not isinstance(data, dict):
+            return []
+        pinned = []
+        for raw in data.get('pinned') or []:
+            try:
+                pinned.append(PinnedTab.from_dict(raw))
+            except CORRUPT_DATA_ERRORS as e:
+                log.message.warning(f"Ignoring malformed pinned tab {raw!r}: {e}")
+        return pinned
+
+
+def _parse_last_active_tabs(
+        raw_tabs: Any) -> dict[uuid.UUID, Optional[int]]:
+    """Parse the ``last_active_tabs`` map from a state file, skipping bad rows."""
+    last_active_tabs: dict[uuid.UUID, Optional[int]] = {}
+    if not isinstance(raw_tabs, dict):
+        return last_active_tabs
+    for raw_id, raw_tab_id in raw_tabs.items():
+        try:
+            workspace_id = uuid.UUID(str(raw_id))
+        except ValueError:
+            log.message.warning(
+                f"Ignoring invalid workspace id {raw_id!r} in "
+                "last_active_tabs")
+            continue
+        if raw_tab_id is not None and not isinstance(raw_tab_id, int):
+            log.message.warning(
+                f"Ignoring invalid last-active tab id {raw_tab_id!r} "
+                f"for workspace {workspace_id}")
+            continue
+        last_active_tabs[workspace_id] = raw_tab_id
+    return last_active_tabs
+
+
+def _is_workspace_file(path: pathlib.Path) -> bool:
+    """Return True if *path* holds a workspace (not an aux/reserved file).
+
+    Underscore-prefixed files (``_state.yml``, ``_journal.yml`` and the
+    quarantined journal copies) are bookkeeping, never workspaces.  Workspace
+    ids are UUIDs and never start with an underscore.  ``pinned.yml`` lives in
+    the same directory and is skipped too.
+    """
+    return not path.name.startswith('_') and path.name != 'pinned.yml'
+
+
+@dataclasses.dataclass
+class JournalSnapshot:
+
+    """A decoded crash journal: the in-memory state at the last flush.
+
+    Attributes:
+        written_at: ISO 8601 UTC timestamp of the flush.
+        active_id: The active workspace id, if any.
+        last_active_tabs: Per-workspace last-active runtime tab ids.
+        workspaces: The workspaces that were loaded at the last flush.
+        pinned: The app-wide pinned tabs at the last flush.
+    """
+
+    written_at: str
+    active_id: Optional[uuid.UUID]
+    last_active_tabs: dict[uuid.UUID, Optional[int]]
+    workspaces: list[Workspace]
+    pinned: list[PinnedTab]
+
+    @property
+    def tab_count(self) -> int:
+        """Return the number of tab entries across all journaled workspaces."""
+        return sum(len(workspace.tabs) for workspace in self.workspaces)
+
+
+class JournalError(ValueError):
+
+    """The crash journal is torn, truncated, edited, or of an unknown format."""
+
+
+def _checksum(payload: dict[str, Any]) -> str:
+    """Return a stable SHA-256 digest of a journal *payload*."""
+    text = json.dumps(payload, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=False)
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def encode_journal(snapshot: JournalSnapshot) -> dict[str, Any]:
+    """Return the checksummed on-disk envelope for *snapshot*."""
+    payload: dict[str, Any] = {
+        'format': JOURNAL_FORMAT,
+        'written_at': snapshot.written_at,
+        'active_id': (
+            str(snapshot.active_id) if snapshot.active_id is not None else None),
+        'last_active_tabs': {
+            str(workspace_id): tab_id
+            for workspace_id, tab_id in snapshot.last_active_tabs.items()
+        },
+        'workspaces': [ws.to_dict() for ws in snapshot.workspaces],
+        'pinned': [tab.to_dict() for tab in snapshot.pinned],
+    }
+    return {'checksum': _checksum(payload), 'payload': payload}
+
+
+def _decode_workspaces(raw_list: Any) -> list[Workspace]:
+    """Decode journaled workspaces, skipping any that are unreadable."""
+    workspaces = []
+    for raw in raw_list or []:
+        try:
+            workspaces.append(Workspace.from_dict(raw))
+        except CORRUPT_DATA_ERRORS as e:
+            log.workspaces.warning(f"Skipping unreadable journal workspace: {e}")
+    return workspaces
+
+
+def _decode_pinned(raw_list: Any) -> list[PinnedTab]:
+    """Decode journaled pinned tabs, skipping any that are unreadable."""
+    pinned = []
+    for raw in raw_list or []:
+        try:
+            pinned.append(PinnedTab.from_dict(raw))
+        except CORRUPT_DATA_ERRORS as e:
+            log.workspaces.warning(f"Skipping unreadable journal pinned tab: {e}")
+    return pinned
+
+
+def _decode_active_id(raw: Any) -> Optional[uuid.UUID]:
+    """Decode the journaled active workspace id, or None if absent/invalid."""
+    if raw is None:
+        return None
+    try:
+        return uuid.UUID(str(raw))
+    except ValueError:
+        log.workspaces.warning("Ignoring invalid active id in crash journal")
+        return None
+
+
+def decode_journal(data: Any) -> JournalSnapshot:
+    """Validate and decode a journal envelope.
+
+    Raises:
+        JournalError: when the envelope is not a mapping, the checksum does not
+            match (a torn or hand-edited write), or the format is unknown.
+    """
+    if not isinstance(data, dict):
+        raise JournalError('journal is not a mapping')
+    payload = data.get('payload')
+    checksum = data.get('checksum')
+    if not isinstance(payload, dict) or not isinstance(checksum, str):
+        raise JournalError('journal has no payload or checksum')
+    if _checksum(payload) != checksum:
+        raise JournalError('checksum mismatch (torn or edited write)')
+    if payload.get('format') != JOURNAL_FORMAT:
+        raise JournalError(f"unsupported journal format {payload.get('format')!r}")
+
+    last_active_tabs = _parse_last_active_tabs(payload.get('last_active_tabs'))
+    return JournalSnapshot(
+        written_at=str(payload.get('written_at') or ''),
+        active_id=_decode_active_id(payload.get('active_id')),
+        last_active_tabs=last_active_tabs,
+        workspaces=_decode_workspaces(payload.get('workspaces')),
+        pinned=_decode_pinned(payload.get('pinned')),
+    )
+
+
+class JournalPersistence:
+
+    """Read/write the crash journal (``_journal.yml``) for one profile.
+
+    The journal is a full snapshot of the manager's loaded state, rewritten
+    atomically (``QSaveFile``) and checksummed so a torn write is detected on
+    the next launch and ignored instead of bricking startup.  It exists only
+    while qutebrowser is running: a clean shutdown deletes it, so finding one
+    at startup means the previous run did not exit cleanly.
+
+    Attributes:
+        base_path: The per-profile workspaces directory.
+        path: The journal file path.
+    """
+
+    def __init__(self, base_path: pathlib.Path) -> None:
+        self.base_path = base_path
+        self.path = base_path / JOURNAL_FILENAME
+
+    def write(self, snapshot: JournalSnapshot) -> None:
+        """Atomically replace the journal with *snapshot*."""
+        envelope = encode_journal(snapshot)
+        with qtutils.savefile_open(str(self.path)) as f:
+            utils.yaml_dump(envelope, f)
+
+    def read(self) -> Optional[JournalSnapshot]:
+        """Return the journal from the last run, or None.
+
+        A missing journal returns None.  An unreadable, torn, or edited journal
+        is logged, moved aside (kept on disk, never loaded again) and treated
+        as absent, so it can never block startup.
+        """
+        if not self.path.exists():
+            return None
+        try:
+            with self.path.open('r', encoding='utf-8') as f:
+                data = utils.yaml_load(f)
+            return decode_journal(data)
+        except CORRUPT_DATA_ERRORS as e:
+            log.workspaces.warning(
+                f"Ignoring unreadable crash journal {self.path}: {e}")
+            self.preserve('corrupt')
+            return None
+
+    def discard(self) -> None:
+        """Delete the journal (clean shutdown)."""
+        self.path.unlink(missing_ok=True)
+
+    def preserve(self, reason: str) -> Optional[pathlib.Path]:
+        """Move the journal aside under a unique name and return the new path.
+
+        Used for declined recovery and corrupt journals so the data stays on
+        disk.  The timestamped name never overwrites an earlier copy.
+        """
+        if not self.path.exists():
+            return None
+        stamp = datetime.datetime.now().strftime('%Y%m%dT%H%M%S%f')
+        dst = self.base_path / f'_journal.{reason}-{stamp}.yml'
+        try:
+            self.path.replace(dst)
+        except OSError as e:
+            log.workspaces.warning(f"Could not preserve crash journal: {e}")
+            return None
+        return dst

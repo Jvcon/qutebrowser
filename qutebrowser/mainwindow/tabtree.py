@@ -36,17 +36,25 @@ These remaining items are tracked for the next sub-slice and marked with
 from __future__ import annotations
 
 import base64
+import contextlib
 import enum
+import functools
+import types
 import uuid
-from collections.abc import Iterable
-from typing import Optional
+import weakref
+from collections.abc import Callable, Iterable, Iterator
+from typing import Any, NamedTuple, Optional
 
 from qutebrowser.qt.core import (
     QAbstractItemModel,
     QEvent,
+    QMimeData,
+    QObject,
     QModelIndex,
+    QPersistentModelIndex,
     QPoint,
     QRect,
+    QRectF,
     QSize,
     Qt,
     QTimer,
@@ -55,12 +63,16 @@ from qutebrowser.qt.core import (
 )
 from qutebrowser.qt.gui import (
     QColor,
+    QContextMenuEvent,
+    QFocusEvent,
     QFontMetrics,
     QHelpEvent,
+    QKeyEvent,
     QKeySequence,
     QMouseEvent,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
     QShortcut,
@@ -80,9 +92,15 @@ from qutebrowser.qt.widgets import (
     QWidget,
 )
 
+from qutebrowser.mainwindow import panelglyphs
+from qutebrowser.mainwindow import panelstyle
+from qutebrowser.mainwindow.panelstyle import (Palette, best_black_or_white,
+                                               blend)
 from qutebrowser.mainwindow.pinpanel import PINNED_TAB_MIME
+from qutebrowser.utils import message
+from qutebrowser.utils.qtutils import weak_slot
 from qutebrowser.workspaces import search
-from qutebrowser.workspaces.manager import WorkspaceManager
+from qutebrowser.workspaces.manager import WorkspaceManager, WorkspaceMoveError
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
 
@@ -102,6 +120,58 @@ ActiveGroupRole = Qt.ItemDataRole.UserRole + 11
 HighlightRole = Qt.ItemDataRole.UserRole + 12
 GroupIdRole = Qt.ItemDataRole.UserRole + 13
 DropTargetRole = Qt.ItemDataRole.UserRole + 14
+ReadingStatusRole = Qt.ItemDataRole.UserRole + 15
+SearchTermsRole = Qt.ItemDataRole.UserRole + 16
+
+#: MIME type of a tab node dragged out of the TabTree (ticket #6).
+#:
+#: The payload is ``"<workspace-uuid>:<tab-id>:<kind>"`` where ``<kind>`` is
+#: ``branch`` (the node has descendants, which move with it) or ``leaf``.
+#: See :func:`encode_tab_node` / :func:`decode_tab_node`.
+TAB_NODE_MIME = 'application/x-qutebrowser-tabtree-node'
+
+_NODE_KIND_BRANCH = 'branch'
+_NODE_KIND_LEAF = 'leaf'
+
+
+class TabNodeRef(NamedTuple):
+
+    """A decoded :data:`TAB_NODE_MIME` payload."""
+
+    workspace_id: uuid.UUID
+    tab_id: int
+    branch: bool
+
+
+def encode_tab_node(workspace_id: uuid.UUID, tab_id: int, *,
+                    branch: bool) -> bytes:
+    """Return the :data:`TAB_NODE_MIME` payload for a dragged tab node."""
+    kind = _NODE_KIND_BRANCH if branch else _NODE_KIND_LEAF
+    return f'{workspace_id}:{tab_id}:{kind}'.encode('ascii')
+
+
+def decode_tab_node(mime_data: QMimeData) -> Optional[TabNodeRef]:
+    """Decode a :data:`TAB_NODE_MIME` payload, or return ``None``.
+
+    Anything malformed (missing format, wrong field count, a bad UUID, a
+    non-numeric tab id or an unknown kind) yields ``None`` rather than an
+    exception, so a stray drag can never crash a drop handler.
+    """
+    if not mime_data.hasFormat(TAB_NODE_MIME):
+        return None
+    raw = mime_data.data(TAB_NODE_MIME).data().decode('ascii', 'replace')
+    fields = raw.split(':')
+    if len(fields) != 3:
+        return None
+    workspace_str, tab_str, kind = fields
+    if not tab_str.isdecimal() or kind not in (_NODE_KIND_BRANCH,
+                                               _NODE_KIND_LEAF):
+        return None
+    try:
+        workspace_id = uuid.UUID(workspace_str)
+    except ValueError:
+        return None
+    return TabNodeRef(workspace_id, int(tab_str), kind == _NODE_KIND_BRANCH)
 
 
 class Kind(enum.IntEnum):
@@ -147,6 +217,52 @@ _TAB_STATIC_ROLES = {
     BadgeRole: None,
     ActiveGroupRole: False,
 }
+
+#: Tab roles that resolve to text (title, URL, icon, reading, a11y, open).
+_TAB_TEXT_ROLES = frozenset({
+    OpenStatusRole,
+    ReadingStatusRole,
+    SearchTermsRole,
+    Qt.ItemDataRole.DisplayRole,
+    Qt.ItemDataRole.ToolTipRole,
+    Qt.ItemDataRole.DecorationRole,
+    Qt.ItemDataRole.AccessibleTextRole,
+    Qt.ItemDataRole.AccessibleDescriptionRole,
+    UrlRole,
+})
+
+
+#: Reading-status glyph per ``WorkspaceTab.reading_status`` (tab rows).
+_READING_GLYPHS = {
+    'FRESH': panelglyphs.Glyph.FRESH,
+    'ACTIVE': panelglyphs.Glyph.ACTIVE,
+    'DONE': panelglyphs.Glyph.DONE,
+}
+
+#: Resolved group-state glyph (``GroupStateRole``) on group rows.
+_GROUP_GLYPHS = {
+    'OPEN': panelglyphs.Glyph.OPEN,
+    'SUSPENDED': panelglyphs.Glyph.SUSPENDED,
+    'ARCHIVED': panelglyphs.Glyph.ARCHIVED,
+}
+
+
+def _reading_color(palette: Palette, glyph: panelglyphs.Glyph) -> QColor:
+    """Return the palette colour of a reading-status *glyph*."""
+    return {
+        panelglyphs.Glyph.FRESH: palette.fresh,
+        panelglyphs.Glyph.ACTIVE: palette.active,
+        panelglyphs.Glyph.DONE: palette.done,
+    }[glyph]
+
+
+def _group_color(palette: Palette, glyph: panelglyphs.Glyph) -> QColor:
+    """Return the palette colour of a group-state *glyph*."""
+    return {
+        panelglyphs.Glyph.OPEN: palette.open,
+        panelglyphs.Glyph.SUSPENDED: palette.suspended,
+        panelglyphs.Glyph.ARCHIVED: palette.archived,
+    }[glyph]
 
 
 @enum.unique
@@ -226,6 +342,15 @@ class TabTreeModel(QAbstractItemModel):
             or ``None``).  Used by the pinned-tab drop handler.
         DropTargetRole: Role id for the row currently highlighted as a
             valid pinned-tab drop target (bool).
+        ReadingStatusRole: Role id for a tab's ``reading_status`` (str):
+            ``'FRESH'``, ``'ACTIVE'`` or ``'DONE'``.  Group rows report
+            ``None``.
+
+    Accessibility (ADR 0008 § "Screen reader contract"): every row sets
+    ``AccessibleTextRole`` (the spoken label) and
+    ``AccessibleDescriptionRole`` (the state), and ``ToolTipRole`` stays as a
+    fallback for older ATs.  See :meth:`_group_accessible_description` and
+    :meth:`_tab_accessible_description`.
     """
 
     KindRole = KindRole
@@ -242,6 +367,8 @@ class TabTreeModel(QAbstractItemModel):
     HighlightRole = HighlightRole
     GroupIdRole = GroupIdRole
     DropTargetRole = DropTargetRole
+    ReadingStatusRole = ReadingStatusRole
+    SearchTermsRole = SearchTermsRole
 
     def __init__(
             self,
@@ -266,6 +393,8 @@ class TabTreeModel(QAbstractItemModel):
         # matching entries, aggregated by group.  ``None`` means the normal,
         # unfiltered view.
         self._search_hits: Optional[list[search.SearchHit]] = None
+        # Lower-cased query terms, underlined in the title (ADR § Search).
+        self._search_terms: list[str] = []
         # Multi-select (VP-F4).  The ids survive ``set_workspace`` rebuilds
         # so a batch command that emits ``changed`` does not wipe the
         # selection mid-operation.
@@ -313,6 +442,19 @@ class TabTreeModel(QAbstractItemModel):
             else:
                 self._build_search_tree(self._search_hits)
         self.endResetModel()
+
+    def set_search_terms(self, terms: list[str]) -> None:
+        """Set the query terms whose matches the delegate underlines."""
+        self._search_terms = list(terms)
+        self._emit_rows_changed()
+
+    def _emit_rows_changed(self) -> None:
+        """Repaint every visible row after a view-only change."""
+        if self.rowCount(QModelIndex()):
+            self.dataChanged.emit(
+                self.index(0, 0, QModelIndex()),
+                self.index(self.rowCount(QModelIndex()) - 1, 0,
+                           QModelIndex()))
 
     @property
     def search_active(self) -> bool:
@@ -494,7 +636,7 @@ class TabTreeModel(QAbstractItemModel):
             timer = QTimer(self)
             timer.setSingleShot(True)
             timer.timeout.connect(
-                lambda tid=tab_id: self._clear_highlight(tid))
+                weak_slot(self._clear_highlight, tab_id))
             timer.start(timeout_ms)
             self._highlight_timer = timer
 
@@ -720,8 +862,11 @@ class TabTreeModel(QAbstractItemModel):
             # The root must accept drops so a pinned entry can land as a
             # top-level standalone row.
             return Qt.ItemFlag.ItemIsDropEnabled
-        return (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-                | Qt.ItemFlag.ItemIsDropEnabled)
+        flags = (Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+                 | Qt.ItemFlag.ItemIsDropEnabled)
+        if self._workspace_tab_for_index(index) is not None:
+            flags |= Qt.ItemFlag.ItemIsDragEnabled
+        return flags
 
     # --- pinned-tab drag & drop ---
 
@@ -830,11 +975,125 @@ class TabTreeModel(QAbstractItemModel):
         tab = node.obj
         return tab if isinstance(tab, WorkspaceTab) else None
 
+    # --- tab-node drag & drop (ticket #6) ---
+
     def mimeTypes(self) -> list[str]:  # noqa: N802 - Qt naming
-        return [PINNED_TAB_MIME]
+        return [PINNED_TAB_MIME, TAB_NODE_MIME]
+
+    def supportedDragActions(self) -> Qt.DropAction:  # noqa: N802
+        return Qt.DropAction.MoveAction
 
     def supportedDropActions(self) -> Qt.DropAction:  # noqa: N802
-        return Qt.DropAction.CopyAction
+        return Qt.DropAction.CopyAction | Qt.DropAction.MoveAction
+
+    def mimeData(  # noqa: N802 - Qt naming
+            self,
+            indexes: Iterable[QModelIndex],
+    ) -> Optional[QMimeData]:
+        """Describe a single dragged tab row as a :data:`TAB_NODE_MIME` payload.
+
+        Group rows (and multi-row drags) return ``None`` so Qt starts no drag.
+        """
+        indexes = list(indexes)
+        if len(indexes) != 1 or self._workspace is None:
+            return None
+        tab = self._workspace_tab_for_index(indexes[0])
+        if tab is None:
+            return None
+        mime = QMimeData()
+        # Branch-ness is read from the current model state: a node with
+        # descendants moves as a branch, a leaf moves alone.
+        branch = any(child.parent_id == tab.tab_id
+                     for child in self._workspace.tabs)
+        mime.setData(TAB_NODE_MIME, encode_tab_node(
+            self._workspace.id, tab.tab_id, branch=branch))
+        return mime
+
+    @staticmethod
+    def _node_for_mime(mime_data: QMimeData) -> Optional[tuple[uuid.UUID, int]]:
+        """Decode ``(workspace id, tab id)`` from a tab-node drag, if any."""
+        ref = decode_tab_node(mime_data)
+        if ref is None:
+            return None
+        return ref.workspace_id, ref.tab_id
+
+    def _node_drop_target(
+            self,
+            index: QModelIndex,
+    ) -> Optional[tuple[Optional[uuid.UUID], Optional[int]]]:
+        """Return ``(group_id, parent_tab_id)`` for a tab-node drop on *index*.
+
+        A group row targets that group at top level.  A tab row targets the
+        tab's own group and *parent* (the dropped node becomes its sibling).
+        The root (no row) targets a standalone top-level position.
+        """
+        group = self.group_for_index(index)
+        if group is not None:
+            return (group.group_id, None)
+        tab = self._workspace_tab_for_index(index)
+        if tab is not None:
+            return (tab.group_id, tab.parent_id)
+        return (None, None)
+
+    def _node_drop_valid(
+            self,
+            data: QMimeData,
+            action: Qt.DropAction,
+            parent: QModelIndex,
+    ) -> Optional[tuple[uuid.UUID, int, Optional[uuid.UUID], Optional[int]]]:
+        """Validate a tab-node drop; return the move arguments or ``None``.
+
+        The result is ``(source workspace id, tab id, group id, parent id)``.
+        A drop is refused when the source is the active workspace (the tree
+        only reorganises a workspace through the existing commands), when
+        the node no longer exists, or when the target group is archived.
+        """
+        if action != Qt.DropAction.MoveAction or self._workspace is None:
+            return None
+        decoded = self._node_for_mime(data)
+        if decoded is None:
+            return None
+        source_id, tab_id = decoded
+        if source_id == self._workspace.id:
+            return None
+        if self._manager.find_tab_by_id(source_id, tab_id) is None:
+            return None
+        target = self._node_drop_target(parent)
+        if target is None:
+            return None
+        group_id, parent_id = target
+        if group_id is not None:
+            group = next((g for g in self._workspace.groups
+                          if g.group_id == group_id), None)
+            if group is not None and group.archived:
+                return None
+        return source_id, tab_id, group_id, parent_id
+
+    def _drop_node(
+            self,
+            data: QMimeData,
+            action: Qt.DropAction,
+            parent: QModelIndex,
+    ) -> bool:
+        """Move the dragged tab node (and its branch) onto *parent*."""
+        valid = self._node_drop_valid(data, action, parent)
+        if valid is None:
+            return False
+        source_id, tab_id, group_id, parent_id = valid
+        assert self._workspace is not None
+        source = self._manager.get_workspace(source_id)
+        # A node with descendants moves as a branch (ADR 0008 ticket #6).
+        branch = source is not None and any(
+            tab.parent_id == tab_id for tab in source.tabs)
+        try:
+            self._manager.move_tab_to_workspace(
+                source_id, tab_id, self._workspace.id,
+                branch=branch, parent_id=parent_id, group_id=group_id)
+        except WorkspaceMoveError as e:
+            message.error(str(e))
+            return False
+        self._drop_target = None
+        return True
 
     def canDropMimeData(  # noqa: N802 - Qt naming
             self,
@@ -845,9 +1104,11 @@ class TabTreeModel(QAbstractItemModel):
             parent: QModelIndex,
     ) -> bool:
         del row, column  # the hovered row identifies the target
-        if action != Qt.DropAction.CopyAction:
-            return False
         if self._workspace is None:
+            return False
+        if data.hasFormat(TAB_NODE_MIME):
+            return self._node_drop_valid(data, action, parent) is not None
+        if action != Qt.DropAction.CopyAction:
             return False
         pinned = self._pinned_for_mime(data)
         if pinned is None:
@@ -874,6 +1135,8 @@ class TabTreeModel(QAbstractItemModel):
             parent: QModelIndex,
     ) -> bool:
         del row, column
+        if data.hasFormat(TAB_NODE_MIME):
+            return self._drop_node(data, action, parent)
         if not self.canDropMimeData(data, action, -1, -1, parent):
             return False
         pinned = self._pinned_for_mime(data)
@@ -1058,6 +1321,10 @@ class TabTreeModel(QAbstractItemModel):
         count = self._group_tab_count(group)
         if role == Qt.ItemDataRole.DisplayRole:
             return group.name
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            return group.name
+        if role == Qt.ItemDataRole.AccessibleDescriptionRole:
+            return self._group_accessible_description(group)
         if role == Qt.ItemDataRole.ToolTipRole:
             plural = 's' if count != 1 else ''
             return f"{group.name}\n{count} tab{plural}"
@@ -1076,6 +1343,73 @@ class TabTreeModel(QAbstractItemModel):
         if role == DropTargetRole:
             return self._drop_target == ('group', group.group_id)
         return _GROUP_STATIC_ROLES.get(role)
+
+    def _group_accessible_description(self, group: Group) -> str:
+        """Return the spoken state of *group*: fold, ``open/total``, state.
+
+        E.g. ``"group, 2/5 open, collapsed, suspended"``.
+        """
+        fold = 'collapsed' if self._group_folded(group) else 'expanded'
+        state = self._group_state(group).lower()
+        return f"group, {self._group_badge(group)} open, {fold}, {state}"
+
+    def _group_folded(self, group: Group) -> bool:
+        """Return the effective folded state of *group* (search forces open)."""
+        return False if self.search_active else group.folded
+
+    def _group_name_for(self, group_id: Optional[uuid.UUID]) -> str:
+        """Return the name of the group *group_id*, or ``''`` if none."""
+        if group_id is None or self._workspace is None:
+            return ''
+        for group in self._workspace.groups:
+            if group.group_id == group_id:
+                return group.name
+        return ''
+
+    def _tab_accessible_data(
+            self,
+            tab: WorkspaceTab,
+            info: _TabInfo,
+            kind: Kind,
+            role: int,
+    ) -> str:
+        """Return the spoken label (text role) or state (description role)."""
+        if role == Qt.ItemDataRole.AccessibleTextRole:
+            return info.title or info.url or '?'
+        return self._tab_accessible_description(tab, info, kind)
+
+    def _tab_accessible_description(
+            self,
+            tab: WorkspaceTab,
+            info: _TabInfo,
+            kind: Kind,
+    ) -> str:
+        """Return the spoken state of a tab row (ADR 0008 § Screen reader).
+
+        E.g. ``"tab, github.com/issues/128, group client-A, reading done,
+        open, loading, audio playing"``.
+        """
+        parts = ['tab']
+        if info.url:
+            parts.append(info.url)
+        if kind == Kind.ParentTab:
+            parts.append('parent')
+        group_name = self._group_name_for(tab.group_id)
+        if group_name:
+            parts.append(f'group {group_name}')
+        reading = getattr(tab, 'reading_status', 'FRESH') or 'FRESH'
+        parts.append(f'reading {reading.lower()}')
+        suspended = getattr(tab, 'open_status', 'SUSPENDED') == 'SUSPENDED'
+        parts.append('suspended' if suspended else 'open')
+        if info.status & Status.LOADING:
+            parts.append('loading')
+        if info.status & Status.AUDIBLE:
+            parts.append('audio playing')
+        if kind == Kind.ParentTab:
+            parts.append(
+                'collapsed' if self._folded_state.get(tab.tab_id, False)
+                else 'expanded')
+        return ', '.join(parts)
 
     def _group_badge(self, group: Group) -> str:
         """Return the ``"open/total"`` badge text for *group*."""
@@ -1106,30 +1440,18 @@ class TabTreeModel(QAbstractItemModel):
         except AttributeError:
             return True
 
-    def _tab_data(self, tab: WorkspaceTab, role: int, kind: Kind):
+    def _tab_data(self, tab: WorkspaceTab, role: int, kind: Kind) -> Any:
         info = self._tab_info.get(tab.tab_id, _TabInfo())
         if role == KindRole:
             return kind
         if role == ActiveRole:
             return self._active_tab_id == tab.tab_id
-        if role == OpenStatusRole:
-            return getattr(tab, 'open_status', 'SUSPENDED')
-        if role in (
-            Qt.ItemDataRole.DisplayRole,
-            Qt.ItemDataRole.ToolTipRole,
-            Qt.ItemDataRole.DecorationRole,
-            UrlRole,
-        ):
-            return self._tab_visible_data(info, role)
+        if role in _TAB_TEXT_ROLES:
+            return self._tab_text_data(tab, info, kind, role)
         if role == FoldedRole:
             return self._tab_folded(tab, kind)
-        if role == StatusRole:
-            status = info.status
-            if getattr(tab, 'open_status', 'SUSPENDED') == 'SUSPENDED':
-                status |= Status.SUSPENDED
-            return status
-        if role == PinStateRole:
-            return info.status & Status.PINNED != 0
+        if role in (StatusRole, PinStateRole):
+            return self._tab_status_data(tab, info, role)
         if role == SelectionRole:
             return tab.tab_id in self._selected
         if role == HighlightRole:
@@ -1137,6 +1459,30 @@ class TabTreeModel(QAbstractItemModel):
         if role in (GroupIdRole, DropTargetRole):
             return self._tab_relation_role(tab, role)
         return _TAB_STATIC_ROLES.get(role)
+
+    def _tab_text_data(self, tab: WorkspaceTab, info: _TabInfo, kind: Kind,
+                       role: int) -> Any:
+        """Return the text-like roles: title/URL/icon, reading and a11y."""
+        if role == OpenStatusRole:
+            return getattr(tab, 'open_status', 'SUSPENDED')
+        if role == SearchTermsRole:
+            return list(self._search_terms)
+        if role == ReadingStatusRole:
+            return getattr(tab, 'reading_status', 'FRESH') or 'FRESH'
+        if role in (Qt.ItemDataRole.AccessibleTextRole,
+                    Qt.ItemDataRole.AccessibleDescriptionRole):
+            return self._tab_accessible_data(tab, info, kind, role)
+        return self._tab_visible_data(info, role)
+
+    @staticmethod
+    def _tab_status_data(tab: WorkspaceTab, info: _TabInfo, role: int) -> Any:
+        """Return the status flags (StatusRole) or pin state (PinStateRole)."""
+        if role == PinStateRole:
+            return info.status & Status.PINNED != 0
+        status = info.status
+        if getattr(tab, 'open_status', 'SUSPENDED') == 'SUSPENDED':
+            status |= Status.SUSPENDED
+        return status
 
     def _tab_relation_role(self, tab: WorkspaceTab, role: int):
         """Return the group id / drop-target roles for *tab*."""
@@ -1225,8 +1571,10 @@ class TabTreeItemDelegate(QStyledItemDelegate):
     PIN_WIDTH = 14
     GAP_BEFORE_PIN = 6
     ACTIVE_ACCENT_WIDTH = 2
-    #: Width of the multi-select checkmark drawn in the left margin.
-    SELECTION_INDICATOR_WIDTH = 12
+    #: Width of the hover bar on the left edge (ADR § Hover).
+    HOVER_MARKER_WIDTH = 3
+    #: Edge of the multi-select checkbox drawn in the left margin.
+    SELECTION_INDICATOR_WIDTH = 14
 
     #: Upper bound for the per-index close-glyph hit-rect cache.
     CLOSE_RECT_CACHE_SIZE = 200
@@ -1239,6 +1587,19 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         self._last_pin_rect: dict[QModelIndex, QRect] = {}
         # Left-edge accent rect recorded during paint for the active tab.
         self._last_active_accent: Optional[QRect] = None
+        # Whether the tree has *keyboard* focus (ADR § Focus ring).  Set by
+        # the host from the focus reason; mouse focus never shows the ring.
+        self._keyboard_focus = False
+        # The tree's current (cursor) row, kept persistent across resets.
+        self._current = QPersistentModelIndex()
+
+    def set_keyboard_focus(self, keyboard: bool) -> None:
+        """Record whether the tree currently has keyboard focus."""
+        self._keyboard_focus = keyboard
+
+    def set_current_index(self, index: QModelIndex) -> None:
+        """Record *index* as the tree's current (cursor) row."""
+        self._current = QPersistentModelIndex(index)
 
     def sizeHint(  # noqa: N802 - Qt naming
             self,
@@ -1262,48 +1623,39 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         self.initStyleOption(option, index)
         kind = index.data(KindRole)
         folded = bool(index.data(FoldedRole))
+        palette = Palette.from_config()
+        rect = option.rect
 
         painter.save()
 
-        # Transient auto-locate / drop-target washes are painted beneath
-        # the selection / hover pass so those still win when both apply.
+        # Row fill (ADR § Color scheme): selected > hover > plain row.  The
+        # fill starts at the viewport edge so the indentation gutter of a
+        # nested row is tinted too, not left in the palette base colour.
+        if option.state & QStyle.StateFlag.State_Selected:
+            fill = palette.selected_fill
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            fill = palette.hover_fill
+        else:
+            fill = palette.row_fill
+        painter.fillRect(
+            QRect(0, rect.y(), rect.right() + 1, rect.height()), fill)
+
+        # Transient auto-locate / drop-target washes sit above the fill.
         if (bool(index.data(HighlightRole))
                 or bool(index.data(DropTargetRole))):
-            self._draw_transient_highlight(painter, option, index)
+            self._draw_transient_highlight(painter, option, index, palette)
 
-        # Background / selection.
-        if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(option.rect, option.palette.highlight())
-        elif option.state & QStyle.StateFlag.State_MouseOver:
-            painter.fillRect(option.rect, option.palette.alternateBase())
-
-        text_color = (
-            option.palette.highlightedText().color()
-            if option.state & QStyle.StateFlag.State_Selected
-            else option.palette.text().color()
-        )
-        # Group running state (VP-D2): dim suspended groups and give
-        # archived groups a distinct muted hint.  OPEN groups are unchanged.
-        if kind == Kind.Group:
-            group_state = index.data(GroupStateRole)
-            if group_state == 'SUSPENDED':
-                dimmed = QColor(text_color)
-                dimmed.setAlpha(140)
-                text_color = dimmed
-            elif group_state == 'ARCHIVED':
-                archived = QColor(text_color)
-                archived.setAlpha(100)
-                text_color = archived
-                hint = QColor(option.palette.mid().color())
-                hint.setAlpha(40)
-                painter.fillRect(option.rect, hint)
+        # Group running state (VP-D2): suspended and archived groups use the
+        # muted text colour; ARCHIVED also carries its own glyph.
+        text_color = palette.text
+        if kind == Kind.Group and index.data(GroupStateRole) in (
+                'SUSPENDED', 'ARCHIVED'):
+            text_color = palette.muted_text
         painter.setPen(text_color)
 
-        rect = option.rect
         x = rect.x()
 
         # Chevron.
-        chevron_rect: Optional[QRect] = None  # type: ignore[name-defined]
         if kind in (Kind.Group, Kind.ParentTab):
             chevron_rect = QRect(
                 x,
@@ -1320,7 +1672,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             )
             x += self.CHEVRON_WIDTH + self.GAP_CHEVRON_ICON
 
-        # Favicon (tabs only).
+        # Favicon (tabs only), then the reading-status glyph (tabs only).
         if kind in (Kind.Tab, Kind.ParentTab):
             icon_y = rect.y() + (rect.height() - self.ICON_SIZE) // 2
             icon_rect = QRect(x, icon_y, self.ICON_SIZE, self.ICON_SIZE)
@@ -1335,24 +1687,91 @@ class TabTreeItemDelegate(QStyledItemDelegate):
                 painter.fillRect(icon_rect, option.palette.mid())
             x += self.ICON_SIZE + self.GAP_ICON_TEXT
 
+            glyph = _READING_GLYPHS.get(index.data(ReadingStatusRole))
+            if glyph is not None:
+                glyph_rect = QRect(x, rect.y(), panelglyphs.GLYPH_SIZE,
+                                   rect.height())
+                panelglyphs.draw_glyph(
+                    painter, glyph, glyph_rect,
+                    _reading_color(palette, glyph))
+                x += panelglyphs.GLYPH_SIZE + self.GAP_ICON_TEXT
+
         # Title, trailing status/badge, hover close glyph and the active
         # accent are all delegated so the paint method stays small.
         self._draw_row_content(
-            painter, option, index, kind, rect, x, text_color)
+            painter, option, index, kind, rect, x, text_color, palette)
+
+        # Hover marker (shape, not colour alone): a 3 px bar on the left edge.
+        # It is drawn after the content so the favicon cannot cover it.  The
+        # active-tab / active-group accent takes over the same edge instead.
+        if (option.state & QStyle.StateFlag.State_MouseOver
+                and not index.data(ActiveRole)):
+            painter.fillRect(
+                QRect(rect.x(), rect.y(), self.HOVER_MARKER_WIDTH,
+                      rect.height()),
+                palette.hover_marker,
+            )
 
         # Multi-select checkmark (VP-F4): drawn as an overlay in the left
         # margin so the title / favicon / badge layout is untouched.
         if bool(index.data(SelectionRole)):
-            self._draw_selection_indicator(painter, rect, option)
+            self._draw_selection_indicator(painter, rect, palette)
 
-        # Focus ring (keyboard focus only; skip hover-only focus).
-        if (
-                option.state & QStyle.StateFlag.State_HasFocus
-                and not (option.state & QStyle.StateFlag.State_MouseOver)
-        ):
-            painter.setPen(text_color)
-            painter.drawRect(option.rect.adjusted(1, 1, -1, -1))
+        self._draw_cursor(painter, option, index, palette)
 
+        painter.restore()
+
+    def _draw_cursor(
+            self,
+            painter: QPainter,
+            option: QStyleOptionViewItem,
+            index: QModelIndex,
+            palette: Palette,
+    ) -> None:
+        """Mark the cursor row by shape: focus ring, or a dotted outline.
+
+        The ring (ADR § Focus ring) is shown only on keyboard focus, so a
+        mouse click gives the tree focus without it.  A current row without
+        keyboard focus gets a dotted outline instead, so it stays identifiable.
+        """
+        rect = option.rect
+        if (self._keyboard_focus
+                and option.state & QStyle.StateFlag.State_HasFocus):
+            self._draw_focus_ring(painter, rect, palette)
+        elif self._is_current(index):
+            pen = QPen(palette.text)
+            pen.setStyle(Qt.PenStyle.DotLine)
+            pen.setWidth(1)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(rect.adjusted(1, 1, -2, -2))
+
+    def _is_current(self, index: QModelIndex) -> bool:
+        """Return whether *index* is the tree's current (cursor) row."""
+        return self._current.isValid() and QModelIndex(self._current) == index
+
+    def _draw_focus_ring(
+            self,
+            painter: QPainter,
+            rect: QRect,
+            palette: Palette,
+    ) -> None:
+        """Draw the two-stroke focus ring: 2 px accent outside, 1 px fg inside.
+
+        Radius is 2 px to match the rounded workspace monograms.
+        """
+        painter.save()
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        outer = QRectF(rect).adjusted(1, 1, -2, -2)
+        pen = QPen(palette.focus_outer)
+        pen.setWidthF(2)
+        painter.setPen(pen)
+        painter.drawRoundedRect(outer, 2, 2)
+        inner = QRectF(rect).adjusted(3, 3, -4, -4)
+        pen = QPen(palette.focus_inner)
+        pen.setWidthF(1)
+        painter.setPen(pen)
+        painter.drawRoundedRect(inner, 1, 1)
         painter.restore()
 
     def editorEvent(  # noqa: N802 - Qt naming  # type: ignore[override]
@@ -1474,7 +1893,8 @@ class TabTreeItemDelegate(QStyledItemDelegate):
                 self.pin_toggled.emit(index)
                 return True
 
-        # Audio icon hit rect (only for audible tabs).
+        # Audio icon hit rect (only for audible tabs).  The strip is right
+        # aligned; the audio glyph follows the loading glyph, if shown.
         status = Status(int(index.data(StatusRole) or 0))
         if status & Status.AUDIBLE:
             fm: QFontMetrics = option.fontMetrics
@@ -1482,11 +1902,12 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             audio_width = fm.horizontalAdvance(audio_text)
             status_text = self._status_text(status)
             full_width = fm.horizontalAdvance(status_text)
-            # Audio is the leftmost glyph in the status strip.
             strip_x = (
                 rect.right() - self.RIGHT_MARGIN - close_reserve
                 - pin_reserve - full_width
             )
+            if status & Status.LOADING:
+                strip_x += fm.horizontalAdvance(_Icon.LOADING.value)
             audio_rect = QRect(
                 strip_x,
                 rect.y(),
@@ -1507,6 +1928,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             rect: QRect,
             x: int,
             text_color: QColor,
+            palette: Palette,
     ) -> None:
         """Draw the title, trailing strip, close/pin glyphs and active accent."""
         fm: QFontMetrics = option.fontMetrics
@@ -1542,6 +1964,8 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             badge = index.data(BadgeRole)
             if badge is not None:
                 badge_text = str(badge)
+        group_glyph = _GROUP_GLYPHS.get(index.data(GroupStateRole)) \
+            if kind == Kind.Group else None
 
         strip_width = (
             fm.horizontalAdvance(status_text) + self.GAP_STRIP
@@ -1553,8 +1977,14 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             if badge_text
             else 0
         )
+        glyph_width = (
+            panelglyphs.GLYPH_SIZE + self.GAP_STRIP
+            if group_glyph is not None
+            else 0
+        )
         trailing_width = (
-            max(strip_width, badge_width) + close_reserve + pin_reserve
+            max(strip_width, badge_width + glyph_width)
+            + close_reserve + pin_reserve
         )
         text_width = max(
             rect.width() - (x - rect.x()) - trailing_width - self.RIGHT_MARGIN,
@@ -1567,6 +1997,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             Qt.TextElideMode.ElideRight,
             text_width,
         )
+        painter.setPen(text_color)
         painter.drawText(
             x,
             rect.y(),
@@ -1575,34 +2006,100 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
             elided,
         )
+        if kind in (Kind.Tab, Kind.ParentTab):
+            self._draw_search_underlines(
+                painter, fm, x, rect, elided, index, palette)
 
-        # Status strip or badge, right aligned (shifted left of the pin and
-        # close glyphs).
-        if status_text or badge_text:
-            draw_text = status_text or badge_text
-            drawn_width = fm.horizontalAdvance(draw_text)
-            text_x = (
-                rect.right() - self.RIGHT_MARGIN - close_reserve
-                - pin_reserve - drawn_width
-            )
-            if kind == Kind.Group:
-                # Dimmed badge.
-                dim_color = QColor(text_color)
-                dim_color.setAlpha(140)
-                painter.setPen(dim_color)
+        right_edge = (
+            rect.right() - self.RIGHT_MARGIN - close_reserve - pin_reserve)
+        # Tab status strip (loading / audio / suspended), right aligned.
+        if status_text:
+            self._draw_status_strip(
+                painter, fm, rect, right_edge - fm.horizontalAdvance(
+                    status_text), status, palette)
+        # Group badge (dimmed, contrast-checked) with the state glyph to
+        # its left.
+        if badge_text:
+            drawn_width = fm.horizontalAdvance(badge_text)
+            text_x = right_edge - drawn_width
+            painter.setPen(palette.muted_text)
             painter.drawText(
                 text_x,
                 rect.y(),
                 drawn_width,
                 rect.height(),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                draw_text,
+                badge_text,
             )
+            if group_glyph is not None:
+                glyph_rect = QRect(
+                    text_x - self.GAP_STRIP - panelglyphs.GLYPH_SIZE,
+                    rect.y(),
+                    panelglyphs.GLYPH_SIZE,
+                    rect.height(),
+                )
+                panelglyphs.draw_glyph(
+                    painter, group_glyph, glyph_rect,
+                    _group_color(palette, group_glyph))
 
         self._finish_row(
             painter, option, index, rect, is_tab, kind, close_rect, pin_rect,
-            is_pinned,
+            is_pinned, palette,
         )
+
+    def _draw_status_strip(
+            self,
+            painter: QPainter,
+            fm: QFontMetrics,
+            rect: QRect,
+            x: int,
+            status: Status,
+            palette: Palette,
+    ) -> None:
+        """Draw the status glyphs left to right, each in its own colour."""
+        for glyph, colour_key in self._status_segments(status):
+            painter.setPen(getattr(palette, colour_key))
+            width = fm.horizontalAdvance(glyph)
+            painter.drawText(
+                x,
+                rect.y(),
+                width,
+                rect.height(),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                glyph,
+            )
+            x += width
+
+    def _draw_search_underlines(
+            self,
+            painter: QPainter,
+            fm: QFontMetrics,
+            x: int,
+            rect: QRect,
+            shown: str,
+            index: QModelIndex,
+            palette: Palette,
+    ) -> None:
+        """Underline the search-query matches in the drawn title (ADR § 2).
+
+        *shown* is the elided title actually drawn at *x*; only matches in it
+        are underlined.  The underline uses the accent colour.
+        """
+        terms = index.data(SearchTermsRole) or []
+        if not terms or not shown:
+            return
+        lowered = shown.lower()
+        baseline = rect.y() + rect.height() - 4
+        painter.save()
+        painter.setPen(palette.accent)
+        for term in terms:
+            start = lowered.find(term)
+            while term and start != -1:
+                left = x + fm.horizontalAdvance(shown[:start])
+                width = fm.horizontalAdvance(shown[start:start + len(term)])
+                painter.drawLine(left, baseline, left + width - 1, baseline)
+                start = lowered.find(term, start + len(term))
+        painter.restore()
 
     def _finish_row(
             self,
@@ -1615,23 +2112,20 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             close_rect: Optional[QRect],
             pin_rect: Optional[QRect],
             is_pinned: bool,
+            palette: Palette,
     ) -> None:
         """Draw the close/pin glyphs and the active-tab/group left accent."""
         # Hover close glyph and its hit-rect cache.
         if close_rect is not None:
-            self._draw_close(painter, close_rect, option.palette.mid().color())
+            self._draw_close(painter, close_rect, palette.muted_text)
             self._remember_close_rect(index, close_rect)
         else:
             self._last_close_rect.pop(index, None)
 
-        # Pin glyph: full-opacity accent when pinned, half-opacity muted
-        # otherwise (the latter only happens on hover).
+        # Pin glyph: accent when pinned, muted otherwise (the latter only
+        # happens on hover).
         if pin_rect is not None:
-            if is_pinned:
-                pin_color = option.palette.highlight().color()
-            else:
-                pin_color = QColor(option.palette.mid().color())
-                pin_color.setAlpha(128)
+            pin_color = palette.pin if is_pinned else palette.muted_text
             self._draw_pin(painter, pin_rect, pin_color)
             self._remember_pin_rect(index, pin_rect)
         else:
@@ -1645,7 +2139,7 @@ class TabTreeItemDelegate(QStyledItemDelegate):
         if active_tab or active_group:
             accent_rect = QRect(
                 rect.x(), rect.y(), self.ACTIVE_ACCENT_WIDTH, rect.height())
-            painter.fillRect(accent_rect, option.palette.highlight().color())
+            painter.fillRect(accent_rect, palette.accent)
             self._last_active_accent = accent_rect
         else:
             self._last_active_accent = None
@@ -1677,17 +2171,31 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             self,
             painter: QPainter,
             rect: QRect,
-            option: QStyleOptionViewItem,
+            palette: Palette,
     ) -> None:
-        """Draw the multi-select checkmark in the row's left margin."""
+        """Draw the multi-select checkbox, with a stroked check, in the margin.
+
+        The check is a 2 px stroke rather than a text glyph: a small text
+        check can read as a solid box at this size.
+        """
         size = self.SELECTION_INDICATOR_WIDTH
         y = rect.y() + (rect.height() - size) // 2
         box = QRect(
             rect.x() + self.ACTIVE_ACCENT_WIDTH + 2, y, size, size)
         painter.save()
-        painter.fillRect(box, option.palette.highlight().color())
-        painter.setPen(option.palette.highlightedText().color())
-        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, '✓')
+        painter.fillRect(box, palette.accent)
+        pen = QPen(best_black_or_white([palette.accent]))
+        pen.setWidthF(2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        left, top = box.x(), box.y()
+        check = QPainterPath()
+        check.moveTo(left + size * 0.25, top + size * 0.52)
+        check.lineTo(left + size * 0.43, top + size * 0.70)
+        check.lineTo(left + size * 0.76, top + size * 0.32)
+        painter.drawPath(check)
         painter.restore()
 
     def _remember_close_rect(self, index: QModelIndex, rect: QRect) -> None:
@@ -1774,50 +2282,66 @@ class TabTreeItemDelegate(QStyledItemDelegate):
             painter: QPainter,
             option: QStyleOptionViewItem,
             index: QModelIndex,
+            palette: Palette,
     ) -> None:
         """Paint the auto-locate / drop-target row washes."""
         if bool(index.data(HighlightRole)):
-            painter.fillRect(option.rect, self._highlight_color(option))
+            painter.fillRect(option.rect, self._highlight_color(palette))
         if bool(index.data(DropTargetRole)):
-            target = QColor(option.palette.highlight().color())
+            target = QColor(palette.accent)
             target.setAlpha(70)
             painter.fillRect(option.rect, target)
 
     @staticmethod
-    def _highlight_color(option: QStyleOptionViewItem) -> QColor:
-        """Return the faint auto-locate wash for *option*'s palette."""
-        base = QColor(option.palette.base().color())
-        accent = QColor(option.palette.highlight().color())
-        ratio = 0.18
-        return QColor(
-            round(base.red() + (accent.red() - base.red()) * ratio),
-            round(base.green() + (accent.green() - base.green()) * ratio),
-            round(base.blue() + (accent.blue() - base.blue()) * ratio),
-        )
+    def _highlight_color(palette: Palette) -> QColor:
+        """Return the faint auto-locate wash (base blended toward accent)."""
+        return blend(palette.base, palette.accent, 0.18)
 
     @staticmethod
-    def _status_text(status: Status) -> str:
-        parts = []
+    def _status_segments(status: Status) -> list[tuple[str, str]]:
+        """Return ``(glyph, colour key)`` for each status-strip item.
+
+        Colour keys name a :class:`Palette` attribute: ``'loading'`` (40 %),
+        ``'text'`` (audio) and ``'suspended'`` (50 %), per ADR 0008 § "Color
+        scheme".  PINNED is its own affordance (the P glyph), not in the strip.
+        """
+        segments = []
         if status & Status.LOADING:
-            parts.append(_Icon.LOADING.value)
+            segments.append((_Icon.LOADING.value, 'loading'))
         if status & Status.AUDIBLE:
-            parts.append(_Icon.AUDIBLE.value)
+            segments.append((_Icon.AUDIBLE.value, 'text'))
         if status & Status.SUSPENDED:
-            parts.append(_Icon.SUSPENDED.value)
-        # PINNED is rendered as its own affordance column (the P glyph),
-        # not as part of the status strip.
-        return ''.join(parts)
+            segments.append((_Icon.SUSPENDED.value, 'suspended'))
+        return segments
+
+    @classmethod
+    def _status_text(cls, status: Status) -> str:
+        return ''.join(glyph for glyph, _ in cls._status_segments(status))
 
 
 class _TabTreeView(QTreeView):
 
-    """QTreeView which accepts pinned-entry drags from the PIN panel.
+    """QTreeView which accepts pinned-entry and tab-node drags.
 
-    The view drives the model's ``canDropMimeData`` / ``dropMimeData``
-    itself so it can reject invalid rows *before* Qt paints a drop
-    indicator, and so the hovered row can carry :data:`DropTargetRole`
-    while the drag is in progress.
+    Native branch arrows are suppressed: the delegate draws the custom 9 px
+    fold chevron (ADR 0008 § "Fold indicator").
+
+    Pinned entries from the PIN panel drop with ``CopyAction``; tab nodes
+    dragged out of this tree (ticket #6) drop with ``MoveAction``.  The view
+    drives the model's ``canDropMimeData`` / ``dropMimeData`` itself so it
+    can reject invalid rows *before* Qt paints a drop indicator, and so the
+    hovered row can carry :data:`DropTargetRole` while the drag is in
+    progress (accept = highlighted, reject = no-drop cursor and no
+    highlight).
     """
+
+    def drawBranches(  # noqa: N802 - Qt naming  # type: ignore[override]
+            self,
+            painter: QPainter,
+            rect: QRect,
+            index: QModelIndex,
+    ) -> None:
+        """Draw no native branch indicator (see the class docstring)."""
 
     @staticmethod
     def _event_pos(event) -> QPoint:
@@ -1827,23 +2351,35 @@ class _TabTreeView(QTreeView):
         except AttributeError:  # Qt5
             return event.pos()
 
+    @staticmethod
+    def _drop_action_for(mime_data: QMimeData) -> Optional[Qt.DropAction]:
+        """Return the drop action our model expects for *mime_data*, if any."""
+        if mime_data.hasFormat(TAB_NODE_MIME):
+            return Qt.DropAction.MoveAction
+        if mime_data.hasFormat(PINNED_TAB_MIME):
+            return Qt.DropAction.CopyAction
+        return None
+
     def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if event.mimeData().hasFormat(PINNED_TAB_MIME):
-            event.acceptProposedAction()
-        else:
+        action = self._drop_action_for(event.mimeData())
+        if action is None:
             super().dragEnterEvent(event)
+            return
+        event.setDropAction(action)
+        event.accept()
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if not event.mimeData().hasFormat(PINNED_TAB_MIME):
+        action = self._drop_action_for(event.mimeData())
+        if action is None:
             super().dragMoveEvent(event)
             return
         index = self.indexAt(self._event_pos(event))
         model = self.model()
         if model.canDropMimeData(
-                event.mimeData(), Qt.DropAction.CopyAction,
-                -1, -1, index):
+                event.mimeData(), action, -1, -1, index):
             model.set_drop_target(index)
-            event.acceptProposedAction()
+            event.setDropAction(action)
+            event.accept()
         else:
             model.set_drop_target(QModelIndex())
             event.ignore()
@@ -1855,16 +2391,18 @@ class _TabTreeView(QTreeView):
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event) -> None:  # noqa: N802 - Qt naming
-        if not event.mimeData().hasFormat(PINNED_TAB_MIME):
+        action = self._drop_action_for(event.mimeData())
+        if action is None:
             super().dropEvent(event)
             return
         index = self.indexAt(self._event_pos(event))
         model = self.model()
         dropped = model.dropMimeData(
-            event.mimeData(), Qt.DropAction.CopyAction, -1, -1, index)
+            event.mimeData(), action, -1, -1, index)
         model.set_drop_target(QModelIndex())
         if dropped:
-            event.acceptProposedAction()
+            event.setDropAction(action)
+            event.accept()
         else:
             event.ignore()
 
@@ -1924,21 +2462,33 @@ class TabTree(QWidget):
         self._search_terms: list[str] = []
 
         self.setObjectName('tab-tree')
+        # ADR 0008 § "Screen reader contract".
+        self.setAccessibleName('Tabs')
+        self.setAccessibleDescription(
+            'Tabs of the active workspace, grouped; use arrow keys to move, '
+            'Right and Left to expand and collapse.')
 
         self._model = TabTreeModel(manager, parent=self)
         self._delegate = TabTreeItemDelegate(self)
         self._view = _TabTreeView(self)
         self._view.setObjectName('tab-tree-view')
+        self._view.setAccessibleName('Tabs')
+        self._view.setAccessibleDescription(self.accessibleDescription())
         self._view.setModel(self._model)
         self._view.setItemDelegate(self._delegate)
-        # Pinned-tab drops (ADR 0008 § "Pinned-tab drop target").
+        # Pinned-tab drops (ADR 0008 § "Pinned-tab drop target") and tab-node
+        # moves (ticket #6) both go through Qt's built-in drag and drop.
         self._view.setAcceptDrops(True)
         self._view.setDragDropMode(
-            QAbstractItemView.DragDropMode.DropOnly)
+            QAbstractItemView.DragDropMode.DragDrop)
+        self._view.setDragEnabled(True)
         self._view.setDropIndicatorShown(False)
 
         self._view.setHeaderHidden(True)
         self._view.setIndentation(18)
+        # No branch column at the root: top-level rows (standalone tabs and
+        # group headers) start at the left edge, as in ADR 0008's wireframes.
+        self._view.setRootIsDecorated(False)
         self._view.setUniformRowHeights(False)
         self._view.setAnimated(True)
         self._view.setSelectionBehavior(
@@ -1952,7 +2502,9 @@ class TabTree(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._view.setVerticalScrollMode(
             QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self._view.setAlternatingRowColors(True)
+        self._view.setAlternatingRowColors(False)
+        self._apply_view_palette()
+        panelstyle.connect_colors_changed(self._on_colors_changed)
         # Group rows expose a minimal context menu (VP-A1 affinity toggle).
         self._view.setContextMenuPolicy(
             Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1977,15 +2529,34 @@ class TabTree(QWidget):
         self.search_input.setObjectName('tab-tree-search')
         self.search_input.setPlaceholderText("Search tabs…")
         self.search_input.setClearButtonEnabled(True)
+        self.search_input.setAccessibleName('Search tabs')
         self.search_input.textChanged.connect(self._on_search_changed)
         layout.addWidget(self.search_input)
 
         layout.addWidget(self._stack)
+        # Tab cycles search -> tree in order (ADR § "Panel focus").
+        self.setTabOrder(self.search_input, self._view)
+
+        # Keyboard focus ring (ADR § "Focus ring") for the field and the tree.
+        panelstyle.install_focus_ring(self.search_input, field=True)
+        panelstyle.install_focus_ring(self._view)
 
         self._refresh_empty_state()
 
         # Delegate interactions.
         self._delegate.fold_toggled.connect(self._model.toggle_folded)
+        # After the model has flipped the fold, mirror it on the view so the
+        # children actually show or hide (ADR § "Fold indicator").
+        self._delegate.fold_toggled.connect(self._on_fold_toggled)
+        # Expansion follows the folded flags: rebuilds and searches re-apply
+        # it, so group members are visible unless the user folded them.
+        self._model.modelReset.connect(self._sync_expansion)
+        selection = self._view.selectionModel()
+        if selection is not None:
+            selection.currentChanged.connect(self._on_current_changed)
+        # Keyboard navigation and focus tracking for the tree (ADR §
+        # "Keyboard navigation"); see :meth:`eventFilter`.
+        self._view.installEventFilter(self)
         self._delegate.fold_toggled.connect(self.fold_toggled)
         self._delegate.audio_toggled.connect(self.audio_toggled)
         self._delegate.close_requested.connect(self.close_requested)
@@ -2008,12 +2579,132 @@ class TabTree(QWidget):
             shortcut.setContext(
                 Qt.ShortcutContext.WidgetWithChildrenShortcut)
             shortcut.activated.connect(
-                lambda d=delta: self._move_selection(d))
+                weak_slot(self._move_selection, delta))
             self._shortcuts.append(shortcut)
+
+        # The model was populated before the reset hook was connected, so
+        # apply the initial expansion explicitly.
+        self._sync_expansion()
 
         # Refresh when the manager signals a mutation.
         # TODO(v0.2): Replace wholesale rebuild with fine-grained inserts/removes.
         self._manager.changed.connect(self._on_manager_changed)
+
+    def _apply_view_palette(self) -> None:
+        """Paint the tree's bare background with the panel base colour."""
+        palette = Palette.from_config()
+        view_palette = QPalette(self._view.palette())
+        for role in (QPalette.ColorRole.Base, QPalette.ColorRole.Window):
+            view_palette.setColor(role, palette.base)
+        view_palette.setColor(QPalette.ColorRole.Text, palette.text)
+        self._view.setPalette(view_palette)
+        self._view.viewport().setPalette(view_palette)
+
+    def _on_colors_changed(self, option: str) -> None:
+        """Re-apply the panel colours after a ``colors.*`` change."""
+        if option.startswith('colors.'):
+            self._apply_view_palette()
+            self._view.viewport().update()
+
+    # --- expansion, current row and keyboard focus ---
+
+    def _sync_expansion(self) -> None:
+        """Expand every group / parent row whose folded flag is clear."""
+        def walk(parent: QModelIndex) -> None:
+            for row in range(self._model.rowCount(parent)):
+                child = self._model.index(row, 0, parent)
+                if self._model.rowCount(child):
+                    folded = bool(child.data(FoldedRole))
+                    self._view.setExpanded(child, not folded)
+                    walk(child)
+
+        walk(QModelIndex())
+
+    def _on_fold_toggled(self, index: QModelIndex) -> None:
+        """Mirror a chevron / keyboard fold change onto the view."""
+        if index.isValid() and self._model.rowCount(index):
+            self._view.setExpanded(index, not bool(index.data(FoldedRole)))
+
+    def _on_current_changed(
+            self,
+            current: QModelIndex,
+            _previous: QModelIndex,
+    ) -> None:
+        """Keep the delegate's cursor-row marker in step with the view."""
+        self._delegate.set_current_index(current)
+        self._view.viewport().update()
+
+    def _set_folded(self, index: QModelIndex, folded: bool) -> None:
+        """Fold or unfold the group / parent row *index* from the keyboard."""
+        if self._model.search_active or not self._model.rowCount(index):
+            return
+        if bool(index.data(FoldedRole)) != folded:
+            self._model.toggle_folded(index)
+        self._view.setExpanded(index, not folded)
+
+    def _keyboard_navigate(self, key: int) -> bool:
+        """Handle Left / Right / Return / Space on the tree.
+
+        Returns ``True`` when the key was consumed.  Right expands a
+        collapsed group or parent (or steps into its first child); Left
+        collapses an expanded one (or steps to the parent).  Return and Space
+        activate a tab row; a group header is a no-op (ADR § "Keyboard
+        navigation").
+        """
+        index = self._view.currentIndex()
+        if not index.isValid():
+            return False
+        has_children = self._model.rowCount(index) > 0
+        if key == Qt.Key.Key_Right:
+            if has_children and not self._view.isExpanded(index):
+                self._set_folded(index, False)
+            elif has_children:
+                self._view.setCurrentIndex(self._model.index(0, 0, index))
+            return True
+        if key == Qt.Key.Key_Left:
+            if has_children and self._view.isExpanded(index):
+                self._set_folded(index, True)
+            elif index.parent().isValid():
+                self._view.setCurrentIndex(index.parent())
+            return True
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space):
+            if index.data(KindRole) != Kind.Group:
+                self.activated.emit(index)
+            return True
+        return False
+
+    def eventFilter(  # noqa: N802 - Qt naming
+            self,
+            obj: Optional[QObject],
+            event: Optional[QEvent],
+    ) -> bool:
+        """Route the tree's keyboard, focus and keyboard-menu events."""
+        if obj is not self._view or event is None:
+            return super().eventFilter(obj, event)
+        etype = event.type()
+        if isinstance(event, QFocusEvent):
+            keyboard = (
+                etype == QEvent.Type.FocusIn
+                and event.reason() != Qt.FocusReason.MouseFocusReason
+            )
+            if etype in (QEvent.Type.FocusIn, QEvent.Type.FocusOut):
+                self._delegate.set_keyboard_focus(keyboard)
+                self._view.viewport().update()
+        elif etype == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+            if event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                if self._keyboard_navigate(event.key()):
+                    return True
+        elif (etype == QEvent.Type.ContextMenu
+              and isinstance(event, QContextMenuEvent)
+              and event.reason() == QContextMenuEvent.Reason.Keyboard):
+            # The Menu key has no mouse position; open the menu on the
+            # cursor row so the affinity toggle is reachable without a mouse.
+            index = self._view.currentIndex()
+            if index.isValid():
+                rect = self._view.visualRect(index)
+                self._on_context_menu_requested(rect.center())
+                return True
+        return super().eventFilter(obj, event)
 
     def _on_search_changed(self, text: str) -> None:
         """Filter the tree live as the user types (VP-P5)."""
@@ -2027,6 +2718,7 @@ class TabTree(QWidget):
         rebuild path; a non-empty query renders only the hits.
         """
         workspace = self._manager.get_active()
+        self._model.set_search_terms(self._search_terms)
         if not self._search_terms or workspace is None:
             self._model.set_search_hits(None)
         else:
@@ -2056,6 +2748,32 @@ class TabTree(QWidget):
             self._refresh_empty_state()
 
         self._restore_current_selection(tab_id, group_id, row)
+
+    @contextlib.contextmanager
+    def bulk_rebuild(self) -> Iterator[None]:
+        """Suppress animation and keep the selection across a bulk rebuild.
+
+        Used while recovering a crash journal (#7): many manager changes
+        collapse into one model reset, which would otherwise animate every
+        expand/collapse and stutter.  Inside the block the view is not
+        animated and does not repaint; on exit the previous animation setting
+        is restored and the current row is put back if it is still valid (by
+        tab id, then group id, then row).
+        """
+        current = self._view.currentIndex()
+        tab_id = self._model.tab_id_for_index(current)
+        group = self._model.group_for_index(current)
+        group_id = group.group_id if group is not None else None
+        row = current.row() if current.isValid() else -1
+        animated = self._view.isAnimated()
+        self._view.setAnimated(False)
+        self._view.setUpdatesEnabled(False)
+        try:
+            yield
+        finally:
+            self._view.setUpdatesEnabled(True)
+            self._view.setAnimated(animated)
+            self._restore_current_selection(tab_id, group_id, row)
 
     def _restore_current_selection(
             self,
@@ -2092,9 +2810,9 @@ class TabTree(QWidget):
         action = menu.addAction(label)
         action.setCheckable(True)
         action.setChecked(group.affinity_enabled)
+        # triggered(bool) lands as the trailing ``enabled`` argument.
         action.triggered.connect(
-            lambda checked=False, g=group: self._set_group_affinity(
-                g, checked))
+            weak_slot(self._set_group_affinity, group))
         menu.exec(self._view.viewport().mapToGlobal(pos))
 
     def _set_group_affinity(self, group: Group, enabled: bool) -> None:
@@ -2119,6 +2837,7 @@ class TabTree(QWidget):
         *group_id* handles a standalone tab.
         """
         tab_index = self._model.focus_group_and_tab(group_id, tab_id)
+        self._sync_expansion()
         if group_id is not None:
             group_index = self._model._index_for_group_id(group_id)
             if group_index.isValid():

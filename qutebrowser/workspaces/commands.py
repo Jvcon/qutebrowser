@@ -24,7 +24,8 @@ from qutebrowser.utils import log, message, objreg, standarddir
 from qutebrowser.utils.utils import format_size
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import (READING_STATUSES, TabMetadata,
-                                            WorkspaceManager)
+                                            WorkspaceManager,
+                                            WorkspaceMoveError)
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
 from qutebrowser.workspaces.portability import (DEFAULT_EXPORT_FILENAME,
@@ -538,9 +539,11 @@ def vp_group_delete(target: str) -> None:
         # ADR 0008 § Decisions: empty groups are deleted without a prompt.
         _make_group_delete_action(manager, workspace, group)()
         return
+    count = manager.group_total_count(workspace.id, group.group_id)
     message.confirm_async(
-        title=(f"Delete group '{group.name}' and all its tabs? "
-               "This cannot be undone."),
+        title=f"Delete group '{group.name}'?",
+        text=(f"This will keep its {count} tab(s) as top-level tabs. "
+              "The group itself cannot be restored."),
         default=False,
         yes_action=_make_group_delete_action(manager, workspace, group),
     )
@@ -1187,6 +1190,64 @@ def tab_move_to_group(tab_id: int, group_name: str = 'root') -> None:
     manager.move_tab_to_group(workspace.id, tab_id, group_id)
     target = group_name if group_id is not None else 'root'
     message.info(f"Moved tab {tab_id} to {target}.")
+
+
+def _move_tab_to_workspace(tab_id: int, workspace_name: str, *,
+                           branch: bool) -> None:
+    """Shared body of :tabtree-move and :tabtree-move-branch.
+
+    The source is always the active workspace: the TabTree only shows that
+    workspace's entries, so *tab_id* must be one of them.
+    """
+    manager = _manager()
+    source = _active_workspace(manager)
+    target = manager.get_workspace_by_name(workspace_name)
+    if target is None:
+        raise cmdutils.CommandError(
+            f"No workspace with the name '{workspace_name}'!")
+    if target.archived:
+        raise cmdutils.CommandError(
+            f"Workspace '{target.name}' is archived; unarchive it first.")
+    try:
+        manager.move_tab_to_workspace(
+            source.id, tab_id, target.id, branch=branch)
+    except WorkspaceMoveError as e:
+        raise cmdutils.CommandError(str(e)) from e
+    what = 'branch from tab' if branch else 'tab'
+    message.info(
+        f"Moved {what} {tab_id} to workspace '{target.name}'.")
+
+
+@cmdutils.register(name='tabtree-move')
+@cmdutils.argument('tab_id', metavar='tab-id')
+@cmdutils.argument('workspace_name', metavar='workspace')
+def tabtree_move(tab_id: int, workspace_name: str) -> None:
+    """Move a single tab from the active workspace to another workspace.
+
+    Its direct children stay in the active workspace and are attached to the
+    tab's former parent. The tab becomes a top-level entry in the target.
+
+    Args:
+        tab_id: The tab entry's integer id in the active workspace.
+        workspace_name: Name of the target workspace.
+    """
+    _move_tab_to_workspace(tab_id, workspace_name, branch=False)
+
+
+@cmdutils.register(name='tabtree-move-branch')
+@cmdutils.argument('tab_id', metavar='tab-id')
+@cmdutils.argument('workspace_name', metavar='workspace')
+def tabtree_move_branch(tab_id: int, workspace_name: str) -> None:
+    """Move a tab and all of its descendants to another workspace.
+
+    Parent-child links inside the moved branch are kept. The branch root
+    becomes a top-level entry in the target.
+
+    Args:
+        tab_id: The branch root's integer id in the active workspace.
+        workspace_name: Name of the target workspace.
+    """
+    _move_tab_to_workspace(tab_id, workspace_name, branch=True)
 
 
 def _live_tab(win_id: int, tab_id: int) -> Any:

@@ -13,22 +13,50 @@ objects and pinned tabs, exposes CRUD operations over them, and emits
 
 import dataclasses
 import datetime
+import itertools
 import re
 import time
 import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any, Callable, Optional
 
-import yaml
-
 from qutebrowser.qt.core import QObject, QTimer, QUrl, pyqtSignal
 
 from qutebrowser.config import config, configexc
-from qutebrowser.utils import log, objreg, qtutils
+from qutebrowser.utils.qtutils import weak_slot
+from qutebrowser.utils import log, message, objreg, qtutils
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
-from qutebrowser.workspaces.persistence import (PinnedPersistence,
+from qutebrowser.workspaces.persistence import (CORRUPT_DATA_ERRORS,
+                                                JournalPersistence,
+                                                JournalSnapshot,
+                                                PinnedPersistence,
                                                 WorkspacePersistence)
+
+#: Batch window (ms) for crash-journal writes.  The first change opens the
+#: window; every change inside it is coalesced into one disk write when it
+#: closes.  A window (rather than a debounce) bounds the latency under a
+#: constant stream of changes.
+JOURNAL_BATCH_MS = 500
+
+#: Tab entries resident at which ADR 0008's memory budget was measured
+#: (``tracemalloc``, 326 KiB against a 512 KiB budget).  Used as the runtime
+#: proxy for that budget -- see :meth:`WorkspaceManager._report_resident_size`.
+MEMORY_BUDGET_ENTRIES = 500
+
+
+@dataclasses.dataclass(frozen=True)
+class RecoverySummary:
+
+    """What a crash recovery restored.
+
+    Attributes:
+        workspaces: Number of workspaces restored from the journal.
+        tabs: Total number of tab entries restored across those workspaces.
+    """
+
+    workspaces: int
+    tabs: int
 
 
 def _now() -> str:
@@ -189,6 +217,42 @@ def _parse_timestamp(value: str) -> Optional[datetime.datetime]:
     return parsed
 
 
+class WorkspaceMoveError(ValueError):
+
+    """A cross-workspace tab move was refused.
+
+    ``str(error)`` is a user-facing message suitable for ``message.error``.
+    """
+
+
+def _free_id(occupied: set[int], preferred: int) -> int:
+    """Return *preferred* when unused, else the smallest unused positive id."""
+    if preferred not in occupied:
+        return preferred
+    candidate = 1
+    while candidate in occupied:
+        candidate += 1
+    return candidate
+
+
+def _descendant_ids(workspace: Workspace, tab_id: int) -> set[int]:
+    """Return the ids of every tab nested (at any depth) under *tab_id*.
+
+    *tab_id* itself is not included.  Visited ids are tracked so a corrupt
+    parent cycle in the data cannot loop forever.
+    """
+    found: set[int] = set()
+    frontier = [tab_id]
+    while frontier:
+        current = frontier.pop()
+        for tab in workspace.tabs:
+            if (tab.parent_id == current and tab.tab_id != tab_id
+                    and tab.tab_id not in found):
+                found.add(tab.tab_id)
+                frontier.append(tab.tab_id)
+    return found
+
+
 @dataclasses.dataclass
 class TabMetadata:
 
@@ -238,10 +302,25 @@ class WorkspaceManager(QObject):
     suggestions_changed = pyqtSignal(list)
 
     def __init__(self, persistence: WorkspacePersistence,
-                 pinned_persistence: PinnedPersistence) -> None:
+                 pinned_persistence: PinnedPersistence,
+                 journal: Optional[JournalPersistence] = None) -> None:
         super().__init__()
         self._persistence = persistence
         self._pinned_persistence = pinned_persistence
+        # Crash journal (#7).  ``None`` disables journaling entirely, which is
+        # what in-memory test doubles get.
+        self._journal = journal
+        self._journal_dirty = False
+        self._journal_closing = False
+        # A journal left by a previous run that did not exit cleanly.  It is
+        # never applied implicitly: the user accepts or declines it first.
+        self._pending_recovery: Optional[JournalSnapshot] = None
+        self._recovery_offered = False
+        self._journal_timer = QTimer(self)
+        self._journal_timer.setSingleShot(True)
+        self._journal_timer.setInterval(JOURNAL_BATCH_MS)
+        self._journal_timer.timeout.connect(weak_slot(self.flush_journal))
+        self.changed.connect(weak_slot(self._mark_journal_dirty))
         self.profile_name: str = persistence.profile_name
         self._workspaces: dict[uuid.UUID, Workspace] = {}
         self._active_id: Optional[uuid.UUID] = None
@@ -279,7 +358,7 @@ class WorkspaceManager(QObject):
         if active_id is not None:
             try:
                 workspace = self._persistence.load(active_id)
-            except (yaml.YAMLError, KeyError, ValueError, OSError) as e:
+            except CORRUPT_DATA_ERRORS as e:
                 log.message.warning(
                     f"Could not load active workspace {active_id}: {e}")
             else:
@@ -287,18 +366,192 @@ class WorkspaceManager(QObject):
                 self._active_id = workspace.id
 
         self._pinned = self._pinned_persistence.load()
+
+        # A surviving journal means the previous run died without a clean
+        # shutdown.  Keep it pending until the user accepts or declines.
+        self._pending_recovery = None
+        self._recovery_offered = False
+        if self._journal is not None:
+            self._pending_recovery = self._journal.read()
+
         # Signal consumers that the initial pinned list is now in
         # memory. Late-constructed consumers (e.g. a PINPanel that is
         # built after the manager) should also call list_pinned()
         # once to pick up the initial state.
         self.pinned_changed.emit()
+        self._report_resident_size()
+
+    def _report_resident_size(self) -> None:
+        """Log the resident tab-entry count against the measured budget.
+
+        Issue #38 asked for a warning when the manager exceeds its memory
+        budget.  The budget itself is enforced by
+        ``tests/unit/workspaces/test_benchmarks.py``, which measures with
+        ``tracemalloc`` -- turning that on in production to raise a warning
+        would tax every later allocation at startup, which is a bad trade for
+        a diagnostic.  So the runtime check is on the *count*, which is what
+        the byte budget was measured at, and it is reported at debug level
+        so ``--debug`` shows the real number without nagging a normal user.
+
+        See ADR 0008 § "Performance baselines" for the measured figures.
+        """
+        resident = sum(len(ws.tabs) for ws in self._workspaces.values())
+        if resident > MEMORY_BUDGET_ENTRIES:
+            log.misc.warning(
+                f"{resident} tab entries resident, "
+                f"{resident / MEMORY_BUDGET_ENTRIES:.1f}x the "
+                f"{MEMORY_BUDGET_ENTRIES} entries ADR 0008's memory "
+                f"budget was measured at; the manager is now above its "
+                f"documented budget.")
+        log.misc.debug(
+            "workspace memory: %d tab entries resident across %d "
+            "workspace(s), budget measured at %d entries",
+            resident, len(self._workspaces), MEMORY_BUDGET_ENTRIES)
 
     def save(self) -> None:
-        """Persist all loaded workspaces, the active id, and pinned tabs."""
+        """Persist all loaded workspaces, the active id, and pinned tabs.
+
+        This is the SaveManager cycle's handler, so the crash journal is
+        snapshotted here as well.
+        """
         for workspace in self._workspaces.values():
             self._persistence.save(workspace)
         self._save_state()
         self._pinned_persistence.save(self._pinned)
+        self.flush_journal(force=True)
+
+    def shutdown(self) -> None:
+        """Clean exit: persist everything, then remove the crash journal.
+
+        The journal is kept when the save fails (it may hold the only copy of
+        recent changes) or when a recovery is still unresolved.
+        """
+        self._journal_timer.stop()
+        try:
+            self.save()
+        except OSError as e:
+            log.workspaces.error(f"Could not save workspaces on exit: {e}")
+            return
+        self._journal_closing = True
+        if self._journal is not None and self._pending_recovery is None:
+            self._journal.discard()
+
+    # --- crash journal (#7) ---
+
+    def _mark_journal_dirty(self) -> None:
+        """Note a change and open the batch window if none is open."""
+        if self._journal is None or self._journal_closing:
+            return
+        self._journal_dirty = True
+        if not self._journal_timer.isActive():
+            self._journal_timer.start()
+
+    def _snapshot(self) -> JournalSnapshot:
+        """Return the journal snapshot of the current in-memory state."""
+        return JournalSnapshot(
+            written_at=_now(),
+            active_id=self._active_id,
+            last_active_tabs=dict(self._last_active_tabs),
+            workspaces=list(self._workspaces.values()),
+            pinned=list(self._pinned),
+        )
+
+    def flush_journal(self, *, force: bool = False) -> bool:
+        """Write the crash journal if the state changed (or when *force*).
+
+        Returns True when a write happened.  A failed write stays dirty and is
+        retried by the next flush (the SaveManager cycle or the next batch).
+        """
+        self._journal_timer.stop()
+        if self._journal is None or self._journal_closing:
+            return False
+        if self._pending_recovery is not None:
+            # The unresolved crash journal is the only copy of that data.
+            return False
+        if not (self._journal_dirty or force):
+            return False
+        try:
+            self._journal.write(self._snapshot())
+        except OSError as e:
+            log.workspaces.warning(f"Could not write crash journal: {e}")
+            self._journal_dirty = True
+            return False
+        self._journal_dirty = False
+        return True
+
+    @property
+    def pending_recovery(self) -> Optional[JournalSnapshot]:
+        """Return the unresolved journal from a previous unclean exit, if any."""
+        return self._pending_recovery
+
+    def take_recovery_offer(self) -> Optional[JournalSnapshot]:
+        """Return the pending journal the first time only.
+
+        Several windows may be built at startup, but only one should ask the
+        user.  Later callers get None until the recovery is resolved.
+        """
+        if self._pending_recovery is None or self._recovery_offered:
+            return None
+        self._recovery_offered = True
+        return self._pending_recovery
+
+    def apply_recovery(self, snapshot: JournalSnapshot) -> RecoverySummary:
+        """Restore the workspaces, tabs and topology held by *snapshot*.
+
+        Every tab that was OPEN at the crash becomes SUSPENDED: its browser
+        page is gone, and it reopens on demand (as any suspended entry does).
+        Tab ids are re-keyed to fresh negative ids so a recovered entry can
+        never be mistaken for a new runtime tab that reuses the same id;
+        ``parent_id`` and the last-active map are remapped with them.  The
+        whole restore is one ``changed`` emission, so the tree rebuilds once.
+        """
+        self._pending_recovery = None
+        counter = itertools.count(-1, -1)
+        for workspace in snapshot.workspaces:
+            mapping: dict[int, int] = {}
+            for tab in workspace.tabs:
+                new_id = next(counter)
+                mapping.setdefault(tab.tab_id, new_id)
+                tab.tab_id = new_id
+            for tab in workspace.tabs:
+                if tab.parent_id is not None:
+                    tab.parent_id = mapping.get(tab.parent_id)
+                if tab.open_status == 'OPEN':
+                    tab.open_status = 'SUSPENDED'
+            self._workspaces[workspace.id] = workspace
+            last = snapshot.last_active_tabs.get(workspace.id)
+            self._last_active_tabs[workspace.id] = (
+                None if last is None else mapping.get(last))
+        if snapshot.active_id in self._workspaces:
+            self._active_id = snapshot.active_id
+        self._pinned = list(snapshot.pinned)
+        summary = RecoverySummary(
+            workspaces=len(snapshot.workspaces), tabs=snapshot.tab_count)
+        log.workspaces.info(
+            f"Recovered {summary.tabs} tabs in {summary.workspaces} "
+            "workspaces from the crash journal")
+        try:
+            self.save()
+        except OSError as e:
+            log.workspaces.error(f"Could not save recovered workspaces: {e}")
+            message.error(f"Recovered workspaces could not be saved: {e}")
+        self.pinned_changed.emit()
+        self.changed.emit()
+        return summary
+
+    def decline_recovery(self) -> None:
+        """Start without the journal's state, keeping the journal on disk.
+
+        The workspace YAML files are untouched.  The journal is moved to a
+        timestamped ``_journal.declined-*.yml`` so its data is preserved, and a
+        fresh journal is written from the state that was loaded.
+        """
+        self._pending_recovery = None
+        if self._journal is not None:
+            moved = self._journal.preserve('declined')
+            if moved is not None:
+                log.workspaces.info(f"Crash journal kept at {moved}")
+        self._mark_journal_dirty()
 
     def _save_state(self) -> None:
         """Persist the active id plus the per-workspace tab map atomically."""
@@ -386,7 +639,7 @@ class WorkspaceManager(QObject):
             return self._workspaces[workspace_id]
         try:
             workspace = self._persistence.load(workspace_id)
-        except (yaml.YAMLError, KeyError, ValueError, OSError):
+        except CORRUPT_DATA_ERRORS:
             return None
         self._workspaces[workspace.id] = workspace
         return workspace
@@ -416,6 +669,9 @@ class WorkspaceManager(QObject):
         if self._last_active_tabs.get(workspace_id) == tab_id:
             return
         self._last_active_tabs[workspace_id] = tab_id
+        # Not a ``changed`` (no Saveable mark) but still worth journaling; the
+        # batch window keeps a burst of tab switches to one write.
+        self._mark_journal_dirty()
 
     def tab_id_for_workspace(
             self,
@@ -985,6 +1241,155 @@ class WorkspaceManager(QObject):
         if tab.parent_id != parent_tab_id:
             tab.parent_id = parent_tab_id
             self.changed.emit()
+
+    # --- cross-workspace move (ticket #6) ---
+
+    def move_tab_to_workspace(
+            self,
+            source_id: uuid.UUID,
+            tab_id: int,
+            target_id: uuid.UUID,
+            *,
+            branch: bool = False,
+            parent_id: Optional[int] = None,
+            group_id: Optional[uuid.UUID] = None,
+    ) -> int:
+        """Move a tab entry (optionally with its branch) to another workspace.
+
+        Args:
+            source_id: Workspace currently owning *tab_id*.
+            tab_id: Runtime id of the tab entry to move.
+            target_id: Workspace to move the entry into.
+            branch: When True, every descendant of *tab_id* moves too and
+                parent-child links inside the moved set are preserved.  When
+                False, only *tab_id* moves; its direct children are
+                re-attached to its old parent in the source workspace so
+                nothing is left pointing at a removed entry.
+            parent_id: Tab id (in the *target* workspace) to become the
+                moved root's parent, or ``None`` for a top-level entry.
+            group_id: Group (in the *target* workspace) to place the moved
+                entries in, or ``None`` for standalone.  Group ids are
+                workspace-scoped, so the group membership of moved entries is
+                always replaced by this value.
+
+        Source and target are written to disk, target first.  A crash between
+        the two writes leaves the entry in *both* files (never in neither).
+
+        Returns:
+            The moved root's tab id in the target workspace (it may differ
+            from *tab_id* when the id was already taken there).
+
+        Raises:
+            WorkspaceMoveError: the move is refused.  ``str()`` of the
+                exception is a user-facing message; nothing is changed.
+        """
+        source = self.get_workspace(source_id)
+        target = self.get_workspace(target_id)
+        if source is None or target is None:
+            raise WorkspaceMoveError("Unknown workspace.")
+        root = self.find_tab_by_id(source_id, tab_id)
+        if root is None:
+            raise WorkspaceMoveError(
+                f"No tab with id {tab_id} in workspace '{source.name}'.")
+
+        descendants = _descendant_ids(source, tab_id)
+        self._check_move(
+            source, target, tab_id, descendants,
+            parent_id=parent_id, group_id=group_id)
+
+        moving_ids = {tab_id} | (descendants if branch else set())
+        moved = [tab for tab in source.tabs if tab.tab_id in moving_ids]
+
+        occupied = {tab.tab_id for tab in target.tabs}
+        mapping: dict[int, int] = {}
+        for tab in moved:
+            new_id = _free_id(occupied, tab.tab_id)
+            occupied.add(new_id)
+            mapping[tab.tab_id] = new_id
+
+        # Detach from the source.  Direct children left behind by a single
+        # move are promoted to the moved tab's old parent.
+        old_parent = root.parent_id
+        source.tabs = [tab for tab in source.tabs
+                       if tab.tab_id not in moving_ids]
+        for child in source.tabs:
+            if child.parent_id == tab_id:
+                child.parent_id = old_parent
+
+        # Re-key the moved entries for the target.  Parent links are read
+        # from the old ids (``mapping`` is keyed by them) before re-keying.
+        for tab in moved:
+            old_id = tab.tab_id
+            if old_id == tab_id:
+                new_parent = parent_id
+            elif tab.parent_id in mapping:
+                # A descendant's parent is always moved along with it.
+                new_parent = mapping[tab.parent_id]
+            else:
+                new_parent = None
+            tab.tab_id = mapping[old_id]
+            tab.parent_id = new_parent
+            tab.assign_group(group_id)
+            self._auto_group_overrides.discard((source_id, old_id))
+            if group_id is not None:
+                self._auto_group_overrides.add((target_id, tab.tab_id))
+            else:
+                self._auto_group_overrides.discard((target_id, tab.tab_id))
+        target.tabs.extend(moved)
+
+        # Last-active bookkeeping: the source must not keep pointing at a tab
+        # it no longer owns; the target inherits the moved tab as its last
+        # active one.
+        src_last = self._last_active_tabs.get(source_id)
+        if src_last is not None and src_last in mapping:
+            still_there = old_parent is not None and any(
+                tab.tab_id == old_parent for tab in source.tabs)
+            self._last_active_tabs[source_id] = (
+                old_parent if still_there else None)
+            self._last_active_tabs[target_id] = mapping[src_last]
+
+        # Target first: a crash in between duplicates the entry, never loses it.
+        self._persistence.save(target)
+        self._persistence.save(source)
+        self._save_state()
+        log.workspaces.debug(
+            "move_tab_to_workspace: %s -> %s, tab %s (branch=%s, moved %d)",
+            source_id, target_id, tab_id, branch, len(moved))
+        self.changed.emit()
+        return mapping[tab_id]
+
+    @staticmethod
+    def _check_move(
+            source: Workspace,
+            target: Workspace,
+            tab_id: int,
+            descendants: set[int],
+            *,
+            parent_id: Optional[int],
+            group_id: Optional[uuid.UUID],
+    ) -> None:
+        """Raise :class:`WorkspaceMoveError` when a move is not allowed."""
+        if source.id == target.id:
+            if parent_id is not None and (
+                    parent_id == tab_id or parent_id in descendants):
+                raise WorkspaceMoveError(
+                    f"Cannot move tab {tab_id} under its own branch.")
+            raise WorkspaceMoveError(
+                f"Tab {tab_id} is already in workspace '{target.name}'.")
+        if parent_id is not None and not any(
+                tab.tab_id == parent_id for tab in target.tabs):
+            raise WorkspaceMoveError(
+                f"Parent tab {parent_id} is not in workspace "
+                f"'{target.name}'.")
+        if group_id is None:
+            return
+        group = next((g for g in target.groups
+                      if g.group_id == group_id), None)
+        if group is None:
+            raise WorkspaceMoveError(
+                f"Group {group_id} is not in workspace '{target.name}'.")
+        if group.archived:
+            raise WorkspaceMoveError(f"Group '{group.name}' is archived.")
 
     # --- batched operations (VP-F4) ---
 

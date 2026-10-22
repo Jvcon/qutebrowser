@@ -4,7 +4,10 @@
 
 """Tests for the vertical panel's TabTree (Phase 2, slice 1)."""
 
+import gc
 import uuid
+import weakref
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +23,9 @@ from qutebrowser.qt.core import (
     pyqtSignal,
 )
 from qutebrowser.qt.gui import (
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
     QHelpEvent,
     QImage,
     QKeySequence,
@@ -28,6 +34,8 @@ from qutebrowser.qt.gui import (
     QPixmap,
 )
 from qutebrowser.qt.widgets import (
+    QApplication,
+    QMenu,
     QStyle,
     QStyleOptionViewItem,
     QTreeView,
@@ -35,6 +43,8 @@ from qutebrowser.qt.widgets import (
 
 from qutebrowser.mainwindow import tabtree, workspacebridge
 from qutebrowser.mainwindow.pinpanel import PINNED_TAB_MIME
+from qutebrowser.utils.qtutils import weak_slot
+from qutebrowser.workspaces.manager import WorkspaceMoveError
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
 
@@ -1134,7 +1144,11 @@ class TestTabTree:
 
         after = tree.view().currentIndex()
         assert after.isValid()
-        assert after.row() == 1
+        # The group header is expanded, so the next visible row is its first
+        # member (group members are visible; they were hidden before the
+        # expansion sync, which is why this used to be row 1).
+        assert after.row() == 0
+        assert after.parent() == tree._model.index(0, 0)
         # J/K uses the dedicated signal so the bridge can keep focus in
         # the tree for iterative navigation; mouse clicks still hit
         # ``activated``.
@@ -1240,6 +1254,10 @@ class TestTabTree:
 
             def scrollTo(self, index, hint=None):  # noqa: N802 - Qt naming
                 scrolled.append((index, hint))
+
+            def setExpanded(self, index, expanded):  # noqa: N802
+                # Expansion sync (fold state -> view) is part of focusing.
+                pass
 
         tree._view = FakeView()  # type: ignore[assignment]
 
@@ -1482,3 +1500,493 @@ class TestTabTreeSearch:
         group_index = model.index(0, 0)
         tab_index = model.index(0, 0, group_index)
         assert tab_index.data(tabtree.OpenStatusRole) == 'SUSPENDED'
+
+
+class _SignalSource(QObject):
+
+    """Emits one zero-argument, one one-argument and one two-argument signal."""
+
+    zero = pyqtSignal()
+    one = pyqtSignal(bool)
+    two = pyqtSignal(str, str)
+
+
+class _PlainOwner:
+
+    """Plain (non-QObject) owner, so tests can drop its last reference."""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def record(self, *args) -> None:
+        self.calls.append(args)
+
+
+class _TriggeringMenu(QMenu):
+
+    """QMenu stand-in whose ``exec`` triggers every checkable action."""
+
+    def exec(self, *args, **kwargs):  # noqa: A003 - Qt naming
+        for action in self.actions():
+            if action.isCheckable():
+                action.trigger()
+        return 0
+
+
+class TestWeakSlot:
+
+    """Regression for #46: per-object signal bindings must never raise.
+
+    ``lambda tid=...`` / ``functools.partial`` bindings closed a reference
+    cycle through the Qt-held connection; the cycle GC then cleared the
+    callable, and the next delivery raised ``TypeError: () missing 1
+    required positional argument: 'tid'`` (or segfaulted for partials).
+    """
+
+    def test_zero_arg_signal_calls_method_with_bound_args(self, qtbot):
+        """A zero-argument signal delivers only the bound arguments."""
+        source = _SignalSource()
+        owner = _PlainOwner()
+        source.zero.connect(weak_slot(owner.record, 7))
+        with qtbot.captureExceptions() as excs:
+            source.zero.emit()
+        assert excs == []
+        assert owner.calls == [(7,)]
+
+    def test_one_arg_signal_appends_signal_argument(self, qtbot):
+        """The signal's own argument is appended after the bound ones."""
+        source = _SignalSource()
+        owner = _PlainOwner()
+        source.one.connect(weak_slot(owner.record, 7))
+        with qtbot.captureExceptions() as excs:
+            source.one.emit(True)
+        assert excs == []
+        assert owner.calls == [(7, True)]
+
+    def test_accepts_caps_forwarded_signal_arguments(self, qtbot):
+        """``accepts`` drops the arguments a handler does not want.
+
+        Qt truncates a signal's arguments to the connected callable's arity.
+        The returned slot is variadic, so Qt cannot introspect it and forwards
+        everything -- a handler that ignores the signal's arguments (every
+        ``QAction.triggered`` handler, since it emits a ``bool``) has to say so
+        with ``accepts=0``, or it is handed the ``bool`` it never declared.
+        """
+        source = _SignalSource()
+        owner = _PlainOwner()
+        source.one.connect(weak_slot(owner.record, 7, accepts=0))
+        with qtbot.captureExceptions() as excs:
+            source.one.emit(True)
+        assert excs == []
+        assert owner.calls == [(7,)]
+
+    def test_accepts_forwards_only_the_first_n_arguments(self, qtbot):
+        source = _SignalSource()
+        owner = _PlainOwner()
+        source.two.connect(weak_slot(owner.record, 7, accepts=1))
+        with qtbot.captureExceptions() as excs:
+            source.two.emit('a', 'b')
+        assert excs == []
+        assert owner.calls == [(7, 'a')]
+
+    def test_dead_owner_is_a_noop(self, qtbot):
+        """Once the owner is gone the still-connected slot does nothing."""
+        source = _SignalSource()
+        owner = _PlainOwner()
+        source.zero.connect(weak_slot(owner.record, 7))
+        del owner
+        gc.collect()
+        with qtbot.captureExceptions() as excs:
+            source.zero.emit()
+        assert excs == []
+
+    def test_non_method_callable_is_bound_with_partial(self, qtbot):
+        """Non-method callables (e.g. test doubles) still get bound args."""
+        source = _SignalSource()
+        received = []
+        source.zero.connect(weak_slot(received.append, 'x'))
+        with qtbot.captureExceptions() as excs:
+            source.zero.emit()
+        assert excs == []
+        assert received == ['x']
+
+    def test_slot_does_not_keep_owner_alive(self, qtbot):
+        """A Qt-held slot must not pin its owner (the root of #46).
+
+        A strong ``lambda``/``partial`` made the connection a reference path
+        to the owner, closing a cycle the GC could clear under Qt.  Holding
+        the owner weakly keeps the owner collectable.
+        """
+        source = _SignalSource()
+        owner = _PlainOwner()
+        owner_ref = weakref.ref(owner)
+        source.zero.connect(weak_slot(owner.record, 7))
+        del owner
+        gc.collect()
+        assert owner_ref() is None
+
+    def test_highlight_timer_clears_highlight(self, qtbot):
+        """The zero-argument timeout clears the highlight without raising."""
+        manager = MockManager(_make_workspace())
+        model = tabtree.TabTreeModel(manager, parent=None)
+        with qtbot.captureExceptions() as excs:
+            model.set_highlighted_tab_id(20, timeout_ms=1)
+            qtbot.waitUntil(lambda: model._highlighted_tab_id is None)
+        assert excs == []
+
+    def test_shortcut_activation_moves_selection(self, qtbot, monkeypatch):
+        """The zero-argument ``j``/``k`` shortcuts call _move_selection."""
+        deltas = []
+        monkeypatch.setattr(
+            tabtree.TabTree, '_move_selection',
+            lambda self, delta: deltas.append(delta))
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        with qtbot.captureExceptions() as excs:
+            tree._shortcuts[0].activated.emit()
+            tree._shortcuts[1].activated.emit()
+        assert excs == []
+        assert deltas == [1, -1]
+
+    def test_affinity_menu_action_passes_checked_state(
+            self, qtbot, monkeypatch):
+        """``triggered(bool)`` reaches _set_group_affinity as ``enabled``."""
+        calls = []
+        monkeypatch.setattr(
+            tabtree.TabTree, '_set_group_affinity',
+            lambda self, group, enabled: calls.append((group, enabled)))
+        monkeypatch.setattr(tabtree, 'QMenu', _TriggeringMenu)
+        manager = MockManager(_make_workspace())
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        group = tree.model()._workspace.groups[0]
+        monkeypatch.setattr(
+            tree.model(), 'group_for_index', lambda index: group)
+        with qtbot.captureExceptions() as excs:
+            tree._on_context_menu_requested(QPoint(0, 0))
+        assert excs == []
+        assert calls == [(group, not group.affinity_enabled)]
+
+
+class TestTabNodeDrag:
+
+    """Dragging a tab node out of one workspace onto another (ticket #6).
+
+    The tree shows the active workspace, so these tests make the *active*
+    workspace the drop target and drag a node that lives in the other one.
+    """
+
+    @pytest.fixture
+    def setup(self, qtbot, tmp_path, monkeypatch):
+        from qutebrowser.workspaces.manager import WorkspaceManager
+        from qutebrowser.workspaces.persistence import (PinnedPersistence,
+                                                        WorkspacePersistence)
+        manager = WorkspaceManager(
+            WorkspacePersistence(base_path=tmp_path / 'ws'),
+            PinnedPersistence(path=tmp_path / 'pinned.yml'))
+        source = manager.add_workspace('source')
+        target = manager.add_workspace('target')
+        manager.set_active(target.id)
+        group = manager.create_group(target.id, 'G')
+        # target: 10 (root) -> 11 child; 20 standalone; 30 in group G.
+        manager.add_tab(target.id, WorkspaceTab(tab_id=10, open_status='OPEN'))
+        manager.add_tab(target.id, WorkspaceTab(
+            tab_id=11, parent_id=10, open_status='OPEN'))
+        manager.add_tab(target.id, WorkspaceTab(
+            tab_id=20, open_status='OPEN'))
+        manager.add_tab(target.id, WorkspaceTab(
+            tab_id=30, group_id=group.group_id, open_status='OPEN'))
+        # source: 1 (root) -> 2 child, 3 standalone.
+        manager.add_tab(source.id, WorkspaceTab(tab_id=1, open_status='OPEN'))
+        manager.add_tab(source.id, WorkspaceTab(
+            tab_id=2, parent_id=1, open_status='OPEN'))
+        manager.add_tab(source.id, WorkspaceTab(
+            tab_id=3, open_status='OPEN'))
+        tree = tabtree.TabTree(win_id=0, manager=manager)
+        qtbot.add_widget(tree)
+        tree.resize(300, 600)
+        tree.show()
+        # Child rows only have a geometry (and so a hit area) when expanded.
+        tree.view().expandAll()
+        messages = []
+        monkeypatch.setattr(
+            tabtree.message, 'error', lambda text, **_kw: messages.append(text))
+        return SimpleNamespace(
+            tree=tree, manager=manager, source=source, target=target,
+            group=group, messages=messages)
+
+    @staticmethod
+    def _node_mime(workspace_id, tab_id, *, branch=False):
+        mime = QMimeData()
+        mime.setData(tabtree.TAB_NODE_MIME, tabtree.encode_tab_node(
+            workspace_id, tab_id, branch=branch))
+        return mime
+
+    @staticmethod
+    def _index_for(model, tab_id=None, group_id=None):
+        """Return the root-level or group-child index for an id."""
+        if tab_id is not None:
+            index = model.index_for_tab_id(tab_id)
+            assert index.isValid(), tab_id
+            return index
+        for row in range(model.rowCount()):
+            idx = model.index(row, 0)
+            group = model.group_for_index(idx)
+            if group is not None and group.group_id == group_id:
+                return idx
+        raise AssertionError('group row not found')
+
+    @staticmethod
+    def _tab_ids(workspace):
+        return {tab.tab_id: tab.parent_id for tab in workspace.tabs}
+
+    # --- model: mime, flags, drag source ---
+
+    def test_tab_rows_are_drag_sources_and_group_rows_are_not(self, setup):
+        model = setup.tree.model()
+        assert tabtree.TAB_NODE_MIME in model.mimeTypes()
+        tab_index = model.index_for_tab_id(20)
+        assert model.flags(tab_index) & Qt.ItemFlag.ItemIsDragEnabled
+        group_index = self._index_for(model, group_id=setup.group.group_id)
+        assert not (model.flags(group_index)
+                    & Qt.ItemFlag.ItemIsDragEnabled)
+
+    def test_mime_data_encodes_workspace_and_tab(self, setup):
+        model = setup.tree.model()
+        mime = model.mimeData([model.index_for_tab_id(20)])
+        assert mime.hasFormat(tabtree.TAB_NODE_MIME)
+        raw = bytes(mime.data(tabtree.TAB_NODE_MIME)).decode('ascii')
+        assert raw == f'{setup.target.id}:20:leaf'
+
+    def test_mime_data_encodes_branch_for_node_with_descendants(self, setup):
+        model = setup.tree.model()
+        # target: 10 has child 11, so 10 is a branch; 20 is a leaf.
+        branch = model.mimeData([model.index_for_tab_id(10)])
+        leaf = model.mimeData([model.index_for_tab_id(20)])
+        assert bytes(branch.data(tabtree.TAB_NODE_MIME)).decode('ascii') == (
+            f'{setup.target.id}:10:branch')
+        assert bytes(leaf.data(tabtree.TAB_NODE_MIME)).decode('ascii') == (
+            f'{setup.target.id}:20:leaf')
+
+    @pytest.mark.parametrize('branch', [True, False])
+    def test_payload_round_trips_through_mime(self, branch):
+        ws_id = uuid.uuid4()
+        mime = QMimeData()
+        mime.setData(tabtree.TAB_NODE_MIME, tabtree.encode_tab_node(
+            ws_id, 42, branch=branch))
+        ref = tabtree.decode_tab_node(mime)
+        assert ref == tabtree.TabNodeRef(ws_id, 42, branch)
+
+    @pytest.mark.parametrize('payload', [
+        b'',
+        b'not-a-payload',
+        b'%s:7' % str(uuid.uuid4()).encode('ascii'),          # no kind
+        b'%s:7:sideways' % str(uuid.uuid4()).encode('ascii'),  # bad kind
+        b'%s:-1:leaf' % str(uuid.uuid4()).encode('ascii'),     # negative id
+        b'%s:x:leaf' % str(uuid.uuid4()).encode('ascii'),      # non-numeric
+        b'nope:7:leaf',                                        # bad uuid
+        b'%s:7:leaf:extra' % str(uuid.uuid4()).encode('ascii'),
+        b'\xff\xfe:7:leaf',                                    # not ascii
+    ])
+    def test_decode_rejects_malformed_payload(self, payload):
+        mime = QMimeData()
+        mime.setData(tabtree.TAB_NODE_MIME, payload)
+        assert tabtree.decode_tab_node(mime) is None
+
+    def test_decode_ignores_other_mime(self):
+        mime = QMimeData()
+        mime.setData(PINNED_TAB_MIME, b'1')
+        assert tabtree.decode_tab_node(mime) is None
+
+    def test_mime_data_refuses_group_row_and_multi_select(self, setup):
+        model = setup.tree.model()
+        group_index = self._index_for(model, group_id=setup.group.group_id)
+        assert model.mimeData([group_index]) is None
+        tab_index = model.index_for_tab_id(20)
+        assert model.mimeData([tab_index, model.index_for_tab_id(30)]) is None
+
+    # --- model: drop targets ---
+
+    def test_drop_on_group_row_moves_into_group(self, setup):
+        model = setup.tree.model()
+        group_index = self._index_for(model, group_id=setup.group.group_id)
+        mime = self._node_mime(setup.source.id, 3)
+
+        assert model.canDropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, group_index)
+        assert model.dropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, group_index)
+
+        assert 3 not in self._tab_ids(setup.source)
+        moved = setup.manager.find_tab_by_id(setup.target.id, 3)
+        assert moved.group_id == setup.group.group_id
+        assert moved.parent_id is None
+
+    def test_drop_on_tab_row_targets_that_tabs_parent(self, setup):
+        """A tab-row drop becomes a sibling: same parent and group as the row."""
+        model = setup.tree.model()
+        child_row = model.index_for_tab_id(11)  # child of 10, standalone group
+        mime = self._node_mime(setup.source.id, 3)
+
+        assert model.dropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, child_row)
+
+        moved = setup.manager.find_tab_by_id(setup.target.id, 3)
+        assert moved.parent_id == 10
+        assert moved.group_id is None
+
+    def test_drop_on_grouped_tab_row_inherits_group(self, setup):
+        model = setup.tree.model()
+        grouped_row = model.index_for_tab_id(30)
+        mime = self._node_mime(setup.source.id, 3)
+
+        assert model.dropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, grouped_row)
+
+        moved = setup.manager.find_tab_by_id(setup.target.id, 3)
+        assert moved.group_id == setup.group.group_id
+        assert moved.parent_id is None
+
+    def test_drop_on_root_is_top_level(self, setup):
+        model = setup.tree.model()
+        mime = self._node_mime(setup.source.id, 3)
+
+        assert model.dropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, QModelIndex())
+
+        moved = setup.manager.find_tab_by_id(setup.target.id, 3)
+        assert moved.parent_id is None
+        assert moved.group_id is None
+
+    def test_dropping_a_parent_moves_its_branch(self, setup):
+        model = setup.tree.model()
+        mime = self._node_mime(setup.source.id, 1, branch=True)  # 1 -> 2
+
+        assert model.dropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, QModelIndex())
+
+        assert self._tab_ids(setup.source) == {3: None}
+        assert self._tab_ids(setup.target) == {
+            10: None, 11: 10, 20: None, 30: None, 1: None, 2: 1}
+
+    def test_same_workspace_drop_is_rejected_silently(self, setup):
+        model = setup.tree.model()
+        own = self._node_mime(setup.target.id, 20)
+        before = self._tab_ids(setup.target)
+        group_index = self._index_for(model, group_id=setup.group.group_id)
+
+        assert not model.canDropMimeData(
+            own, Qt.DropAction.MoveAction, -1, -1, group_index)
+        assert not model.dropMimeData(
+            own, Qt.DropAction.MoveAction, -1, -1, group_index)
+        assert self._tab_ids(setup.target) == before
+        assert setup.messages == []
+
+    def test_copy_action_is_rejected_for_node_drags(self, setup):
+        model = setup.tree.model()
+        mime = self._node_mime(setup.source.id, 3)
+        assert not model.canDropMimeData(
+            mime, Qt.DropAction.CopyAction, -1, -1, QModelIndex())
+
+    def test_unknown_source_tab_is_rejected(self, setup):
+        model = setup.tree.model()
+        mime = self._node_mime(setup.source.id, 999)
+        assert not model.canDropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, QModelIndex())
+
+    def test_malformed_payload_is_rejected(self, setup):
+        model = setup.tree.model()
+        mime = QMimeData()
+        mime.setData(tabtree.TAB_NODE_MIME, b'not-a-payload')
+        assert not model.canDropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, QModelIndex())
+
+    def test_archived_target_group_is_rejected(self, setup):
+        model = setup.tree.model()
+        setup.group.archived = True
+        group_index = self._index_for(model, group_id=setup.group.group_id)
+        mime = self._node_mime(setup.source.id, 3)
+        assert not model.canDropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, group_index)
+
+    def test_manager_refusal_is_reported_and_not_accepted(self, setup):
+        model = setup.tree.model()
+        mime = self._node_mime(setup.source.id, 3)
+
+        def refuse(*_args, **_kwargs):
+            raise WorkspaceMoveError('refused in test')
+        # The cheap checks pass; the manager has the final say and refuses.
+        setup.manager.move_tab_to_workspace = refuse
+
+        assert not model.dropMimeData(
+            mime, Qt.DropAction.MoveAction, -1, -1, QModelIndex())
+        assert setup.messages == ['refused in test']
+
+    # --- view: hover accept/reject and the real Qt drop path ---
+
+    @classmethod
+    def _hover(cls, view, pos, mime, action):
+        """Send a realistic drag sequence: enter, then move over *pos*."""
+        cls._send(view, QDragEnterEvent, pos, mime, action)
+        return cls._send(view, QDragMoveEvent, pos, mime, action)
+
+    @staticmethod
+    def _send(view, event_cls, pos, mime, action):
+        # PyQt6 takes a QPoint for the enter/move events, a QPointF for drops.
+        where = QPointF(pos) if event_cls is QDropEvent else QPoint(pos)
+        event = event_cls(
+            where, action, mime, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(view.viewport(), event)
+        return event
+
+    def test_hover_accepts_group_and_highlights(self, setup, qtbot):
+        view = setup.tree.view()
+        model = setup.tree.model()
+        group_index = self._index_for(model, group_id=setup.group.group_id)
+        pos = view.visualRect(group_index).center()
+        mime = self._node_mime(setup.source.id, 3)
+
+        event = self._hover(view, pos, mime, Qt.DropAction.MoveAction)
+
+        assert event.isAccepted()
+        assert model.data(group_index, model.DropTargetRole) is True
+
+    def test_hover_rejects_own_workspace_without_highlight(self, setup, qtbot):
+        view = setup.tree.view()
+        model = setup.tree.model()
+        row = model.index_for_tab_id(20)
+        pos = view.visualRect(row).center()
+        own = self._node_mime(setup.target.id, 20)
+
+        event = self._hover(view, pos, own, Qt.DropAction.MoveAction)
+
+        assert not event.isAccepted()
+        assert model.data(row, model.DropTargetRole) is False
+
+    def test_real_drop_event_moves_the_node(self, setup, qtbot):
+        view = setup.tree.view()
+        model = setup.tree.model()
+        row = model.index_for_tab_id(11)
+        pos = view.visualRect(row).center()
+        mime = self._node_mime(setup.source.id, 3)
+
+        self._send(view, QDragEnterEvent, pos, mime, Qt.DropAction.MoveAction)
+        event = self._send(view, QDropEvent, pos, mime,
+                           Qt.DropAction.MoveAction)
+
+        assert event.isAccepted()
+        assert 3 not in self._tab_ids(setup.source)
+        moved = setup.manager.find_tab_by_id(setup.target.id, 3)
+        assert moved.parent_id == 10
+        # The highlight is cleared once the drop is handled.
+        assert model.data(row, model.DropTargetRole) is False
+
+    def test_drag_enter_accepts_node_mime(self, setup, qtbot):
+        view = setup.tree.view()
+        pos = view.visualRect(setup.tree.model().index_for_tab_id(20)).center()
+        mime = self._node_mime(setup.source.id, 3)
+        event = self._send(view, QDragEnterEvent, pos, mime,
+                           Qt.DropAction.MoveAction)
+        assert event.isAccepted()

@@ -56,6 +56,7 @@ Known limitations (tracked for the next sub-slice)
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import uuid
 from collections.abc import Callable
@@ -68,9 +69,11 @@ from qutebrowser.qt.widgets import (QFrame, QHBoxLayout, QLabel, QPushButton,
 
 from qutebrowser.config import config
 from qutebrowser.mainwindow.tabtree import Status, TabTreeModel
-from qutebrowser.utils import log, objreg, qtutils
+from qutebrowser.utils import log, message, objreg, qtutils
+from qutebrowser.utils.qtutils import weak_slot
 from qutebrowser.workspaces import iconbytes, tabentry_fetch
 from qutebrowser.workspaces.manager import WorkspaceManager
+from qutebrowser.workspaces.persistence import JournalSnapshot
 from qutebrowser.workspaces.model import (Group, PinnedTab, Workspace,
                                           WorkspaceTab)
 
@@ -421,6 +424,9 @@ class WorkspaceBridge(QObject):
         self._previous_active_tab_id: Optional[int] = None
         self._user_initiated_close_flags: dict[int, bool] = {}
         self._current_suggestions: list[Group] = []
+        # Crash journal awaiting the user's answer (#7); set only while the
+        # recovery prompt is open.
+        self._recovery_snapshot: Optional[JournalSnapshot] = None
         self.suggestion_card: Optional[QFrame] = None
         self.suggestion_label: Optional[QLabel] = None
         self.suspend_button: Optional[QPushButton] = None
@@ -486,6 +492,63 @@ class WorkspaceBridge(QObject):
         # blocked on tab / session restoration.
         QTimer.singleShot(0, self.restore_active_workspace)
         QTimer.singleShot(0, self.refresh_suggestions)
+        QTimer.singleShot(0, self._offer_recovery)
+
+    # --- crash recovery (#7) ---
+
+    def _offer_recovery(self) -> None:
+        """Ask once per launch whether to restore a crash journal.
+
+        Only the first window to get here asks (the manager hands the offer
+        out once).  The prompt is a statusbar yes/no question; cancelling it
+        counts as declining, which keeps the journal on disk.
+        """
+        if self._manager is None or self._model is None:
+            return
+        if sip.isdeleted(self._model):
+            return
+        snapshot = self._manager.take_recovery_offer()
+        if not isinstance(snapshot, JournalSnapshot):
+            return
+        self._recovery_snapshot = snapshot
+        message.confirm_async(
+            title='Recover workspaces?',
+            text=(
+                'qutebrowser did not exit cleanly. Restore '
+                f'{snapshot.tab_count} tab(s) in '
+                f'{len(snapshot.workspaces)} workspace(s) from the last '
+                'session? Declining keeps the saved data on disk.'),
+            yes_action=weak_slot(self._on_recovery_accepted, accepts=0),
+            no_action=weak_slot(self._on_recovery_declined, accepts=0),
+            cancel_action=weak_slot(self._on_recovery_declined, accepts=0),
+        )
+
+    def _on_recovery_accepted(self) -> None:
+        """Apply the journal, rebuilding the tree without animation."""
+        snapshot, self._recovery_snapshot = self._recovery_snapshot, None
+        if (snapshot is None or self._manager is None
+                or self._model is None or sip.isdeleted(self._model)):
+            return
+        rebuild = (self._tab_tree.bulk_rebuild() if self._tab_tree is not None
+                   else contextlib.nullcontext())
+        with rebuild:
+            summary = self._manager.apply_recovery(snapshot)
+        # Re-register any live tabs (the startup tab) against the restored
+        # entries, then point focus at the restored active workspace.
+        self._sync_existing_tabs()
+        self.restore_active_workspace()
+        message.info(
+            f"Recovered {summary.tabs} tab(s) in {summary.workspaces} "
+            "workspace(s) after an unclean shutdown.")
+
+    def _on_recovery_declined(self) -> None:
+        """Start from the saved data; the journal is preserved on disk."""
+        self._recovery_snapshot = None
+        if self._manager is None:
+            return
+        self._manager.decline_recovery()
+        message.info(
+            'Crash recovery skipped; the previous journal was kept on disk.')
 
     # --- registration ---
 
@@ -1211,28 +1274,30 @@ class WorkspaceBridge(QObject):
             return
         self._attached.add(tab_id)
 
+        # weak_slot rather than ``lambda x=...``: the tab id is bound
+        # positionally, so each signal's own arity is what Qt delivers.
+        # ``load_started`` and ``shutting_down`` are zero-argument signals.
         tab.title_changed.connect(
-            lambda title, tid=tab_id: self._on_title_changed(tid, title))
+            weak_slot(self._on_title_changed, tab_id))
         tab.url_changed.connect(
-            lambda url, tid=tab_id: self._on_url_changed(tid, url))
+            weak_slot(self._on_url_changed, tab_id))
         tab.icon_changed.connect(
-            lambda icon, tid=tab_id: self._on_icon_changed(tid, icon))
+            weak_slot(self._on_icon_changed, tab_id))
         tab.load_started.connect(
-            lambda tid=tab_id: self._on_load_started(tid))
+            weak_slot(self._on_load_started, tab_id))
         tab.load_finished.connect(
-            lambda ok, tid=tab_id: self._on_load_finished(tid, ok))
+            weak_slot(self._on_load_finished, tab_id))
         tab.pinned_changed.connect(
-            lambda pinned, tid=tab_id: self._on_pinned_changed(tid, pinned))
+            weak_slot(self._on_pinned_changed, tab_id))
         tab.shutting_down.connect(
-            lambda tab=tab: self._on_tab_shutting_down(tab))
+            weak_slot(self._on_tab_shutting_down, tab))
 
         audio = getattr(tab, 'audio', None)
         if audio is not None:
             audio.muted_changed.connect(
-                lambda muted, tid=tab_id: self._on_muted_changed(tid, muted))
+                weak_slot(self._on_muted_changed, tab_id))
             audio.recently_audible_changed.connect(
-                lambda audible, tid=tab_id:
-                    self._on_recently_audible_changed(tid, audible))
+                weak_slot(self._on_recently_audible_changed, tab_id))
 
     # --- per-tab handlers ---
 
@@ -1376,7 +1441,7 @@ class WorkspaceBridge(QObject):
             return
         QTimer.singleShot(
             int(delay) * 1000,
-            lambda wid=self._win_id: self._maybe_snapshot_window(wid),
+            weak_slot(self._maybe_snapshot_window, self._win_id),
         )
 
     def _window_registry(self, win_id: int) -> dict[int, AbstractTab]:

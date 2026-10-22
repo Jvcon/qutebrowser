@@ -13,14 +13,17 @@ Module attributes:
 """
 
 
+import functools
+import types
+import weakref
 import io
 import enum
 import pathlib
 import operator
 import contextlib
-from typing import (Any, TYPE_CHECKING, BinaryIO, IO, Literal,
+from typing import (Any, TYPE_CHECKING, BinaryIO, IO, Literal, Optional,
                     TypeAlias, Union, Protocol, cast, overload, TypeVar)
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from qutebrowser.qt import machinery, sip
 from qutebrowser.qt.core import (qVersion, QEventLoop, QDataStream, QByteArray,
@@ -758,3 +761,52 @@ def maybe_cast(to_type: type[_T], do_cast: bool, value: Any) -> _T:
         )
 
     return value
+
+# --- weak slots (bug #46) ---
+
+
+def weak_slot(
+        method: Callable[..., None],
+        *bound: object,
+        accepts: Optional[int] = None,
+) -> Callable[..., None]:
+    """Return a Qt slot calling *method* with *bound* prepended to the signal.
+
+    The signal's own arguments are appended, so a zero-argument signal calls
+    ``method(*bound)``.  *accepts* caps how many of those arguments are
+    forwarded; ``None`` (the default) forwards all of them.
+
+    Use this instead of ``lambda x=...`` or ``functools.partial`` when binding
+    per-object arguments to a signal.  Those hold *method*'s instance
+    strongly, so the connection (kept alive by Qt) closes a reference cycle
+    through the owner.  The cycle collector then clears the callable while Qt
+    can still deliver to it: a lambda loses its defaults (``TypeError: ()
+    missing 1 required positional argument``) and a partial loses its
+    ``fn`` (segfault).  Here the owner is held weakly, so no cycle is formed;
+    a dead owner makes the slot a no-op.  Non-method callables (e.g. test
+    doubles) are bound with :func:`functools.partial`.
+
+    Args:
+        method: The bound method to call.
+        bound: Arguments prepended to the signal's own arguments.
+        accepts: How many signal arguments to forward.  Qt normally truncates
+            a signal's arguments to the connected callable's arity, but the
+            returned slot is variadic and therefore opaque to that
+            truncation -- a handler that ignores the signal's arguments must
+            say so explicitly.  ``QAction.triggered`` and
+            ``QAbstractButton.clicked`` both emit a ``bool`` that most panel
+            handlers do not want; bind those with ``accepts=0``.
+    """
+    if not isinstance(method, types.MethodType):
+        return functools.partial(method, *bound)
+    owner = weakref.WeakMethod(method)
+
+    def slot(*args: object) -> None:
+        func = owner()
+        if func is None:
+            return
+        if accepts is not None:
+            args = args[:accepts]
+        func(*bound, *args)
+
+    return slot

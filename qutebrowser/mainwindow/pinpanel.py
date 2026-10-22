@@ -47,11 +47,13 @@ from qutebrowser.qt.core import (
     pyqtSlot,
 )
 from qutebrowser.qt.gui import (
+    QColor,
+    QContextMenuEvent,
+    QFontMetrics,
+    QKeyEvent,
     QMouseEvent,
     QPainter,
     QPixmap,
-    QFontMetrics,
-    QColor,
 )
 from qutebrowser.qt.widgets import (
     QAbstractItemView,
@@ -64,7 +66,10 @@ from qutebrowser.qt.widgets import (
     QWidget,
 )
 
+from qutebrowser.utils.qtutils import weak_slot
 from qutebrowser.config import config
+from qutebrowser.mainwindow import panelstyle
+from qutebrowser.mainwindow.panelstyle import Palette
 from qutebrowser.workspaces.model import PinnedTab
 
 
@@ -97,6 +102,11 @@ def _pinned_tab_data(tab: PinnedTab, role: int):
         return tab.title
     if role == Qt.ItemDataRole.DecorationRole:
         return tab.favicon
+    # ADR 0008 § "Screen reader contract": spoken label and state.
+    if role == Qt.ItemDataRole.AccessibleTextRole:
+        return tab.title or tab.url or '?'
+    if role == Qt.ItemDataRole.AccessibleDescriptionRole:
+        return f"pinned tab, {tab.url}" if tab.url else "pinned tab"
     return None
 
 
@@ -245,14 +255,15 @@ class PinnedTabDelegate(QStyledItemDelegate):
             index: QModelIndex,
     ) -> None:
         painter.save()
+        palette = Palette.from_config()
         if option.state & QStyle.StateFlag.State_Selected:
-            painter.fillRect(
-                option.rect,
-                option.palette.highlight(),
-            )
-            text_color: QColor = option.palette.highlightedText().color()
+            fill = palette.selected_fill
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            fill = palette.hover_fill
         else:
-            text_color = option.palette.text().color()
+            fill = palette.row_fill
+        painter.fillRect(option.rect, fill)
+        text_color: QColor = palette.text
 
         rect = option.rect
         icon_x = rect.x() + 3
@@ -338,10 +349,14 @@ class PINPanel(QWidget):
         self._manager = manager
 
         self.setObjectName('pin-panel')
+        # ADR 0008 § "Screen reader contract".
+        self.setAccessibleName('Pinned tabs')
+        self.setAccessibleDescription('Pinned tabs of this profile')
 
         self._model = PinnedTabModel(parent=self)
         self._list = _PinListView(self)
         self._list.setObjectName('pin-panel-list')
+        self._list.setAccessibleName('Pinned tabs')
         self._list.setModel(self._model)
         self._list.setItemDelegate(PinnedTabDelegate(self._list))
         self._list.setResizeMode(QListView.ResizeMode.Adjust)
@@ -374,6 +389,11 @@ class PINPanel(QWidget):
 
         # Left click is the standard QListView.clicked signal.
         self._list.clicked.connect(self._on_clicked)
+        # Keyboard: Return activates the cursor row (ADR § "Keyboard
+        # navigation"); Delete unpins it (see eventFilter).
+        self._list.activated.connect(self._on_activated)
+        self._list.installEventFilter(self)
+        panelstyle.install_focus_ring(self._list)
         # Right click is the standard customContextMenuRequested
         # signal (the QListView emits it for the right button).
         self._list.customContextMenuRequested.connect(
@@ -422,6 +442,9 @@ class PINPanel(QWidget):
         # takes no layout space at all (ADR § "1. PIN panel" / § Decisions
         # "Pin panel collapse on empty").
         has_pinned = bool(pinned)
+        count = len(pinned)
+        self.setAccessibleDescription(
+            f"Pinned tabs, {count} item{'' if count == 1 else 's'}")
         self._list.setVisible(has_pinned)
         self.setMaximumHeight(16777215 if has_pinned else 0)
         self.setVisible(has_pinned)
@@ -440,9 +463,58 @@ class PINPanel(QWidget):
             return
         self.activated.emit(tab)
 
+    @pyqtSlot(QModelIndex)
+    def _on_activated(self, index: QModelIndex) -> None:
+        """Activate the pinned tab on *index* (keyboard Return)."""
+        tab = self._model.pinned_at(index.row())
+        if tab is not None:
+            self.activated.emit(tab)
+
+    def _emit_unpinned(self, tab_id: int) -> None:
+        """Forward an unpin request for *tab_id*."""
+        self.unpinned.emit(tab_id)
+
+    def _keyboard_menu(self) -> bool:
+        """Open the context menu on the cursor row for the Menu key.
+
+        The Menu key carries no mouse position, so the menu is anchored to
+        the current row rather than wherever the pointer happens to be.
+        Returns ``True`` when a menu was requested.
+        """
+        index = self._list.currentIndex()
+        if not index.isValid():
+            return False
+        rect = self._list.visualRect(index)
+        # Vertically centred on the row; the row may have no width before
+        # the first layout pass in icon mode, so do not rely on it.
+        pos = QPoint(max(rect.x(), 0) + 4, rect.center().y())
+        self._open_menu(index, pos)
+        return True
+
     def eventFilter(  # noqa: N802 - Qt naming
             self, obj: QObject, event: QEvent,
     ) -> bool:
+        if (
+                obj is self._list
+                and event.type() == QEvent.Type.ContextMenu
+                and isinstance(event, QContextMenuEvent)
+                and event.reason() == QContextMenuEvent.Reason.Keyboard
+                and self._keyboard_menu()
+        ):
+            return True
+        if (
+                obj is self._list
+                and event.type() == QEvent.Type.KeyPress
+                and isinstance(event, QKeyEvent)
+                and event.key() == Qt.Key.Key_Delete
+                and event.modifiers() == Qt.KeyboardModifier.NoModifier
+        ):
+            # Keyboard equivalent of the middle-click unpin (ADR § "1. PIN
+            # panel"): every panel action must be reachable without a mouse.
+            tab = self._model.pinned_at(self._list.currentIndex().row())
+            if tab is not None:
+                self.unpinned.emit(tab.tab_id)
+                return True
         if (
                 obj is self._list.viewport()
                 and event.type() == QEvent.Type.MouseButtonPress
@@ -458,7 +530,11 @@ class PINPanel(QWidget):
         return super().eventFilter(obj, event)
 
     def _on_context_menu_requested(self, pos: QPoint) -> None:
-        index = self._list.indexAt(pos)
+        """Show the context menu for the row under the mouse at *pos*."""
+        self._open_menu(self._list.indexAt(pos), pos)
+
+    def _open_menu(self, index: QModelIndex, pos: QPoint) -> None:
+        """Show the context menu for *index*, anchored at viewport *pos*."""
         if not index.isValid():
             return
         tab = self._model.pinned_at(index.row())
@@ -467,7 +543,7 @@ class PINPanel(QWidget):
         menu = QMenu(self._list)
         unpin_action = menu.addAction('Unpin')
         unpin_action.triggered.connect(
-            lambda: self.unpinned.emit(tab.tab_id))
+            weak_slot(self._emit_unpinned, tab.tab_id, accepts=0))
         menu.exec(self._list.viewport().mapToGlobal(pos))
 
     # --- public API used by the host (VerticalPanel) ---

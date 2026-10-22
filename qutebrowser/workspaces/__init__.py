@@ -24,7 +24,10 @@ def init(
 
     Called once during startup, after the QApplication exists, so that the
     manager can be loaded and registered with the ``SaveManager`` (which
-    drives auto-saving via :attr:`WorkspaceManager.changed`).
+    drives auto-saving via :attr:`WorkspaceManager.changed`).  The manager
+    also keeps a crash journal (see :class:`JournalPersistence`); a journal
+    left behind by an unclean exit is offered for recovery by the
+    workspace bridge.
 
     Args:
         save_manager: The application's save manager.
@@ -35,16 +38,23 @@ def init(
             ``docs/agents/upstream-tracking.md`` for the upstream #5935
             alignment plan).
     """
+    from qutebrowser.misc import quitter
     from qutebrowser.utils import objreg
     from qutebrowser.workspaces.manager import WorkspaceManager
-    from qutebrowser.workspaces.persistence import (PinnedPersistence,
+    from qutebrowser.workspaces.persistence import (JournalPersistence,
+                                                    PinnedPersistence,
                                                     WorkspacePersistence)
 
     persistence = WorkspacePersistence(profile_name=profile_name)
     pinned_persistence = PinnedPersistence(profile_name=profile_name)
-    manager = WorkspaceManager(persistence, pinned_persistence)
+    journal = JournalPersistence(persistence.base_path)
+    manager = WorkspaceManager(persistence, pinned_persistence,
+                               journal=journal)
     manager.load()
     manager.start_auto_suspend_scheduler(parent=manager)
     save_manager.add_saveable('workspace-manager', manager.save,
                               manager.changed)
+    if quitter.instance is not None:
+        # A clean exit removes the crash journal (#7); a SIGKILL leaves it.
+        quitter.instance.shutting_down.connect(manager.shutdown)
     objreg.register('workspace-manager', manager, update=True)

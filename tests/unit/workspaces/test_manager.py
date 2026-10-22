@@ -15,7 +15,7 @@ from qutebrowser.qt.core import QUrl
 
 from qutebrowser.workspaces import manager as manager_module
 from qutebrowser.workspaces.manager import TabMetadata, WorkspaceManager
-from qutebrowser.workspaces.model import PinnedTab, WorkspaceTab
+from qutebrowser.workspaces.model import (PinnedTab, Workspace, WorkspaceTab)
 from qutebrowser.workspaces.persistence import (PinnedPersistence,
                                                 WorkspacePersistence)
 
@@ -2377,6 +2377,56 @@ def _patch_affinity_config(monkeypatch, *, enabled=True):
                 content=SimpleNamespace(vertical_panel=panel))))
 
 
+class TestResidentSizeReport:
+
+    """The runtime proxy for ADR 0008's memory budget (#38)."""
+
+    def _manager_with(self, tmp_path, count):
+        mgr = WorkspaceManager(
+            persistence=WorkspacePersistence(
+                'default', tmp_path / 'workspaces'),
+            pinned_persistence=PinnedPersistence(
+                'default', tmp_path / 'profile'),
+        )
+        ws = Workspace(id=uuid.uuid4(), name='big',
+                       tabs=[WorkspaceTab(tab_id=i, parent_id=None)
+                             for i in range(count)])
+        mgr._workspaces[ws.id] = ws
+        return mgr
+
+    def test_under_budget_logs_debug_only(self, tmp_path, caplog):
+        mgr = self._manager_with(tmp_path, 10)
+        with caplog.at_level('DEBUG', logger='misc'):
+            mgr._report_resident_size()
+        assert [r for r in caplog.records if r.levelname == 'WARNING'] == []
+        debug = [r.getMessage() for r in caplog.records
+                 if r.levelname == 'DEBUG']
+        assert any('10 tab entries' in m for m in debug), debug
+
+    def test_over_budget_warns_and_names_the_ratio(self, tmp_path, caplog):
+        mgr = self._manager_with(
+            tmp_path, manager_module.MEMORY_BUDGET_ENTRIES + 1)
+        with caplog.at_level('WARNING'):
+            mgr._report_resident_size()
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelname == 'WARNING']
+        assert len(warnings) == 1, warnings
+        assert 'budget was measured at' in warnings[0], warnings
+        assert '501 tab entries' in warnings[0], warnings
+
+    def test_counts_entries_across_loaded_workspaces(self, tmp_path, caplog):
+        mgr = self._manager_with(tmp_path, 300)
+        other = Workspace(id=uuid.uuid4(), name='other',
+                          tabs=[WorkspaceTab(tab_id=1, parent_id=None)])
+        mgr._workspaces[other.id] = other
+        with caplog.at_level('DEBUG', logger='misc'):
+            mgr._report_resident_size()
+        debug = [r.getMessage() for r in caplog.records
+                 if r.levelname == 'DEBUG']
+        assert any('301 tab entries' in m and '2 workspace(s)' in m
+                   for m in debug), debug
+
+
 class TestCloseGroupAffinity:
 
     """VP-A1: closing a group records its window affinity."""
@@ -2657,3 +2707,337 @@ class TestSaveLoad:
         second.load()
         assert second.get_active() is None
         assert second.list_workspaces() == []
+
+
+def _assert_links_consistent(workspace):
+    """No tab may point at a parent (or group) that is absent from its workspace."""
+    ids = {tab.tab_id for tab in workspace.tabs}
+    assert len(ids) == len(workspace.tabs), 'duplicate tab ids'
+    group_ids = {group.group_id for group in workspace.groups}
+    for tab in workspace.tabs:
+        assert tab.parent_id is None or tab.parent_id in ids, tab
+        assert tab.group_id is None or tab.group_id in group_ids, tab
+
+
+def _tab(manager, workspace, tab_id, parent_id=None, group_id=None):
+    tab = WorkspaceTab(tab_id=tab_id, parent_id=parent_id,
+                       group_id=group_id, url=f'https://t{tab_id}.example/',
+                       open_status='OPEN')
+    manager.add_tab(workspace.id, tab)
+    return tab
+
+
+def _parents(workspace):
+    return {tab.tab_id: tab.parent_id for tab in workspace.tabs}
+
+
+@pytest.fixture
+def two_workspaces(manager):
+    """Active workspace ``src`` plus an empty ``dst``.
+
+    ``src`` holds: 10 (root) -> 11, 12 (children); 11 -> 13 (grandchild);
+    20 standalone; 30 in group ``G``.
+    """
+    src = manager.add_workspace('src')
+    dst = manager.add_workspace('dst')
+    group = manager.create_group(src.id, 'G')
+    _tab(manager, src, 10)
+    _tab(manager, src, 11, parent_id=10)
+    _tab(manager, src, 12, parent_id=10)
+    _tab(manager, src, 13, parent_id=11)
+    _tab(manager, src, 20)
+    _tab(manager, src, 30, group_id=group.group_id)
+    return manager, src, dst, group
+
+
+class TestMoveTabToWorkspace:
+
+    def test_single_move_removes_from_source_and_adds_to_target(
+            self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        new_id = manager.move_tab_to_workspace(src.id, 20, dst.id)
+
+        assert new_id == 20
+        assert 20 not in {tab.tab_id for tab in src.tabs}
+        moved = manager.find_tab_by_id(dst.id, 20)
+        assert moved is not None
+        assert moved.parent_id is None
+        assert moved.group_id is None
+        assert moved.url == 'https://t20.example/'
+        _assert_links_consistent(src)
+        _assert_links_consistent(dst)
+
+    def test_single_move_leaves_children_behind_under_old_parent(
+            self, two_workspaces):
+        """Only the moved tab leaves; its children are promoted to its parent."""
+        manager, src, dst, _group = two_workspaces
+        manager.move_tab_to_workspace(src.id, 11, dst.id)
+
+        assert _parents(src) == {10: None, 12: 10, 13: 10, 20: None, 30: None}
+        assert [tab.tab_id for tab in dst.tabs] == [11]
+        assert dst.tabs[0].parent_id is None
+        _assert_links_consistent(src)
+
+    def test_single_move_of_root_promotes_children_to_top_level(
+            self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        manager.move_tab_to_workspace(src.id, 10, dst.id)
+
+        assert _parents(src) == {11: None, 12: None, 13: 11, 20: None,
+                                 30: None}
+        _assert_links_consistent(src)
+
+    def test_branch_move_moves_all_descendants(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        manager.move_tab_to_workspace(src.id, 10, dst.id, branch=True)
+
+        assert _parents(src) == {20: None, 30: None}
+        assert _parents(dst) == {10: None, 11: 10, 12: 10, 13: 11}
+        _assert_links_consistent(src)
+        _assert_links_consistent(dst)
+
+    def test_branch_move_of_inner_node_keeps_its_subtree(
+            self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        manager.move_tab_to_workspace(src.id, 11, dst.id, branch=True)
+
+        assert _parents(src) == {10: None, 12: 10, 20: None, 30: None}
+        assert _parents(dst) == {11: None, 13: 11}
+
+    def test_moved_root_attaches_to_given_target_parent(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        _tab(manager, dst, 1)
+        manager.move_tab_to_workspace(src.id, 20, dst.id, parent_id=1)
+
+        assert manager.find_tab_by_id(dst.id, 20).parent_id == 1
+        _assert_links_consistent(dst)
+
+    def test_moved_root_joins_given_target_group(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        target_group = manager.create_group(dst.id, 'Dest')
+        manager.move_tab_to_workspace(
+            src.id, 20, dst.id, group_id=target_group.group_id)
+
+        assert (manager.find_tab_by_id(dst.id, 20).group_id
+                == target_group.group_id)
+        _assert_links_consistent(dst)
+
+    def test_group_membership_is_replaced_not_carried_over(
+            self, two_workspaces):
+        """Group ids are workspace-scoped: a source group never follows a move."""
+        manager, src, dst, group = two_workspaces
+        manager.move_tab_to_workspace(src.id, 30, dst.id)
+
+        moved = manager.find_tab_by_id(dst.id, 30)
+        assert moved.group_id is None
+        assert dst.groups == []
+        _assert_links_consistent(dst)
+
+    def test_branch_move_clears_group_of_every_moved_node(
+            self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        src.tabs[0].group_id = src.groups[0].group_id  # tab 10 in G
+        manager.move_tab_to_workspace(src.id, 10, dst.id, branch=True)
+
+        assert all(tab.group_id is None for tab in dst.tabs)
+
+    def test_id_collision_in_target_gets_fresh_id_and_keeps_links(
+            self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        _tab(manager, dst, 10)  # occupies the id the branch root uses
+        new_root = manager.move_tab_to_workspace(
+            src.id, 10, dst.id, branch=True)
+
+        assert new_root != 10
+        # The pre-existing target entry keeps its id.
+        assert manager.find_tab_by_id(dst.id, 10).url == 'https://t10.example/'
+        root = manager.find_tab_by_id(dst.id, new_root)
+        assert root.parent_id is None
+        # Descendant links were remapped onto the moved copies' new ids.
+        _assert_links_consistent(dst)
+        assert {tab.tab_id for tab in dst.tabs} == {10, new_root, 11, 12, 13}
+        child = manager.find_tab_by_id(dst.id, 11)
+        assert child.parent_id == new_root
+        assert manager.find_tab_by_id(dst.id, 13).parent_id == 11
+        assert manager.find_tab_by_id(dst.id, 12).parent_id == new_root
+
+    def test_move_from_inactive_source_by_id(self, two_workspaces):
+        """The source need not be active; ids are resolved within it."""
+        manager, src, dst, _group = two_workspaces
+        manager.set_active(dst.id)
+        manager.move_tab_to_workspace(src.id, 20, dst.id)
+
+        assert manager.find_tab_by_id(dst.id, 20) is not None
+        assert manager.get_active() is dst
+
+    def test_active_workspace_is_unchanged_by_move(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        assert manager.get_active() is src
+        manager.move_tab_to_workspace(src.id, 10, dst.id, branch=True)
+        assert manager.get_active() is src
+
+    def test_overrides_follow_the_moved_tab(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        manager.move_tab_to_group(src.id, 20, src.groups[0].group_id)
+        manager.move_tab_to_workspace(src.id, 20, dst.id)
+        assert (src.id, 20) not in manager._auto_group_overrides
+        assert (dst.id, 20) not in manager._auto_group_overrides
+
+    def test_emits_changed_once(self, two_workspaces, qtbot):
+        manager, src, dst, _group = two_workspaces
+        with qtbot.waitSignal(manager.changed):
+            manager.move_tab_to_workspace(src.id, 20, dst.id)
+
+    def test_yaml_round_trip_rewrites_both_files(self, two_workspaces, pers):
+        manager, src, dst, group = two_workspaces
+        manager.move_tab_to_workspace(src.id, 10, dst.id, branch=True)
+        manager.save()
+
+        fresh = WorkspacePersistence(base_path=pers[0].base_path)
+        loaded_src = fresh.load(src.id)
+        loaded_dst = fresh.load(dst.id)
+        assert loaded_src == src
+        assert loaded_dst == dst
+        assert _parents(loaded_src) == {20: None, 30: None}
+        assert _parents(loaded_dst) == {10: None, 11: 10, 12: 10, 13: 11}
+        assert loaded_src.groups == [group]
+
+    def test_yaml_is_written_for_target_before_source(
+            self, two_workspaces, pers, monkeypatch):
+        """A failure on the source write leaves the tab in the target file."""
+        manager, src, dst, _group = two_workspaces
+        manager.save()
+        real_save = manager._persistence.save
+        calls = []
+
+        def failing_save(workspace):
+            calls.append(workspace.id)
+            if workspace.id == src.id:
+                raise OSError('disk full')
+            real_save(workspace)
+
+        monkeypatch.setattr(manager._persistence, 'save', failing_save)
+        with pytest.raises(OSError):
+            manager.move_tab_to_workspace(src.id, 20, dst.id)
+
+        assert calls == [dst.id, src.id]
+        on_disk = WorkspacePersistence(base_path=pers[0].base_path)
+        assert any(tab.tab_id == 20 for tab in on_disk.load(dst.id).tabs)
+
+    def test_last_active_of_moved_tab_moves_with_it(self, two_workspaces, pers):
+        manager, src, dst, _group = two_workspaces
+        manager.record_active_tab(20, src.id)
+        manager.move_tab_to_workspace(src.id, 20, dst.id)
+
+        assert manager.tab_id_for_workspace(dst.id) == 20
+        assert manager.tab_id_for_workspace(src.id) is None
+        manager.save()
+        reloaded = WorkspaceManager(*pers)
+        reloaded.load()
+        assert reloaded.tab_id_for_workspace(dst.id) == 20
+
+    def test_last_active_falls_back_to_surviving_parent(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        manager.record_active_tab(11, src.id)
+        manager.move_tab_to_workspace(src.id, 11, dst.id)
+
+        assert manager.tab_id_for_workspace(src.id) == 10
+        assert manager.tab_id_for_workspace(dst.id) == 11
+
+    def test_last_active_on_branch_descendant_moves_with_branch(
+            self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        manager.record_active_tab(13, src.id)
+        manager.move_tab_to_workspace(src.id, 10, dst.id, branch=True)
+
+        assert manager.tab_id_for_workspace(dst.id) == 13
+        assert manager.tab_id_for_workspace(src.id) is None
+
+    def test_last_active_unrelated_tab_is_untouched(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        manager.record_active_tab(30, src.id)
+        manager.move_tab_to_workspace(src.id, 20, dst.id)
+
+        assert manager.tab_id_for_workspace(src.id) == 30
+        assert manager.tab_id_for_workspace(dst.id) is None
+
+    def test_last_active_remapped_when_moved_tab_id_changes(
+            self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        _tab(manager, dst, 20)
+        manager.record_active_tab(20, src.id)
+        new_id = manager.move_tab_to_workspace(src.id, 20, dst.id)
+
+        assert new_id != 20
+        assert manager.tab_id_for_workspace(dst.id) == new_id
+
+    def test_error_unknown_tab(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        before = list(src.tabs), list(dst.tabs)
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match='No tab with id 999'):
+            manager.move_tab_to_workspace(src.id, 999, dst.id)
+        assert (list(src.tabs), list(dst.tabs)) == before
+
+    def test_error_unknown_target_workspace(self, two_workspaces):
+        manager, src, _dst, _group = two_workspaces
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match='Unknown workspace'):
+            manager.move_tab_to_workspace(src.id, 20, uuid.uuid4())
+
+    def test_error_unknown_source_workspace(self, two_workspaces):
+        manager, _src, dst, _group = two_workspaces
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match='Unknown workspace'):
+            manager.move_tab_to_workspace(uuid.uuid4(), 20, dst.id)
+
+    def test_error_same_workspace(self, two_workspaces):
+        manager, src, _dst, _group = two_workspaces
+        before = list(src.tabs)
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match="already in workspace 'src'"):
+            manager.move_tab_to_workspace(src.id, 20, src.id)
+        assert src.tabs == before
+
+    def test_error_cycle_into_own_descendant_same_workspace(
+            self, two_workspaces):
+        """Re-parenting a node under its own branch is refused, not corrupted."""
+        manager, src, _dst, _group = two_workspaces
+        before = list(src.tabs)
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match='own branch'):
+            manager.move_tab_to_workspace(
+                src.id, 10, src.id, branch=True, parent_id=13)
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match='own branch'):
+            manager.move_tab_to_workspace(
+                src.id, 10, src.id, parent_id=10)
+        assert src.tabs == before
+
+    def test_error_parent_not_in_target(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        before = list(src.tabs), list(dst.tabs)
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match='Parent tab 11 is not in workspace'):
+            manager.move_tab_to_workspace(src.id, 20, dst.id, parent_id=11)
+        assert (list(src.tabs), list(dst.tabs)) == before
+
+    def test_error_group_not_in_target(self, two_workspaces):
+        manager, src, dst, group = two_workspaces
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match='is not in workspace'):
+            manager.move_tab_to_workspace(
+                src.id, 20, dst.id, group_id=group.group_id)
+
+    def test_error_archived_target_group(self, two_workspaces):
+        manager, src, dst, _group = two_workspaces
+        archived = manager.create_group(dst.id, 'Old')
+        archived.archived = True
+        with pytest.raises(manager_module.WorkspaceMoveError,
+                           match="Group 'Old' is archived"):
+            manager.move_tab_to_workspace(
+                src.id, 20, dst.id, group_id=archived.group_id)
+        assert manager.find_tab_by_id(src.id, 20) is not None
+
+    def test_errors_are_value_errors(self):
+        assert issubclass(manager_module.WorkspaceMoveError, ValueError)

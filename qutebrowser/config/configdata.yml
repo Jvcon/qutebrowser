@@ -3866,6 +3866,8 @@ bindings.default:
       gC: tab-clone
       gc: cmd-set-text -s :tab-collect
       gG: cmd-set-text -s :tab-move-to-group
+      gT: cmd-set-text -s :tabtree-move
+      gTb: cmd-set-text -s :tabtree-move-branch
       gs: cmd-set-text -s :vp-status-set
       gv: cmd-set-text -s :vp-status-cycle
       gz: cmd-set-text -s :vp-select-toggle
@@ -4160,6 +4162,8 @@ bindings.default:
       co: tab-only
       gc: cmd-set-text -s :tab-collect
       gG: cmd-set-text -s :tab-move-to-group
+      gT: cmd-set-text -s :tabtree-move
+      gTb: cmd-set-text -s :tabtree-move-branch
       gC: tab-clone
       gm: tab-move
       gs: cmd-set-text -s :vp-status-set

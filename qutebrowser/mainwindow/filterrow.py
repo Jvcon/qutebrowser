@@ -12,7 +12,10 @@ push the filter into the PIN and TabTree models.
 """
 
 from qutebrowser.qt.core import Qt, pyqtSignal
-from qutebrowser.qt.widgets import QLineEdit
+from qutebrowser.qt.gui import QKeyEvent
+from qutebrowser.qt.widgets import QLineEdit, QWidget
+
+from qutebrowser.mainwindow import panelstyle
 
 
 class FilterRow(QLineEdit):
@@ -28,12 +31,18 @@ class FilterRow(QLineEdit):
     filter_changed = pyqtSignal(str)
     closed = pyqtSignal()
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._closing = False
         self.setObjectName('filter-row')
         self.setPlaceholderText('/ search...')
         self.setFixedHeight(28)
+        # ADR 0008 § "Screen reader contract" / § "Focus ring".
+        self.setAccessibleName('Filter tabs')
+        self.setAccessibleDescription(
+            'Type to filter tabs and pinned tabs by title or URL. '
+            'Escape closes the filter.')
+        panelstyle.install_focus_ring(self, field=True)
         self.hide()
         self.textChanged.connect(self._on_text_changed)
 
@@ -67,7 +76,7 @@ class FilterRow(QLineEdit):
             self.close_filter()
 
     def keyPressEvent(  # noqa: N802 - Qt naming
-            self, event) -> None:
+            self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key.Key_Escape:
             self.close_filter()
             event.accept()

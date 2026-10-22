@@ -691,8 +691,11 @@ class TestAutoLocate:
     @staticmethod
     def _collect(tree):
         emitted = []
-        tree.group_focus_requested.connect(
-            lambda gid, tid: emitted.append((gid, tid)))
+
+        def record(gid, tid):
+            emitted.append((gid, tid))
+
+        tree.group_focus_requested.connect(record)
         return emitted
 
     def test_known_tab_emits_group_focus(self, browser, manager, qtbot):
@@ -1379,3 +1382,97 @@ class TestActiveWorkspaceSwitch:
 
         assert browser.widget.currentWidget() is tab_open
         assert model.active_tab_id() == 3
+
+
+class TestTabSignalBindings:
+
+    """Regression for #46: per-tab signal bindings deliver without raising.
+
+    Each binding is a :func:`qutebrowser.utils.qtutils.weak_slot` carrying the tab id, so the
+    handler must receive exactly the bound id plus the signal's own args --
+    including for the zero-argument ``load_started`` / ``shutting_down``.
+    """
+
+    @pytest.mark.parametrize('signal_name, args, handler, expected', [
+        ('title_changed', ('Title',), '_on_title_changed', (1, 'Title')),
+        ('url_changed', (QUrl('https://a.example/'),), '_on_url_changed',
+         (1, QUrl('https://a.example/'))),
+        ('load_started', (), '_on_load_started', (1,)),
+        ('load_finished', (True,), '_on_load_finished', (1, True)),
+        ('pinned_changed', (True,), '_on_pinned_changed', (1, True)),
+    ])
+    def test_tab_signal_reaches_handler(
+            self, qtbot, bridge, monkeypatch,
+            signal_name, args, handler, expected):
+        """Each tab-level signal calls its handler with the bound tab id."""
+        calls = []
+
+        def record(self, *handler_args):
+            calls.append(handler_args)
+
+        monkeypatch.setattr(workspacebridge.WorkspaceBridge, handler, record)
+        tab = MockTab(1)
+        bridge._attach_tab(tab)
+        with qtbot.captureExceptions() as excs:
+            getattr(tab, signal_name).emit(*args)
+        assert excs == []
+        assert calls == [expected]
+
+    def test_shutting_down_passes_tab_object(self, qtbot, bridge, monkeypatch):
+        """The zero-argument ``shutting_down`` binds the tab object itself."""
+        calls = []
+
+        def record(self, *handler_args):
+            calls.append(handler_args)
+
+        monkeypatch.setattr(
+            workspacebridge.WorkspaceBridge, '_on_tab_shutting_down', record)
+        tab = MockTab(1)
+        bridge._attach_tab(tab)
+        with qtbot.captureExceptions() as excs:
+            tab.shutting_down.emit()
+        assert excs == []
+        assert len(calls) == 1
+        assert calls[0][0] is tab
+
+    @pytest.mark.parametrize('signal_name, handler, args, expected', [
+        ('muted_changed', '_on_muted_changed', (True,), (1, True)),
+        ('recently_audible_changed', '_on_recently_audible_changed',
+         (True,), (1, True)),
+    ])
+    def test_audio_signal_reaches_handler(
+            self, qtbot, bridge, monkeypatch,
+            signal_name, handler, args, expected):
+        """Per-tab audio signals call their handler with the bound tab id."""
+        calls = []
+
+        def record(self, *handler_args):
+            calls.append(handler_args)
+
+        monkeypatch.setattr(workspacebridge.WorkspaceBridge, handler, record)
+        tab = MockTab(1)
+        bridge._attach_tab(tab)
+        with qtbot.captureExceptions() as excs:
+            getattr(tab.audio, signal_name).emit(*args)
+        assert excs == []
+        assert calls == [expected]
+
+    def test_snapshot_check_fires_with_window_id(
+            self, qtbot, bridge, monkeypatch):
+        """The delayed snapshot singleShot (zero-argument) passes the win id."""
+        calls = []
+
+        def record(self, win_id):
+            calls.append(win_id)
+
+        monkeypatch.setattr(
+            workspacebridge.WorkspaceBridge, '_maybe_snapshot_window', record)
+        monkeypatch.setattr(
+            workspacebridge, '_panel_setting',
+            lambda name, default: 0 if name == 'snapshot_delay_seconds'
+            else default)
+        with qtbot.captureExceptions() as excs:
+            bridge._schedule_snapshot_check()
+            qtbot.waitUntil(lambda: bool(calls))
+        assert excs == []
+        assert calls == [bridge._win_id]
