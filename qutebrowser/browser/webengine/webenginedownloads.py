@@ -14,7 +14,7 @@ from qutebrowser.qt.webenginecore import QWebEngineDownloadRequest
 
 from qutebrowser.browser import downloads, pdfjs
 from qutebrowser.utils import (debug, usertypes, message, log, objreg, urlutils,
-                               utils, version)
+                               utils, version, qtutils)
 
 
 class DownloadItem(downloads.AbstractDownloadItem):
@@ -34,23 +34,27 @@ class DownloadItem(downloads.AbstractDownloadItem):
             qt_item.downloadProgress.connect(self.stats.on_download_progress)
         else:  # Qt 6
             qt_item.receivedBytesChanged.connect(
-                lambda: self.stats.on_download_progress(
-                    qt_item.receivedBytes(),
-                    qt_item.totalBytes(),
-                )
-            )
+                qtutils.weak_slot(self._on_bytes_changed))
             qt_item.totalBytesChanged.connect(
-                lambda: self.stats.on_download_progress(
-                    qt_item.receivedBytes(),
-                    qt_item.totalBytes(),
-                )
-            )
+                qtutils.weak_slot(self._on_bytes_changed))
         qt_item.stateChanged.connect(
             self._on_state_changed)
 
         # Ensure wrapped qt_item is deleted manually when the wrapper object
         # is deleted. See https://github.com/qutebrowser/qutebrowser/issues/3373
         self.destroyed.connect(self._qt_item.deleteLater)
+
+    def _on_bytes_changed(self):
+        """Forward the wrapped item's byte counts to the stats object.
+
+        Bound with weak_slot() rather than a lambda capturing self and
+        qt_item: a strong capture closes a reference cycle through the
+        Qt-held connection (see #51).
+        """
+        self.stats.on_download_progress(
+            self._qt_item.receivedBytes(),
+            self._qt_item.totalBytes(),
+        )
 
     def _is_page_download(self):
         """Check if this item is a page (i.e. mhtml) download."""

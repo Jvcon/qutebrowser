@@ -4,12 +4,17 @@
 
 import base64
 import dataclasses
+import gc
+import weakref
 
 import pytest
 pytest.importorskip('qutebrowser.qt.webenginecore')
-from qutebrowser.qt.webenginecore import QWebEngineProfile
+from qutebrowser.qt import machinery, sip
+from qutebrowser.qt.core import QObject, pyqtSignal
+from qutebrowser.qt.webenginecore import QWebEngineDownloadRequest, QWebEngineProfile
 
 from qutebrowser.utils import urlutils, usertypes, utils
+from qutebrowser.browser import downloads
 from qutebrowser.browser.webengine import webenginedownloads
 
 
@@ -33,6 +38,86 @@ class _ExpectedNames:
 
     before: str
     after: str
+
+
+class _FakeDownloadRequest(QObject):
+
+    """Stands in for QWebEngineDownloadRequest, which can't be constructed.
+
+    Only the progress signals and byte getters DownloadItem uses are modelled.
+    """
+
+    receivedBytesChanged = pyqtSignal()  # noqa: N815 - mimics Qt name
+    totalBytesChanged = pyqtSignal()  # noqa: N815 - mimics Qt name
+    stateChanged = pyqtSignal(QWebEngineDownloadRequest.DownloadState)  # noqa: N815 - mimics Qt name
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.getter_calls = 0
+
+    def receivedBytes(self):
+        self.getter_calls += 1
+        return 5
+
+    def totalBytes(self):
+        self.getter_calls += 1
+        return 10
+
+
+@pytest.mark.skipif(machinery.IS_QT5, reason="Qt 6 progress signals only")
+class TestProgressSlots:
+
+    """Regression for #51: progress bindings must not capture the owner.
+
+    The lambdas they replaced closed a reference cycle through the Qt-held
+    connection.  The cycle GC could then clear the callable while Qt still
+    delivered to it.  This only guards arity and delivery: it cannot detect
+    the collector clearing the callable, which is timing-dependent.
+    """
+
+    @pytest.fixture
+    def manager(self, qapp):
+        manager = downloads.AbstractDownloadManager(parent=qapp)
+        yield manager
+        manager.deleteLater()
+
+    @pytest.fixture
+    def qt_item(self, qapp):
+        item = _FakeDownloadRequest(parent=qapp)
+        yield item
+        # DownloadItem may already have deleted it via destroyed -> deleteLater.
+        if not sip.isdeleted(item):
+            item.deleteLater()
+
+    @pytest.mark.parametrize('signal_name', ['receivedBytesChanged',
+                                             'totalBytesChanged'])
+    def test_delivers_progress_to_live_owner(self, qtbot, manager, qt_item,
+                                             signal_name):
+        item = webenginedownloads.DownloadItem(qt_item, manager)
+        with qtbot.captureExceptions() as excs:
+            getattr(qt_item, signal_name).emit()
+        assert excs == []
+        assert item.stats.done == 5
+        assert item.stats.total == 10
+
+    @pytest.mark.parametrize('signal_name', ['receivedBytesChanged',
+                                             'totalBytesChanged'])
+    def test_dead_owner_is_a_noop(self, qtbot, manager, qt_item, signal_name):
+        """Once the owner is gone the still-connected slot delivers nothing."""
+        item = webenginedownloads.DownloadItem(qt_item, manager)
+        owner_ref = weakref.ref(item)
+        # The wrapper is sip-owned by its manager parent, so only deleting the
+        # C++ object lets the Python owner go away.
+        item.deleteLater()
+        del item
+        qtbot.waitUntil(lambda: owner_ref() is None)
+        gc.collect()
+
+        qt_item.getter_calls = 0
+        with qtbot.captureExceptions() as excs:
+            getattr(qt_item, signal_name).emit()
+        assert excs == []
+        assert qt_item.getter_calls == 0
 
 
 class TestDataUrlWorkaround:
