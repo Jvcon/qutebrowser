@@ -46,6 +46,7 @@ def _bound_command_name(command: str) -> str:
 # qutebrowser spells the ADR's ``tab-reload`` command ``reload``.
 ACTIVE_TAB_COMMANDS = [
     'tab-close',
+    'tab-mute',
     'tab-only',
     'tab-clone',
     'tab-move',
@@ -63,6 +64,7 @@ ACTIVE_TAB_COMMANDS = [
 @pytest.mark.parametrize('key, expected', [
     ('d', 'tab-close'),
     ('<Ctrl-W>', 'tab-close'),
+    ('<Alt-m>', 'tab-mute'),
     ('co', 'tab-only'),
     ('gc', 'cmd-set-text -s :tab-collect'),
     ('gG', 'cmd-set-text -s :tab-move-to-group'),
@@ -82,6 +84,8 @@ ACTIVE_TAB_COMMANDS = [
     ('gwu', 'cmd-set-text -s :workspace-unarchive'),
     ('gws', 'cmd-set-text -s :workspace-switch'),
     ('gwi', 'cmd-set-text -s :vp-workspace-import'),
+    ('gh', 'vp-group-next'),
+    ('<Shift-F2>', 'vp-close-branch-hint'),
     ('ggl', 'group-list'),
     ('ggn', 'cmd-set-text -s :vp-group-new'),
     ('ggr', 'cmd-set-text -s :vp-group-rename'),

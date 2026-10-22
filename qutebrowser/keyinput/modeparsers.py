@@ -160,6 +160,20 @@ class WorkspacePanelKeyParser(NormalKeyParser):
                          mode=usertypes.KeyMode.workspace_panel,
                          commandrunner=commandrunner, parent=parent)
         self._filter_active = False
+        self._keys_captured = False
+
+    def set_keys_captured(self, captured: bool) -> None:
+        """Let an in-panel overlay own the keyboard (ADR 0008 § Keyboard nav).
+
+        While the TabTree's Shift+F2 close-branch hint is open, no panel
+        binding may fire and unbound keys must reach the overlay, so the
+        parser passes every key through, exactly as while the filter row is
+        open.
+        """
+        self._keys_captured = captured
+        self.passthrough = captured or self._filter_active
+        if captured:
+            self.clear_keystring()
 
     def set_filter_active(self, active: bool) -> None:
         """Pass all keys through while the transient filter row is open.
@@ -171,14 +185,14 @@ class WorkspacePanelKeyParser(NormalKeyParser):
         itself on ``Esc`` without leaving ``workspace_panel``.
         """
         self._filter_active = active
-        self.passthrough = active
+        self.passthrough = active or self._keys_captured
         if active:
             self.clear_keystring()
 
     def handle(self, e: QKeyEvent, *,
                dry_run: bool = False) -> QKeySequence.SequenceMatch:
         """Ignore bindings while the filter row owns the keyboard."""
-        if self._filter_active:
+        if self._filter_active or self._keys_captured:
             return QKeySequence.SequenceMatch.NoMatch
         return super().handle(e, dry_run=dry_run)
 

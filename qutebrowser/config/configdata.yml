@@ -4159,6 +4159,7 @@ bindings.default:
       <Escape>: mode-leave
       d: tab-close
       <Ctrl-W>: tab-close
+      <Alt-m>: tab-mute
       co: tab-only
       gc: cmd-set-text -s :tab-collect
       gG: cmd-set-text -s :tab-move-to-group
@@ -4182,6 +4183,8 @@ bindings.default:
       gws: cmd-set-text -s :workspace-switch
       gwe: cmd-set-text -s :vp-workspace-export
       gwi: cmd-set-text -s :vp-workspace-import
+      gh: vp-group-next
+      <Shift-F2>: vp-close-branch-hint
       ggl: group-list
       ggn: cmd-set-text -s :vp-group-new
       ggr: cmd-set-text -s :vp-group-rename

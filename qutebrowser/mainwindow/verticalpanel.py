@@ -29,12 +29,15 @@ Focus protocol
 """
 
 from qutebrowser.qt.core import Qt, pyqtSignal, pyqtSlot
-from qutebrowser.qt.widgets import QApplication, QVBoxLayout, QWidget
+from qutebrowser.qt.widgets import (QApplication, QListView, QToolButton,
+                                    QVBoxLayout, QWidget)
 
+from qutebrowser.api import cmdutils
 from qutebrowser.config import config
 from qutebrowser.keyinput import modeman
 from qutebrowser.mainwindow import filterrow, pinpanel, tabtree, workspaceindicator
 from qutebrowser.utils import objreg, usertypes
+from qutebrowser.utils.qtutils import weak_slot
 
 
 class VerticalPanel(QWidget):
@@ -62,6 +65,7 @@ class VerticalPanel(QWidget):
     ) -> None:
         super().__init__(parent)
         self._win_id = win_id
+        self._manager = manager
         self._last_focused: QWidget | None = None
         # Tracks whether we already drove the mode into
         # KeyMode.workspace_panel via the most recent focus transition.
@@ -118,6 +122,13 @@ class VerticalPanel(QWidget):
                 win_id=win_id, manager=manager, parent=self)
             self._layout.addWidget(self.workspace_indicator)
 
+        self._chain_tab_order()
+        # Workspace buttons are created and removed by the indicator's own
+        # ``changed`` handler (connected first), so re-chain after each one.
+        if manager is not None:
+            manager.changed.connect(
+                weak_slot(self._chain_tab_order, accepts=0))
+
         self.apply_width()
         if config.val.verticalpanel.visible:
             self.show()
@@ -132,6 +143,35 @@ class VerticalPanel(QWidget):
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
 
         config.instance.changed.connect(self._on_config_changed)
+
+    def _chain_tab_order(self) -> None:
+        """Chain Tab / Shift+Tab: PIN list -> FilterRow -> TabTree -> indicator.
+
+        ADR 0008 § Keyboard navigation. The FilterRow is transient: Qt skips
+        hidden widgets when moving focus, so it can stay in the chain while
+        closed and the order never breaks when it opens or closes. The
+        WorkspaceIndicator's buttons are created on demand, so the chain is
+        rebuilt from the current buttons each time the manager changes.
+        The webview hop lies outside this panel and is left to the window.
+        """
+        chain: list[QWidget] = []
+        if self.pin_panel is not None:
+            pin_list = self.pin_panel.findChild(QListView)
+            if pin_list is not None:
+                chain.append(pin_list)
+        chain.append(self.filter_row)
+        if self.tab_tree is not None:
+            chain.append(self.tab_tree.search_input)
+            chain.append(self.tab_tree.view())
+        if self.workspace_indicator is not None:
+            indicator = self.workspace_indicator
+            chain.append(indicator)
+            for action in indicator.actions():
+                button = indicator.widgetForAction(action)
+                if isinstance(button, QToolButton):
+                    chain.append(button)
+        for first, second in zip(chain, chain[1:]):
+            self.setTabOrder(first, second)
 
     def _on_config_changed(self, option: str) -> None:
         if option == 'verticalpanel.width':
@@ -221,8 +261,14 @@ class VerticalPanel(QWidget):
             self.tab_tree.set_filter(text)
 
     def _on_filter_closed(self) -> None:
-        """Return focus to the TabTree when the filter row closes."""
+        """Clear the filter from the models and return focus to the TabTree.
+
+        ``FilterRow`` clears its text while it closes, and that clear is not
+        re-emitted as ``filter_changed``, so the models are cleared here.
+        Clearing an already-empty filter is a no-op.
+        """
         self._set_filter_active(False)
+        self._on_filter_changed('')
         if self.tab_tree is not None:
             self.tab_tree.view().setFocus(Qt.FocusReason.OtherFocusReason)
 
@@ -272,3 +318,37 @@ class VerticalPanel(QWidget):
                 return True
             candidate = candidate.parentWidget()
         return False
+
+
+@cmdutils.register(name='vp-group-next')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_group_next(win_id: int = 0) -> None:
+    """Move the TabTree selection to the next group header.
+
+    "Next" is in display order after the current row, wrapping to the first
+    group. If the tree has no group header, the command line is pre-filled
+    with ``:vp-group-new``, the same text the ``ggn`` binding sets, so the
+    group is created through that command.
+
+    Bound to ``gh`` in ``workspace_panel`` mode (ADR 0008 § Keyboard navigation).
+    """
+    panel = objreg.get('vertical-panel', scope='window', window=win_id)
+    if panel.tab_tree is not None and panel.tab_tree.focus_next_group():
+        return
+    status = objreg.get('status-command', scope='window', window=win_id)
+    status.cmd_set_text_command(':vp-group-new', space=True)
+
+
+@cmdutils.register(name='vp-close-branch-hint')
+@cmdutils.argument('win_id', value=cmdutils.Value.win_id)
+def vp_close_branch_hint(win_id: int = 0) -> None:
+    """Show the close-branch hint for the selected row.
+
+    Press ``w`` to close the workspace's open tabs, ``t`` to close the selected
+    tab, or any other key (including Escape) to dismiss.
+
+    Bound to ``<Shift-F2>`` in ``workspace_panel`` mode (ADR 0008 § Keyboard navigation).
+    """
+    panel = objreg.get('vertical-panel', scope='window', window=win_id)
+    if panel.tab_tree is not None:
+        panel.tab_tree.show_close_hint()

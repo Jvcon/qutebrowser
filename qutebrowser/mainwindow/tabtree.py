@@ -79,6 +79,7 @@ from qutebrowser.qt.gui import (
 )
 from qutebrowser.qt.widgets import (
     QAbstractItemView,
+    QFrame,
     QLabel,
     QLineEdit,
     QMenu,
@@ -96,8 +97,9 @@ from qutebrowser.mainwindow import panelglyphs
 from qutebrowser.mainwindow import panelstyle
 from qutebrowser.mainwindow.panelstyle import (Palette, best_black_or_white,
                                                blend)
+from qutebrowser.keyinput import modeman
 from qutebrowser.mainwindow.pinpanel import PINNED_TAB_MIME
-from qutebrowser.utils import message
+from qutebrowser.utils import message, objreg, usertypes
 from qutebrowser.utils.qtutils import weak_slot
 from qutebrowser.workspaces import search
 from qutebrowser.workspaces.manager import WorkspaceManager, WorkspaceMoveError
@@ -2533,6 +2535,25 @@ class TabTree(QWidget):
         self.search_input.textChanged.connect(self._on_search_changed)
         layout.addWidget(self.search_input)
 
+        # ADR 0008 § Keyboard navigation: the Shift+F2 close-branch hint.
+        # Hidden until opened; sits between the search field and the tree.
+        self._hint_open = False
+        self._hint_tab_id: Optional[int] = None
+        self._close_hint = QFrame(self)
+        self._close_hint.setObjectName('tab-tree-close-hint')
+        self._close_hint.setFrameShape(QFrame.Shape.StyledPanel)
+        hint_layout = QVBoxLayout(self._close_hint)
+        hint_layout.setContentsMargins(6, 4, 6, 4)
+        hint_layout.setSpacing(2)
+        self._hint_workspace = QLabel(self._close_hint)
+        self._hint_tab = QLabel(self._close_hint)
+        for label in (self._hint_workspace, self._hint_tab):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            hint_layout.addWidget(label)
+        self._close_hint.hide()
+        layout.insertWidget(1, self._close_hint)
+        self._apply_hint_style()
+
         layout.addWidget(self._stack)
         # Tab cycles search -> tree in order (ADR § "Panel focus").
         self.setTabOrder(self.search_input, self._view)
@@ -2604,7 +2625,18 @@ class TabTree(QWidget):
         """Re-apply the panel colours after a ``colors.*`` change."""
         if option.startswith('colors.'):
             self._apply_view_palette()
+            self._apply_hint_style()
             self._view.viewport().update()
+
+    def _apply_hint_style(self) -> None:
+        """Colour the close-branch hint from the panel palette (ADR § Color)."""
+        palette = Palette.from_config()
+        self._close_hint.setStyleSheet(
+            f'QFrame#tab-tree-close-hint {{'
+            f' background: {palette.search_fill.name()};'
+            f' border: 1px solid {palette.focus_outer.name()}; }}'
+            f' QFrame#tab-tree-close-hint QLabel {{'
+            f' color: {palette.text.name()}; background: transparent; }}')
 
     # --- expansion, current row and keyboard focus ---
 
@@ -2682,6 +2714,14 @@ class TabTree(QWidget):
         if obj is not self._view or event is None:
             return super().eventFilter(obj, event)
         etype = event.type()
+        if self._hint_open:
+            # The hint owns the keyboard: nothing reaches the tree's rows.
+            if etype == QEvent.Type.ShortcutOverride:
+                event.accept()
+                return True
+            if etype == QEvent.Type.KeyPress and isinstance(event, QKeyEvent):
+                self._on_close_hint_key(event)
+                return True
         if isinstance(event, QFocusEvent):
             keyboard = (
                 etype == QEvent.Type.FocusIn
@@ -2997,6 +3037,143 @@ class TabTree(QWidget):
                     widget.setFocus(Qt.FocusReason.TabFocusReason)
                 return
             parent = parent.parent()
+
+    # --- group jump (ADR § Keyboard navigation, ``gh``) ---
+
+    def focus_next_group(self) -> bool:
+        """Move the current row to the next group header and focus the tree.
+
+        "Next" is taken in display order from the top-level row holding the
+        current row (so a tab inside group A moves to the group after A).
+        Past the last group it wraps to the first; with no current row it
+        starts at the top. Returns False when no group header is visible.
+        """
+        model = self._model
+        root = QModelIndex()
+        groups = [
+            row for row in range(model.rowCount(root))
+            if model.index(row, 0, root).data(KindRole) == Kind.Group
+        ]
+        if not groups:
+            return False
+        current = self._view.currentIndex()
+        top = current
+        while top.isValid() and top.parent().isValid():
+            top = top.parent()
+        start = top.row() if top.isValid() else -1
+        later = [row for row in groups if row > start]
+        target = model.index(later[0] if later else groups[0], 0, root)
+        self._view.setCurrentIndex(target)
+        self._view.scrollTo(
+            target, QAbstractItemView.ScrollHint.EnsureVisible)
+        self._view.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        return True
+
+    # --- close-branch hint (ADR § Keyboard navigation, Shift+F2) ---
+
+    @property
+    def close_hint_open(self) -> bool:
+        """Whether the Shift+F2 close-branch hint is showing."""
+        return self._hint_open
+
+    def show_close_hint(self) -> bool:
+        """Show the close-branch hint for the current row.
+
+        Returns False (and shows nothing) when the tree has no current row.
+        Focus moves to the tree so the hint can own the keyboard.
+        """
+        index = self._view.currentIndex()
+        if not index.isValid():
+            return False
+        workspace = self._manager.get_active()
+        name = workspace.name if workspace is not None else ''
+        title = index.data(Qt.ItemDataRole.DisplayRole) or ''
+        # A group header has no tab to close; ``t`` is then a no-op.
+        self._hint_tab_id = (
+            None if index.data(KindRole) == Kind.Group
+            else self._model.tab_id_for_index(index))
+        self._hint_workspace.setText(f'[w] close workspace  {name}')
+        self._hint_tab.setText(
+            f'[t] close tab  {title}' if self._hint_tab_id is not None
+            else '[t] close tab  (select a tab row)')
+        self._hint_open = True
+        self._set_hint_capture(True)
+        self._close_hint.show()
+        self._view.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        return True
+
+    def hide_close_hint(self) -> None:
+        """Dismiss the close-branch hint and hand keys back to the tree."""
+        self._hint_open = False
+        self._hint_tab_id = None
+        self._close_hint.hide()
+        self._set_hint_capture(False)
+
+    def _set_hint_capture(self, active: bool) -> None:
+        """Stop the workspace_panel parser binding keys while the hint is up.
+
+        Without this, bound keys (``d``, ``r``, ``/``, ...) and unbound letters
+        (``w``, ``t``) would be consumed by the mode before reaching the hint.
+        The parser is optional so tests can build a tree without a mode manager.
+        """
+        try:
+            mode_manager = modeman.instance(self._win_id)
+        except (modeman.UnavailableError, objreg.RegistryUnavailableError):
+            return
+        parser = mode_manager.parsers.get(usertypes.KeyMode.workspace_panel)
+        setter = getattr(parser, 'set_keys_captured', None)
+        if setter is not None:
+            setter(active)
+
+    def _on_close_hint_key(self, event: QKeyEvent) -> None:
+        """Run the hint action for ``w`` / ``t``; any other key dismisses."""
+        key = event.key()
+        tab_id = self._hint_tab_id
+        plain = event.modifiers() == Qt.KeyboardModifier.NoModifier
+        self.hide_close_hint()
+        if not plain:
+            return
+        if key == Qt.Key.Key_W:
+            self._close_workspace_tabs()
+        elif key == Qt.Key.Key_T and tab_id is not None:
+            self._close_tab(tab_id)
+
+    def _close_tab(self, tab_id: int) -> None:
+        """Close one tab through the same path as the row's close glyph."""
+        index = self._model.index_for_tab_id(tab_id)
+        if index.isValid():
+            self.close_requested.emit(index)
+
+    def _close_workspace_tabs(self) -> None:
+        """Close every OPEN tab of the active workspace, after confirmation.
+
+        Each tab goes through :attr:`close_requested`, the path the row's close
+        glyph uses, so entries flip to SUSPENDED and stay in the workspace.
+        """
+        workspace = self._manager.get_active()
+        if workspace is None:
+            return
+        tab_ids = [
+            tab.tab_id for tab in workspace.tabs
+            if tab.open_status == 'OPEN'
+            and self._model.index_for_tab_id(tab.tab_id).isValid()
+        ]
+        if not tab_ids:
+            message.info(f"Workspace '{workspace.name}' has no open tabs.")
+            return
+        message.confirm_async(
+            title=f"Close workspace '{workspace.name}'?",
+            text=(f"This closes {len(tab_ids)} open tab(s); their entries "
+                  "stay in the workspace as suspended."),
+            default=False,
+            yes_action=weak_slot(self._close_tabs_confirmed, tab_ids,
+                                 accepts=0),
+        )
+
+    def _close_tabs_confirmed(self, tab_ids: list[int]) -> None:
+        """Close each of *tab_ids* that still has a row (confirmed by user)."""
+        for tab_id in tab_ids:
+            self._close_tab(tab_id)
 
     def _refresh_empty_state(self) -> None:
         """Show the placeholder when the active workspace is empty."""
