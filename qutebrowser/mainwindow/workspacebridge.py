@@ -775,7 +775,10 @@ class WorkspaceBridge(QObject):
         if self._model is None or sip.isdeleted(self._model):
             return
         new_id = tab.tab_id
-        workspace_id = self._active_workspace_id()
+        # Record against the owning workspace: a tab moved away from the
+        # active workspace must not become its last-active (dangling) tab.
+        workspace_id = (self._owning_workspace_id(new_id)
+                        or self._active_workspace_id())
         if workspace_id is not None:
             self._manager.record_active_tab(  # type: ignore[union-attr]
                 new_id, workspace_id)
@@ -991,6 +994,11 @@ class WorkspaceBridge(QObject):
             return
         workspace_id = self._active_workspace_id()
         if workspace_id is None:
+            return
+        owner = self._owning_workspace_id(tab.tab_id)
+        if owner is not None and owner != workspace_id:
+            # Moved out of the shown workspace: its group id is scoped to the
+            # owner, so there is no row here to locate.
             return
         entry = self._manager.find_tab_by_id(workspace_id, tab.tab_id)
         if entry is None:
@@ -1323,9 +1331,29 @@ class WorkspaceBridge(QObject):
         workspace = self._manager.get_active()
         return None if workspace is None else workspace.id
 
+    def _owning_workspace_id(self, tab_id: int) -> Optional[uuid.UUID]:
+        """Return the workspace whose entries contain *tab_id*.
+
+        A moved OPEN entry keeps its runtime id but belongs to another
+        workspace than the one the live tab is still shown in, so the active
+        workspace is not necessarily the owner.  Metadata writes and the
+        suspend-on-close path must address the owner, otherwise they hit
+        nothing (or a different entry) until the next switch.
+        """
+        if self._manager is None:
+            return None
+        active = self._active_workspace_id()
+        if (active is not None
+                and self._manager.find_tab_by_id(active, tab_id) is not None):
+            return active
+        for workspace in self._manager.list_workspaces():
+            if self._manager.find_tab_by_id(workspace.id, tab_id) is not None:
+                return workspace.id
+        return None
+
     def _on_title_changed(self, tab_id: int, title: str) -> None:
         self._state_for(tab_id).title = title
-        workspace_id = self._active_workspace_id()
+        workspace_id = self._owning_workspace_id(tab_id)
         if workspace_id is not None:
             # The manager applies the user-edited guard for us.
             self._manager.update_tab_metadata(  # type: ignore[union-attr]
@@ -1337,7 +1365,7 @@ class WorkspaceBridge(QObject):
         state = self._state_for(tab_id)
         url_changed = state.url != url_str
         state.url = url_str
-        workspace_id = self._active_workspace_id()
+        workspace_id = self._owning_workspace_id(tab_id)
         if workspace_id is not None:
             source = url.host().lower()
             self._manager.update_tab_metadata(  # type: ignore[union-attr]
@@ -1354,7 +1382,7 @@ class WorkspaceBridge(QObject):
     def _on_icon_changed(self, tab_id: int, icon: QIcon) -> None:
         """Persist a live favicon as base64 PNG onto the workspace tab."""
         encoded = iconbytes.icon_to_png_base64(icon)
-        workspace_id = self._active_workspace_id()
+        workspace_id = self._owning_workspace_id(tab_id)
         if workspace_id is None or not encoded:
             return
         self._manager.update_tab_metadata(  # type: ignore[union-attr]
@@ -1374,7 +1402,7 @@ class WorkspaceBridge(QObject):
 
     def _fetch_description(self, tab_id: int, tab: AbstractTab) -> None:
         """Best-effort description capture, persisted when it resolves."""
-        workspace_id = self._active_workspace_id()
+        workspace_id = self._owning_workspace_id(tab_id)
         manager = self._manager
         if workspace_id is None or manager is None:
             return
@@ -1527,7 +1555,7 @@ class WorkspaceBridge(QObject):
                 self._model.set_active_tab_id(None)
         if self._manager is None:
             return
-        workspace_id = self._active_workspace_id()
+        workspace_id = self._owning_workspace_id(tab_id)
         if workspace_id is None:
             return
         # D1: closing a tab keeps its entry in the workspace but flips it to
