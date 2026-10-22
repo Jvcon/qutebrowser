@@ -9,6 +9,15 @@
 set -euo pipefail
 
 echo "==> Installing system packages (PyQt6/QtWebEngine, docs tooling)"
+# gh comes from GitHub's own apt repo: Ubuntu 24.04 only ships 2.45.0, but
+# docs/agents/issue-tracker.md uses `gh issue create --parent` and
+# `gh issue edit --add-sub-issue`, which need a recent gh.
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
 sudo apt-get update
 # python3-pyqt6 / python3-pyqt6.qtwebengine: system-wide PyQt, required because
 #   tox links the system PyQt into its venvs via scripts/link_pyqt.py.
@@ -18,6 +27,8 @@ sudo apt-get update
 # libegl1: needed by pylint/vulture/docs tox envs importing PyQt (see CI).
 # asciidoc: tox docs env.
 # dbus-run-session: how CI wraps tox runs.
+# gh / git-lfs: everyday GitHub tooling; the git-lfs postinst registers the
+#   filters system-wide, so no extra setup step is needed.
 sudo apt-get install -y --no-install-recommends \
     python3-pyqt6 \
     python3-pyqt6.qtwebengine \
@@ -26,7 +37,9 @@ sudo apt-get install -y --no-install-recommends \
     libegl1 \
     asciidoc \
     dbus \
-    dbus-x11
+    dbus-x11 \
+    gh \
+    git-lfs
 
 # Sanity check, as the CI image does.
 python3 -c "from PyQt6 import QtWebEngineCore, QtWebEngineWidgets"
@@ -60,10 +73,21 @@ echo "==> Upgrading npm to latest"
 npm install -g npm@latest
 
 echo "==> Installing opencode tooling (non-fatal)"
+# Both installers prompt by default and the postCreateCommand has a TTY, so
+# a prompt blocks the build forever. Answer every prompt up front and detach
+# stdin as a safety net for prompts we don't know about.
 set +e
-curl -fsSL https://opencode.ai/install | bash
-npx -y oh-my-opencode-slim@latest install
-npx -y skills@latest add mattpocock/skills
+curl -fsSL https://opencode.ai/v2/install | bash
+# --preset=opencode-go: free models, the default "openai" preset needs a key
+npx -y oh-my-opencode-slim@latest install \
+    --preset=opencode-go \
+    --companion=no \
+    --background-subagents=yes \
+    --no-tui < /dev/null
+# --global: install to ~/.agents/skills, keeping the checkout clean
+npx -y skills@latest add mattpocock/skills \
+    --yes --agent opencode --global < /dev/null
 set -e
 
 echo "==> post-create done"
+echo "    run 'gh auth login' once to authenticate the GitHub CLI"
