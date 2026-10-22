@@ -9,8 +9,9 @@ implementation.
 ## Context
 
 Issue #1 introduces a 220 px-wide vertical workspace panel. This ADR records
-its visual design: four stacked permanent sections, a transient Search & Filter
-row, the widget for each section, and the details that bind them together.
+its visual design: three stacked permanent sections, two transient blocks (the
+Search & Filter row and the VP-A2 smart-suggestion card), the widget for each
+section, and the details that bind them together.
 
 The panel is organized as:
 
@@ -32,15 +33,28 @@ appear inside the PIN panel. The two views are disjoint by construction.
 
 ## Decision
 
-Use a 220 px-wide vertical column with **four stacked permanent sections**, top
+Use a 220 px-wide vertical column with **three stacked permanent sections**, top
 to bottom:
 
 1. **PIN panel** — one of `icon` or `line` style, driven by config.
-2. **TabTree** — `QTreeView` styled as a tab bar for the active workspace.
+2. **TabTree** — `QTreeView` styled as a tab bar for the active workspace. It is
+   the only section with a stretch factor and absorbs all height changes.
 3. **WorkspaceIndicator** — `QToolBar` with checkable workspace buttons.
 
-A **transient filter row** appears at the top of the TabTree when the user
-presses `/`, and disappears on `Esc` or when the field is cleared.
+Two **transient blocks** also live in the column. Neither is a permanent
+section:
+
+- **Filter row** (transient) — a 28 px `FilterRow` placed between the PIN panel
+  and the TabTree. It appears when the user presses `/` and disappears on `Esc`
+  or when the field is cleared.
+- **Suggestion card** (VP-A2, transient) — a non-modal `QFrame` parented to the
+  panel, created hidden, and shown only when there are suggestions. It is
+  inserted at index 0 of the panel layout, above the PIN panel. It has no
+  stretch factor and is not counted among the permanent sections. While visible
+  it takes its natural height above the PIN panel; the TabTree (the only
+  stretch member) gives up that height. It is not a floating overlay, and it
+  is not a compressible section: the permanent sections' stretch rules are
+  defined without it.
 
 ### Rationale
 
@@ -498,6 +512,51 @@ format (`pinned`, `archived`, `created_at`, `title`, `url`, …, `open_status`,
 `reading_status`, `created_at`). Older YAML files load without migration.
 Adding a new field never requires a version bump or data fix-up.
 
+### Crash journal (#7)
+
+The per-workspace YAML files above are written on the `SaveManager` cycle and
+are **not** crash-safe on their own: a `kill -9` loses everything written since
+the last cycle. A separate journal closes that gap:
+
+```
+<data>/profiles/<profile>/workspaces/_journal.yml
+```
+
+It is a checksummed envelope — `sha256` over the canonical JSON of the
+payload, then the payload — so a torn or hand-edited file is *detected*, not
+misread. It carries `format`, `written_at`, the active workspace, the
+per-workspace last-active map, every workspace as `Workspace.to_dict()`, and
+the pinned list.
+
+Lifecycle:
+
+- Written after model changes; **removed on clean shutdown**, so its presence
+  at startup means an unclean exit. That is the whole detection mechanism.
+- **Declining** recovery moves it aside to `_journal.declined-<ts>.yml` and
+  writes a fresh journal from the loaded state. Every workspace YAML file is
+  left untouched, so declining never costs the user anything on disk.
+- A **corrupt** journal moves to `_journal.corrupt-<ts>.yml` and startup
+  proceeds normally. Both side files are kept and never loaded again.
+
+Two decisions that deviate from what a reader might expect:
+
+1. **The journal batches over 500 ms, not the 60 s `SaveManager` throttle.**
+   The 60 s convention stays on the session `_autosave`. Reusing it here would
+   mean a `kill -9` silently discards up to a minute of tab state — which is
+   precisely the loss this journal exists to prevent. `save()` (the
+   `SaveManager` cycle, `:save`, and shutdown) forces a flush regardless.
+2. **Recovered OPEN entries return as SUSPENDED**, not eagerly reopened. A
+   50-tab workspace restored in one go would otherwise load 50 pages during
+   startup, which is the spike that motivates suspension in the first place.
+   They reopen through the existing path when their workspace is activated.
+   Tab ids are re-keyed to unique negative ids so a recovered entry can never
+   be confused with a new runtime tab that reuses a positive one.
+
+Recovery applies inside `TabTree.bulk_rebuild()`, which disables animation and
+update painting for the duration and restores the selection by tab id, then
+group id, then row. `apply_recovery` emits a single `changed`, so the tree
+rebuilds once rather than once per entry.
+
 ## Storage layout
 
 All workspace data lives under a per-profile directory tree, designed
@@ -674,6 +733,29 @@ Colors derive from existing config. Panel base = `colors.webpage.bg`;
 foreground = `colors.tabs.odd.fg` (fallback because `colors.webpage.fg` does
 not exist); accent = `colors.tabs.indicator.start`. Blending is linear RGB.
 
+> **Amended after implementation (#37).** The foreground key chosen above does
+> not work out of the box: `colors.tabs.odd.fg` and `colors.webpage.bg` both
+> default to `white`, which is 1 : 1 — the panel would be unreadable. The key
+> itself is not wrong (changing its default would alter tab rendering for every
+> user), so the **implementation resolves the foreground instead of trusting
+> the key blindly**: when `colors.tabs.odd.fg` and the panel base resolve to
+> the same colour, it falls back to whichever of black/white is more legible
+> and blends fills toward that resolved value, logging a warning that names
+> both the configured and the displayed colour.
+>
+> The same applies to the accent. `colors.tabs.indicator.start` defaults to
+> `#0000aa`, which measures 1.07 : 1 against a dark panel; the palette shifts
+> it until it reaches 3 : 1 and **warns when it does**, naming both values.
+> A shifted accent is still what is painted — an invisible focus ring is worse
+> than a colour the user did not pick — but the substitution is never silent.
+> Both messages are emitted once per resolved value, not per repaint, and reach
+> warning level only when the displaced colour is one **the user configured**.
+> Out of the box `colors.tabs.odd.fg` and `colors.webpage.bg` are both `white`,
+> so the text fallback fires on every clean install; reporting that as a
+> warning would be noise the user cannot act on and would train them to ignore
+> warnings. When the value still holds its configdata default, the same message
+> is logged at debug level instead.
+
 ```
 blend(base, overlay, amount) = base * (1 - amount) + overlay * amount
 ```
@@ -683,7 +765,7 @@ blend(base, overlay, amount) = base * (1 - amount) + overlay * amount
 | Panel / PIN background | `base` |
 | Search field | `blend(base, fg, 0.03)` |
 | TabTree row | `blend(base, fg, 0.05)` |
-| Hover | `blend(base, fg, 0.07)` |
+| Hover | `blend(base, fg, 0.08)` |
 | Selected | `blend(base, fg, 0.12)` |
 | Loading icon | `fg` at 40 % opacity |
 | Suspended icon | `fg` at 50 % opacity |
@@ -692,6 +774,20 @@ blend(base, overlay, amount) = base * (1 - amount) + overlay * amount
 
 **Contrast**: text ≥ 4.5 : 1, icons ≥ 3 : 1 (WCAG AA). Shift generated
 monogram luminance toward `fg` until it passes.
+
+Each fill's blend is additionally capped so the resolved foreground stays at
+4.5 : 1 on that fill; an uncapped selected fill drops black text to 4.30 : 1
+on a mid-grey palette.
+
+**Row state without colour** (amended after design review): the current row, the
+hovered row and the multi-select set must be distinguishable by shape, not by
+fill alone. The markers are a dotted outline around the current row (drawn in
+the resolved text colour), a **3 px** left bar on the hovered row (at least
+3 : 1 against both the row fill and the hover fill), and a 14 × 14 checkbox with
+a 2 px stroke for the selected set. A 2 px bar in the muted text colour was
+reviewed and rejected: on both dark and light themes it was effectively
+invisible, leaving hover carried by the fill change alone — the thing this rule
+exists to prevent.
 
 ### Focus ring
 
@@ -788,6 +884,17 @@ The TabTree and PIN panel expose a clean AT-SPI2 contract:
 - PIN panel `accessibleName` is `"Pinned tabs"`.
 - WorkspaceIndicator `accessibleName` is `"Workspaces"`.
 - The TabTree role is `QAccessible.Role.Tree`.
+
+> **Amended after implementation (#37): `AccessibleRole` is not settable in
+> this build.** `QAccessible` is not bound in the vendored PyQt6
+> (`from qutebrowser.qt.gui import QAccessible` fails) and `QWidget` has no
+> `setAccessibleRole`, so an explicit role cannot be assigned. Roles are
+> therefore whatever the widget class gives: `QTreeView` → Tree, `QListView` →
+> List, `QToolBar` → ToolBar. For the TabTree that happens to be the intended
+> role; for the others it was never specified. Reviving explicit roles requires
+> a PyQt6 build that exposes `QAccessible` — treat this as a build
+> dependency, not an implementation gap. The name/description contract below
+> is unaffected and is implemented.
 - Each row sets:
   - `Qt.ItemDataRole.AccessibleTextRole` for the spoken label.
   - `Qt.ItemDataRole.AccessibleDescriptionRole` for state.
@@ -961,6 +1068,55 @@ it.
    table. The trade-off vs. parser-side focus dispatch is recorded in
    § Decisions (Approach C accepted; Approach B rejected).
 
+### Phase 1 supersessions (Refs #1)
+
+Issue #1 (the Phase 1 product spec and architecture) is still open, and its
+body is the Phase 1 spec. The statements below in #1 no longer match the
+shipped code. This section records what supersedes them. It does not change
+any decision above.
+
+1. **`ProfileIndicator` → `WorkspaceIndicator`.** #1 §B specifies
+   `qutebrowser/mainwindow/profileindicator.py` with `ProfileIndicator(QLabel)`
+   as the top section of the panel. That file does not exist. This ADR replaces
+   it with `WorkspaceIndicator(QToolBar)` at the bottom of the panel, with one
+   checkable button per workspace. #1's requirement that the active workspace
+   name be visible in the status bar (user story 18) is served by the
+   status-bar segment in `qutebrowser/mainwindow/statusbar/bar.py` (objectName
+   `statusbar-workspace`). The toolbar form was chosen because the indicator
+   must switch workspaces, not only display the name. A `QLabel` can show the
+   name but cannot switch. The toolbar's checkable buttons let the user switch
+   without leaving the panel. Switching is panel-state work (see § Binding
+   classification). The profile name that `ProfileIndicator` was meant to show
+   (constant `default` in Phase 1) is not displayed by `WorkspaceIndicator`.
+
+2. **Command-name drift.** #1 §I lists three names that were not shipped as
+   written. #36 (closed) already reconciled this ADR's command tables to the
+   registered set. Where #1 §I and § Commands disagree, § Commands is the
+   authority. The correct names are:
+   - `:verticalpanel-toggle` → **`:vertical-panel-toggle`**. Registered in
+     `qutebrowser/browser/commands.py`; bound to `<Ctrl-\>` in the normal
+     bindings.
+   - `:tabtree-move <tab_id> <workspace>` → **not registered**. No `tabtree-move`
+     command exists in the code or config. Cross-workspace move is ticket #6.
+     Do not treat `tab-move` (the existing qutebrowser command that § Commands
+     lists for parent-child and group moves) as its replacement.
+   - `:tabtree-close-branch <tab_id>` → **not registered**, and it has no entry
+     in § Commands. It is not shipped. This ADR does not decide whether it will
+     be added.
+
+   The `vp-` prefix for group, selection, batch, and suggestion commands
+   follows § Commands. Examples are `vp-group-*` and `vp-batch-move`.
+
+3. **Still-open Phase 1 items.** #1 is waiting on these:
+   - #6 — cross-workspace tab move (drag and command).
+   - #7 — SIGKILL crash recovery.
+   - #37 — Phase 6: visuals, focus ring, and accessibility (under #11).
+   - #38 — Phase 7: performance benchmarks, SIGKILL recovery, and memory budget
+     (under #11).
+   - #39 — Phase 8: dogfooding and layout validation (under #11).
+   - #48 — WorkspaceIndicator full rebuild on every change causes switch
+     flicker; `vp-group-delete` confirmation text is wrong.
+
 ## Accessibility tier commitment
 
 **Tier 2** — committed for v0.1.
@@ -970,9 +1126,25 @@ We will deliver:
 - Full keyboard navigation through PIN panel, Search, TabTree, and
   WorkspaceIndicator.
 - Visible, high-contrast focus rings that appear only on keyboard focus.
-- Screen-reader labels for every row via model roles.
+- Screen-reader labels for every row via model roles. Explicit
+  `AccessibleRole` assignment is **not** part of the v0.1 commitment — see the
+  amendment in § Screen reader contract.
 - WCAG AA text contrast (4.5 : 1) and icon contrast (3 : 1) for all shipped
   default themes.
+
+**Not covered by the v0.1 commitment** (recorded so the gap is deliberate, not
+accidental):
+
+- System high-contrast / forced-colours themes. The palette derives from
+  `colors.*` only; it does not query the platform's forced-colours setting.
+  ADR Tier 3 excludes forced colours, but issue #37's wording asked for system
+  high-contrast support, so this is a known, accepted shortfall for v0.1.
+- AT-SPI delivery is **implemented but unverified**: the offscreen test
+  environment cannot exercise Orca or NVDA. The name/description contract is
+  asserted in unit tests; that a screen reader actually announces it needs a
+  real desktop session.
+- Cross-panel tab order (PIN → TabTree → WorkspaceIndicator) is not wired.
+- `tab-mute` has no `workspace_panel` binding.
 
 **What Tier 3 would require** (out of scope for v0.1):
 
@@ -984,6 +1156,70 @@ We will deliver:
 - WCAG AAA (7 : 1) contrast for all text.
 - Automated a11y regression tests using a tool such as Accerciser or
   `pytest-qt` AT-SPI assertions.
+
+## Performance baselines (Phase 7, #38)
+
+Regression reference for the panel. Re-run with
+`QT_QPA_PLATFORM=offscreen python -m pytest tests/unit/workspaces/test_benchmarks.py -q -s`
+and compare against the medians below.
+
+**Scope.** These are **panel-side numbers only**: `WorkspaceManager` and
+`TabTree` (model + view, not shown). They say nothing about browser-process
+memory or crash recovery. Browser-process-level SIGKILL recovery and its
+journal are tracked in **#7**, not here.
+
+**Environment caveat.** Recorded on a 2-vCPU Linux container, CPython 3.12.3,
+Qt under `QT_QPA_PLATFORM=offscreen`. The tree is never shown, so there are
+no real paint passes and **no real font metrics** (no real font rendering
+under the offscreen platform). Treat absolute values as indicative; compare
+relative change on the same machine. Full 500-tab scale was run in this
+container; CI was not used for these numbers (#38 expects CI to run smaller
+sizes).
+
+Benchmarks use an in-memory persistence stand-in, so no number includes disk
+I/O. Filter typing sends one `textChanged` per character through
+`FilterRow.filter_changed` into `TabTree.set_filter`, the same route
+`VerticalPanel` uses; it does not synthesise key events.
+
+| Operation (panel-side) | Size | Median |
+| --- | --- | --- |
+| TabTree rebuild (`manager.changed` → model reset) | 1 tab | 36.0 µs |
+| TabTree rebuild | 10 tabs | 51.2 µs |
+| TabTree rebuild | 100 tabs | 284.6 µs |
+| TabTree rebuild | 500 tabs | 3.25 ms |
+| Group collapse (`toggle_folded`, one group) | 500 tabs | 315.6 µs |
+| Group expand (`toggle_folded`, one group) | 500 tabs | 308.4 µs |
+| Workspace switch (`set_active` + tree rebuild, 500↔500) | 500 tabs | 3.08 ms |
+| Filter row open (`FilterRow.open`) | 500 tabs | 14.1 µs |
+| Filter typing, whole query `item/4` (6 keystrokes) | 500 tabs | 26.1 ms (≈4.3 ms / keystroke) |
+| `auto_suspend_due_tabs`, every entry due | 500 tabs | 29.4 ms |
+| `auto_suspend_due_tabs`, none due (pure scan) | 500 tabs | 51.4 µs |
+
+Benchmark-to-test mapping: `tests/unit/workspaces/test_benchmarks.py`
+(`TestTabTreeRebuild`, `TestGroupFold`, `TestWorkspaceSwitch`, `TestFilter`,
+`TestAutoSuspendScan`). Iteration counts are fixed with `pedantic` where the
+operation mutates state; the largest single iteration is ~30 ms, far below
+the 2 s threshold, so case sizes were not reduced.
+
+**Memory budget (WorkspaceManager, retained Python heap).**
+
+- *Method:* `tracemalloc` (deterministic, no psutil). It is started right
+  before the objects are built, `gc.collect()` runs, and the traced current
+  size is read. This counts Python-heap bytes held by the manager, `Workspace`,
+  `Group`, and `WorkspaceTab` objects. It does **not** see Qt C++ allocations
+  (widgets, pixmaps) or browser-process memory.
+- *500 tab entries in the active workspace:* measured **326 KiB**; budget
+  **512 KiB** (≈1.6× headroom).
+- *10 workspaces on disk, `load()`:* measured **442 KiB**; budget **640 KiB**
+  (≈1.45× headroom). Only the active workspace is resident. The test asserts
+  this in two ways: `list_workspaces()` holds one workspace, and exactly 500
+  `WorkspaceTab.from_dict` calls happen (the non-active 4 500 entries are not
+  materialised). Loading the other nine on demand via `get_workspace` brings
+  the total to roughly 3.9 MiB (control measurement, not asserted), so the
+  budget does discriminate eager from lazy loading.
+- *Dev-mode warning on budget overrun:* **not implemented**. The budget is
+  enforced by tests only; a runtime dev-mode alarm needs a hook in
+  `manager.py`, which is owned by the parallel lane.
 
 ## Decisions
 
