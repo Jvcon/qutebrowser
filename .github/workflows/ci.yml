@@ -281,6 +281,49 @@ jobs:
           if-no-files-found: ignore
         if: failure()
 
+  sigkill-recovery:
+    # Drives a real qutebrowser through SIGKILL + relaunch (#7, #54).
+    if: "!contains(github.event.head_commit.message, '[ci skip]')"
+    timeout-minutes: 20
+    # Same runner as the tests job's py312-pyqt66 entry (see above).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+            python -m pip install -U pip
+            python -m pip install -U -r misc/requirements/requirements-tox.txt
+      - name: Set up tox environment
+        run: "dbus-run-session -- tox run -e py312-pyqt66 --notest"
+      # Why the Chromium flags: without --no-sandbox, qutebrowser segfaults
+      # inside a container (QtWebEngine's sandbox cannot start), the same
+      # problem that keeps the tests job on ubuntu-22.04 (#8424).
+      # --disable-gpu and --disable-dev-shm-usage avoid GPU init and small
+      # /dev/shm failures on the runner. They are set on the step so they are
+      # visible here. tox does not pass QTWEBENGINE_CHROMIUM_FLAGS or
+      # QT_QPA_PLATFORM through to commands, so the tox environment's python
+      # is called directly instead of via `tox -e`.
+      # Why offscreen and no xvfb: the harness drives qutebrowser over IPC
+      # (`:prompt-accept yes`), not by clicking, so no X display is needed.
+      # dbus-run-session matches the other jobs and gives qutebrowser the
+      # session bus it expects.
+      # Exit codes: 0 = at least --min-pass of --trials passed; 1 = below
+      # that threshold (job fails); 3 = qutebrowser could not be driven at
+      # all (UNVERIFIED, job fails).
+      - name: Run SIGKILL recovery check
+        run: >-
+            dbus-run-session -- .tox/py312-pyqt66/bin/python scripts/dev/sigkill_recovery_check.py
+            --trials 5 --min-pass 4 --tabs 50
+        env:
+          QTWEBENGINE_CHROMIUM_FLAGS: "--no-sandbox --disable-gpu --disable-dev-shm-usage"
+          QT_QPA_PLATFORM: offscreen
+
   codeql:
     if: "!contains(github.event.head_commit.message, '[ci skip]')"
     permissions:

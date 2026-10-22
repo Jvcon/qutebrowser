@@ -6,10 +6,11 @@
 
 """End-to-end SIGKILL crash-recovery check for the workspace journal (#7).
 
-This script drives a *real* qutebrowser process.  It is NOT wired into CI: it
-needs a display (or ``xvfb-run``), a working QtWebEngine, and it takes minutes.
-The unit tests in ``tests/unit/workspaces/test_journal.py`` cover the same
-logic in-process; this script is the only check that exercises the real
+This script drives a *real* qutebrowser process.  It runs in CI as the
+``sigkill-recovery`` job in ``.github/workflows/ci.yml`` (#54), and needs a
+working QtWebEngine (plus a display, or ``QT_QPA_PLATFORM=offscreen``).  It
+takes minutes.  The unit tests in ``tests/unit/workspaces/test_journal.py``
+cover the same logic in-process; this script is the only check that exercises the real
 signal path (Qt, the SaveManager cycle, the statusbar prompt and the quit
 handler).
 
